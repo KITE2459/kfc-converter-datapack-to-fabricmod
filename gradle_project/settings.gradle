@@ -1,0 +1,9 @@
+pluginManagement {
+    repositories {
+        maven { url = "https://maven.fabricmc.net/" }   // Fabric Loom 플러그인
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "kfc-datapack-converter"

@@ -1,0 +1,6948 @@
+#!/usr/bin/env python3
+"""
+emit.py - brigadier 파스트리(JSON) -> 네이티브 자바 문장.
+
+입력: ParseDumper 가 만든 trees.json (한 줄 = 한 객체).
+출력: 각 줄에 대한 자바 코드 문자열 + 분류(native/bridge) + 사유.
+
+설계 핵심
+---------
+brigadier 의 chain 은 [노드들 + 인자들] 이 평탄하게 섞여 있다. emit 을 위해
+이를 의미 단위로 재구성한다:
+
+  execute 커맨드  -> [수정자(as/at/if/on/positioned/store/...)] + run <타겟 커맨드>
+  비-execute 커맨드 -> 그 자체가 타겟 커맨드 (scoreboard/data/tag/tp/...)
+
+타겟 커맨드는 `emit_target()` 가, execute 수정자는 `emit_execute()` 가 처리한다.
+네이티브화 불가(의미 이해 필요/미해소)면 BRIDGE 로 분류하고 사유를 단다.
+
+이 파일은 마인크래프트가 필요 없다 - 순수 파이썬. fixtures/trees_sample.json 으로 단위 테스트.
+"""
+from __future__ import annotations
+import json, re, sys
+from datapack_io import open_datapack
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# 출력 패키지 루트 (convert.py 가 set_group 으로 주입). fqcn/패키지 일관성의 단일 소스.
+GROUP = "kartriderpack"
+
+def set_group(g):
+    global GROUP
+    GROUP = g
+
+
+# 매크로 함수 집합 (호출부에서 Map<String,String> 인자를 넘겨야 하는 피호출 함수들).
+# convert.py 의 [pass-1] 에서 set_macro_fns 로 주입. 빈 집합이면 모든 호출을 무인자로 본다.
+MACRO_FNS: set = set()
+
+_VAR_COUNTER = [0]
+def _fresh_var(prefix: str) -> str:
+    """함수 내 임시변수 충돌 방지용 전역 유니크 이름."""
+    _VAR_COUNTER[0] += 1
+    return f"{prefix}_{_VAR_COUNTER[0]}"
+
+def _uid() -> int:
+    """전역 단조 증가 정수. kfcSrc<N>/_faceE<N> 등 '숫자 접미사' 형태를 유지하면서
+       체인 간 번호 재사용으로 인한 동일-스코프 변수 중복 선언을 원천 차단한다.
+       (kfcSrcN 형태를 유지하므로 하위 정규식 매칭/마지막-소스 추적은 그대로 동작.)"""
+    _VAR_COUNTER[0] += 1
+    return _VAR_COUNTER[0]
+
+ALL_FIDS = set()
+def set_all_fids(s):
+    """변환되는 모든 함수 id 집합 주입(동적 function 디스패치 후보 열거용)."""
+    global ALL_FIDS
+    ALL_FIDS = set(s)
+
+def set_macro_fns(s):
+    global MACRO_FNS
+    MACRO_FNS = set(s)
+
+
+# ───────────────────────── 결과 구조 ─────────────────────────
+@dataclass
+class Emitted:
+    line: str
+    java: list[str] = field(default_factory=list)   # 생성된 자바 문장(들)
+    kind: str = "native"                              # native | gated | bridge
+    reason: str = ""                                  # bridge/gated 사유
+    rejects_function: bool = False                    # True면 이 줄이 함수 전체를 무효화(mcfunction 파싱거부 재현)
+    macro_params: list = field(default_factory=list)  # 이 줄이 쓰는 매크로 변수명(시그니처 결정용)
+    side_effects: list = field(default_factory=list)  # 값 식 평가 전에 먼저 실행할 부수효과 문장
+
+    def bridge(self, reason: str) -> "Emitted":
+        # 자바->바닐라 디스패처 호출은 최적화 이득이 없어 최종 산출에서 쓰지 않는다.
+        # 이 줄을 포함한 함수는 통째로 instantExecuteFunction(원본 mcfunction) 폴백으로 간다.
+        # 여기선 표식(dispatch)만 남긴다 - 본문 자바는 폴백 시 참고용 주석으로만 쓰임.
+        self.reason = reason
+        self.java = [f'// ⛔ 자바 변환 불가(함수 폴백): {reason}']
+        self.kind = "dispatch"
+        return self
+
+    def reject(self, reason: str) -> "Emitted":
+        """무효 명령 - mcfunction 에서는 이 함수 전체가 로드 거부됨. 함수 전체 비활성 신호."""
+        self.kind = "bridge"
+        self.reason = reason
+        self.rejects_function = True
+        self.java = [f'// [INVALID COMMAND - 원본에서 함수 전체 거부됨] {self.line}']
+        return self
+
+    def line_for_bridge(self) -> str:
+        # 매크로($) 줄은 $ 포함 원문 그대로 (런타임 매크로 치환은 mcfunction 호출로 처리해야 하므로
+        #  사실 줄 단위가 아닌 함수 단위 브릿지가 옳다 - 여기선 표식만)
+        return self.line
+
+
+# ───────────────────────── 헬퍼 ─────────────────────────
+def jstr(s: str) -> str:
+    """자바 문자열 리터럴."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _jnum(tok, parse_fn, suffix=""):
+    """수치 토큰 -> 자바 수치식. MACROVAR_n 포함 시 런타임 파싱식 생성.
+       '0.5' -> '0.5f' / 'MACROVAR_0' -> 'Float.parseFloat(MACROVAR_0)'
+       '-MACROVAR_0' -> '(-Float.parseFloat(MACROVAR_0))'
+       'aMACROVAR_0b' -> 'Float.parseFloat("a" + MACROVAR_0 + "b")' (문자열 연결)"""
+    t = str(tok)
+    if "MACROVAR_" not in t:
+        return None  # 호출측이 기존 경로(float()/int())로
+    mm = re.fullmatch(r'(-?)(MACROVAR_\d+)', t)
+    if mm:
+        core = f'{parse_fn}({mm.group(2)})'
+        return f'(-{core})' if mm.group(1) else core
+    parts = [p for p in re.split(r'(MACROVAR_\d+)', t) if p]
+    expr = " + ".join(p if p.startswith("MACROVAR_") else jstr(p) for p in parts)
+    return f'{parse_fn}({expr})'
+
+
+def jfloat(tok):
+    e = _jnum(tok, "Float.parseFloat")
+    return e if e is not None else f'{float(tok)}f'
+
+
+def jdouble(tok):
+    e = _jnum(tok, "Double.parseDouble")
+    return e if e is not None else repr(float(tok))
+
+
+def jint(tok):
+    e = _jnum(tok, "Integer.parseInt")
+    return e if e is not None else str(int(tok))
+
+
+
+def parse_range(raw: str) -> tuple[str | None, str | None]:
+    """'8000..' -> ('8000', None), '..5' -> (None,'5'), '3' -> ('3','3'), '1..9'->('1','9')"""
+    if ".." in raw:
+        lo, hi = raw.split("..", 1)
+        return (lo or None, hi or None)
+    return (raw, raw)
+
+
+def holder_expr(raw: str) -> str:
+    """스코어 홀더 -> 자바 holder name 식.
+       '@s' -> 실행자 이름 ; '@...' -> None(셀렉터) ; '*' -> None(전체) ;
+       그 외('#foo'/'lowdetail'/플레이어명) -> 리터럴 홀더 이름."""
+    if raw == "@s":
+        # 서버 소스(executor 없음)에서 @s 줄은 원본에서 '명령 실패=무동작'.
+        # 식 컨텍스트에선 매치 불가능한 홀더명으로 안전하게 무력화.
+        return '(executor == null ? "<no-executor>" : executor.getNameForScoreboard())'
+    if raw.startswith("@") or raw == "*":
+        return None  # 셀렉터/전체 홀더 - 호출부에서 처리
+    return jstr(raw)  # #foo / 평문 가짜플레이어(lowdetail 등) / 플레이어명 -> 리터럴 홀더
+
+
+def self_holder_guard(raw: str):
+    """홀더 raw -> (자바 holder식, guard조건|None). @s / @s[...] / #foo 만 처리.
+       그 외 셀렉터(@e/@n/...)는 None 반환(루프 필요)."""
+    if raw == "@s":
+        return ("executor.getNameForScoreboard()", "executor != null")
+    if raw.startswith("#"):
+        return (jstr(raw), None)
+    if raw.startswith("@s[") or raw.startswith("@s "):
+        sel = parse_selector(raw)
+        if sel is None:
+            return None
+        cond = selector_cond(sel)        # base 's' -> 실행자 검사식
+        if cond is None:
+            return None
+        guard = "executor != null" if cond == "true" else f"executor != null && ({cond})"
+        return ("executor.getNameForScoreboard()", guard)
+    # @ 로 시작하지 않는 토큰은 가짜 플레이어(literal score holder). 바닐라 ScoreHolderArgument 는
+    # 셀렉터(@..)가 아니면 임의 이름을 그대로 점수 홀더로 허용한다(#foo 와 동일 취급).
+    if not raw.startswith("@"):
+        return (jstr(raw), None)
+    return None
+
+
+# ───────────────────────── 셀렉터 raw 파싱 ─────────────────────────
+# brigadier 가 selector 를 raw 로만 줘서, 여기서 분해한다. (ParseDumper 보강 전 임시지만
+#  selector 문법은 단순/안정적이라 raw 파싱으로 충분히 정확하다.)
+@dataclass
+class Selector:
+    base: str                      # a/e/p/r/s/n
+    tags_pos: list = field(default_factory=list)   # 요구 태그
+    tags_neg: list = field(default_factory=list)   # 배제 태그
+    type_id: str | None = None     # type= (단일 또는 #tag), '!' 접두 제거
+    type_neg: bool = False
+    type_is_tag: bool = False      # #로 시작했나
+    limit: int | None = None
+    distance: tuple | None = None  # (min,max)
+    volume: tuple | None = None    # (dx,dy,dz) 박스 셀렉터
+    origin: tuple | None = None    # (x,y,z) 박스 절대 원점
+    sort: str | None = None
+    scores: dict = field(default_factory=dict)
+    predicates: list = field(default_factory=list)
+    gamemode: str | None = None    # gamemode= (플레이어 셀렉터)
+    gamemode_neg: bool = False
+    team: tuple | None = None      # (이름, 부정) team=red / team=!red / team= (무소속)
+    name: tuple | None = None      # (이름, 부정) name=Steve / name=!Steve
+    level: tuple | None = None     # (min,max) 경험치 레벨 (플레이어)
+    advancements: list = field(default_factory=list)  # (advId, bool | {crit:bool})
+    nbt: list = field(default_factory=list)            # (nbt문자열, 부정)
+    x_rotation: tuple | None = None  # (min,max) 피치 범위
+    y_rotation: tuple | None = None  # (min,max) yaw 범위 (래핑 없는 min<=max 만 지원)
+    raw: str = ""
+
+
+def box_origin_expr(sel, src_var: str) -> str:
+    """박스 셀렉터의 원점 Vec3d 식. 절대좌표(x/y/z) 있으면 그걸, 없으면 소스 위치."""
+    if sel.origin is not None:
+        x, y, z = sel.origin
+        return f"new net.minecraft.util.math.Vec3d({x}, {y}, {z})"
+    return f"{src_var}.getPosition()"
+
+
+def _split_commas_depth0(s: str) -> list:
+    out, depth, buf = [], 0, ""
+    for ch in s:
+        if ch in "[{": depth += 1; buf += ch
+        elif ch in "]}": depth -= 1; buf += ch
+        elif ch == "," and depth == 0:
+            if buf.strip(): out.append(buf.strip())
+            buf = ""
+        else: buf += ch
+    if buf.strip(): out.append(buf.strip())
+    return out
+
+
+def parse_advancements(v: str) -> list:
+    """advancements={ns:path=true, ns:p2={crit=true}} -> [(advId, bool|{crit:bool}), ...]"""
+    v = v.strip()
+    if v.startswith("{") and v.endswith("}"):
+        v = v[1:-1]
+    out = []
+    for item in _split_commas_depth0(v):
+        if "=" not in item:
+            continue
+        key, val = item.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if val.startswith("{") and val.endswith("}"):
+            crits = {}
+            for c in _split_commas_depth0(val[1:-1]):
+                if "=" in c:
+                    ck, cv = c.split("=", 1)
+                    crits[ck.strip()] = (cv.strip() == "true")
+            out.append((key, crits))
+        else:
+            out.append((key, val == "true"))
+    return out
+
+
+def parse_selector(raw: str) -> Selector | None:
+    m = re.match(r'^@([aeprsn])(?:\[(.*)\])?$', raw.strip())
+    if not m:
+        return None
+    sel = Selector(base=m.group(1), raw=raw)
+    body = m.group(2)
+    if not body:
+        return sel
+    for k, v in split_selector_args(body):
+        if k == "tag":
+            (sel.tags_neg if v.startswith("!") else sel.tags_pos).append(v.lstrip("!"))
+        elif k == "type":
+            neg = v.startswith("!")
+            v2 = v.lstrip("!")
+            sel.type_neg = neg
+            sel.type_is_tag = v2.startswith("#")
+            sel.type_id = v2.lstrip("#")
+        elif k == "limit":
+            sel.limit = int(v)
+        elif k == "distance":
+            sel.distance = parse_range(v)
+        elif k in ("dx", "dy", "dz"):
+            if sel.volume is None:
+                sel.volume = {"dx": "0", "dy": "0", "dz": "0"}
+            sel.volume[k] = v
+        elif k in ("x", "y", "z"):
+            if not isinstance(sel.origin, dict):
+                sel.origin = {}
+            sel.origin[k] = v
+        elif k == "sort":
+            sel.sort = v
+        elif k == "scores":
+            sel.scores = parse_scores(v)
+        elif k == "predicate":
+            sel.predicates.append(v)
+        elif k == "gamemode":
+            sel.gamemode_neg = v.startswith("!")
+            sel.gamemode = v.lstrip("!")
+        elif k == "x_rotation":
+            sel.x_rotation = parse_range(v)
+        elif k == "y_rotation":
+            sel.y_rotation = parse_range(v)
+        elif k == "team":
+            sel.team = (_unquote_sel(v.lstrip("!")), v.startswith("!"))
+        elif k == "name":
+            sel.name = (_unquote_sel(v.lstrip("!")), v.startswith("!"))
+        elif k == "level":
+            sel.level = parse_range(v)
+        elif k == "advancements":
+            sel.advancements = parse_advancements(v)
+        elif k == "nbt":
+            sel.nbt.append((v.lstrip("!"), v.startswith("!")))
+        else:
+            # 미인식 필터 키: 조용히 무시하면 셀렉터 의미가 넓어진 채 native 인정되는
+            # 의미 왜곡이 생긴다(예: gamemode 누락으로 관전자 전용 태그가 전원에게).
+            # 파싱 실패로 처리해 해당 줄을 거부/폴백시킨다 - 정확성 우선.
+            return None
+    if isinstance(sel.volume, dict):
+        sel.volume = (sel.volume["dx"], sel.volume["dy"], sel.volume["dz"])
+    if isinstance(sel.origin, dict):
+        if not all(a in sel.origin for a in ("x", "y", "z")):
+            return None  # 부분 좌표 원점 1차 미지원
+        sel.origin = (sel.origin["x"], sel.origin["y"], sel.origin["z"])
+    return sel
+
+
+def split_selector_args(body: str):
+    """'tag=a,tag=!b,type=#x,scores={o=1..}' -> [(k,v),...]. 중괄호/대괄호 균형 고려."""
+    out, depth, buf = [], 0, ""
+    for ch in body:
+        if ch in "[{":
+            depth += 1; buf += ch
+        elif ch in "]}":
+            depth -= 1; buf += ch
+        elif ch == "," and depth == 0:
+            if buf.strip():
+                out.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(buf)
+    res = []
+    for item in out:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            res.append((k.strip(), v.strip()))
+    return res
+
+
+def parse_scores(v: str) -> dict:
+    # '{obj=1..,o2=..5}' -> {'obj':(1,None),'o2':(None,5)}
+    v = v.strip().lstrip("{").rstrip("}")
+    out = {}
+    for k, val in split_selector_args(v):
+        out[k] = parse_range(val)
+    return out
+
+
+# 엔티티 type id -> 자바 EntityType 상수 (1차: 흔한 것 + #tag 는 KARTMODELS 류로 근사)
+ENTITY_TYPE_JAVA = {
+    "minecraft:text_display": "EntityType.TEXT_DISPLAY",
+    "minecraft:item_display": "EntityType.ITEM_DISPLAY",
+    "minecraft:block_display": "EntityType.BLOCK_DISPLAY",
+    "minecraft:area_effect_cloud": "EntityType.AREA_EFFECT_CLOUD",
+    "item_display": "EntityType.ITEM_DISPLAY",
+    "text_display": "EntityType.TEXT_DISPLAY",
+    "block_display": "EntityType.BLOCK_DISPLAY",
+    "area_effect_cloud": "EntityType.AREA_EFFECT_CLOUD",
+}
+
+
+# 바닐라 1.21.5 EntityType 정적 상수명(JAR 에서 추출). 임의 minecraft:<path> -> EntityType.<UPPER>
+# 매핑이 안전한지(상수가 실제 존재하는지) 판정하는 데 쓴다.
+VANILLA_ENTITY_TYPES = {
+    'ACACIA_BOAT', 'ACACIA_CHEST_BOAT', 'ALLAY', 'AREA_EFFECT_CLOUD', 'ARMADILLO',
+    'ARMOR_STAND', 'ARROW', 'AXOLOTL', 'BAMBOO_CHEST_RAFT', 'BAMBOO_RAFT', 'BAT', 'BEE',
+    'BIRCH_BOAT', 'BIRCH_CHEST_BOAT', 'BLAZE', 'BLOCK_DISPLAY', 'BOGGED', 'BREEZE',
+    'BREEZE_WIND_CHARGE', 'CAMEL', 'CAT', 'CAVE_SPIDER', 'CHERRY_BOAT', 'CHERRY_CHEST_BOAT',
+    'CHEST_MINECART', 'CHICKEN', 'COD', 'COMMAND_BLOCK_MINECART', 'COW', 'CREAKING', 'CREEPER',
+    'DARK_OAK_BOAT', 'DARK_OAK_CHEST_BOAT', 'DOLPHIN', 'DONKEY', 'DRAGON_FIREBALL', 'DROWNED',
+    'EGG', 'ELDER_GUARDIAN', 'ENDERMAN', 'ENDERMITE', 'ENDER_DRAGON', 'ENDER_PEARL',
+    'END_CRYSTAL', 'EVOKER', 'EVOKER_FANGS', 'EXPERIENCE_BOTTLE', 'EXPERIENCE_ORB',
+    'EYE_OF_ENDER', 'FALLING_BLOCK', 'FIREBALL', 'FIREWORK_ROCKET', 'FISHING_BOBBER', 'FOX',
+    'FROG', 'FURNACE_MINECART', 'GHAST', 'GIANT', 'GLOW_ITEM_FRAME', 'GLOW_SQUID', 'GOAT',
+    'GUARDIAN', 'HOGLIN', 'HOPPER_MINECART', 'HORSE', 'HUSK', 'ILLUSIONER', 'INTERACTION',
+    'IRON_GOLEM', 'ITEM', 'ITEM_DISPLAY', 'ITEM_FRAME', 'JUNGLE_BOAT', 'JUNGLE_CHEST_BOAT',
+    'LEASH_KNOT', 'LIGHTNING_BOLT', 'LINGERING_POTION', 'LLAMA', 'LLAMA_SPIT', 'MAGMA_CUBE',
+    'MANGROVE_BOAT', 'MANGROVE_CHEST_BOAT', 'MARKER', 'MINECART', 'MOOSHROOM', 'MULE',
+    'OAK_BOAT', 'OAK_CHEST_BOAT', 'OCELOT', 'OMINOUS_ITEM_SPAWNER', 'PAINTING', 'PALE_OAK_BOAT',
+    'PALE_OAK_CHEST_BOAT', 'PANDA', 'PARROT', 'PHANTOM', 'PIG', 'PIGLIN', 'PIGLIN_BRUTE',
+    'PILLAGER', 'PLAYER', 'POLAR_BEAR', 'PUFFERFISH', 'RABBIT', 'RAVAGER', 'SALMON', 'SHEEP',
+    'SHULKER', 'SHULKER_BULLET', 'SILVERFISH', 'SKELETON', 'SKELETON_HORSE', 'SLIME',
+    'SMALL_FIREBALL', 'SNIFFER', 'SNOWBALL', 'SNOW_GOLEM', 'SPAWNER_MINECART', 'SPECTRAL_ARROW',
+    'SPIDER', 'SPLASH_POTION', 'SPRUCE_BOAT', 'SPRUCE_CHEST_BOAT', 'SQUID', 'STRAY', 'STRIDER',
+    'TADPOLE', 'TEXT_DISPLAY', 'TNT', 'TNT_MINECART', 'TRADER_LLAMA', 'TRIDENT',
+    'TROPICAL_FISH', 'TURTLE', 'VEX', 'VILLAGER', 'VINDICATOR', 'WANDERING_TRADER', 'WARDEN',
+    'WIND_CHARGE', 'WITCH', 'WITHER', 'WITHER_SKELETON', 'WITHER_SKULL', 'WOLF', 'ZOGLIN',
+    'ZOMBIE', 'ZOMBIE_HORSE', 'ZOMBIE_VILLAGER', 'ZOMBIFIED_PIGLIN'
+}
+
+def entity_type_java(type_id: str) -> str | None:
+    """엔티티 타입 id -> 자바 EntityType 상수식. minecraft 네임스페이스의 모든 바닐라 타입 지원.
+       명시 매핑(ENTITY_TYPE_JAVA) 우선, 그 외엔 path 를 대문자화해 EntityType.<UPPER>.
+       존재하지 않는 상수는 생성하지 않는다(모드/커스텀 타입 -> None -> 브릿지)."""
+    if type_id in ENTITY_TYPE_JAVA:
+        return ENTITY_TYPE_JAVA[type_id]
+    ns, _, path = type_id.partition(":")
+    if path == "":
+        ns, path = "minecraft", ns
+    if ns != "minecraft":
+        return None
+    const = path.upper()
+    if const in VANILLA_ENTITY_TYPES:
+        return f"EntityType.{const}"
+    return None
+
+# 엔티티 타입 태그(#ns:path) -> 실제 타입 id 리스트. 데이터팩 tags/entity_type/*.json 에서 로드.
+# 도메인 가정 없이, 입력 데이터팩의 정의를 그대로 읽는다(범용).
+ENTITY_TYPE_TAGS: dict[str, list[str]] = {}
+
+PREDICATES: dict[str, str] = {}   # "kartmobil:ifride" -> 자바 boolean 식 템플릿({E}=대상 엔티티)
+# 대상이 이미 ServerPlayerEntity 로 확정된 컨텍스트(플레이어 루프 람다 등)용 변형:
+# instanceof 패턴 바인딩 없이 {P} 를 직접 사용 (같은 줄 다중 바인딩 충돌 방지).
+PREDICATES_PLAYER: dict[str, str] = {}
+
+def _player_input_expr(key: str, target: str) -> str:
+    return f'{target}.getPlayerInput().{key}()'
+
+def compile_predicate_json(j):
+    """predicate JSON -> (일반식, 플레이어컨텍스트식). 둘 다 {E}/{P} 템플릿.
+       플레이어컨텍스트식은 대상이 이미 ServerPlayerEntity 인 람다 안에서 쓰며
+       instanceof 바인딩이 없어 같은 줄 다중 사용 시 충돌하지 않는다. 미지원이면 None."""
+    cond = j.get("condition")
+    if cond == "minecraft:random_chance":
+        e = f'(ctx.world.random.nextFloat() < {j.get("chance", 0)}f)'
+        return (e, e)
+    if cond == "minecraft:entity_properties" and j.get("entity") == "this":
+        p = j.get("predicate", {})
+        if p == {"vehicle": {"passenger": {}}}:
+            e = '({E} != null && {E}.hasVehicle())'
+            return (e, e.replace("{E}", "{P}"))
+        if set(p.keys()) == {"passenger"} and p["passenger"].get("type") == "minecraft:player":
+            e = 'KfcGen.hasPlayerPassenger({E})'
+            return (e, e.replace("{E}", "{P}"))
+        inp = (p.get("type_specific") or {}).get("input")
+        if p.get("type") == "minecraft:player" and inp and len(inp) == 1:
+            key, val = next(iter(inp.items()))
+            if val is True and key in ("forward", "backward", "left", "right", "jump", "sneak", "sprint"):
+                gen = ('({E} instanceof net.minecraft.server.network.ServerPlayerEntity _kp'
+                       f' && _kp.getPlayerInput().{key}())')
+                ply = f'{{P}}.getPlayerInput().{key}()'
+                return (gen, ply)
+    return None
+
+
+def load_predicates(datapack_root):
+    """data/<ns>/predicate/**/*.json -> PREDICATES / PREDICATES_PLAYER (컴파일 가능한 것만).
+       datapack_root 는 디렉터리/zip 경로 또는 이미 열린 소스."""
+    src = datapack_root if hasattr(datapack_root, "glob") else open_datapack(datapack_root)
+    for rel in src.glob("data/*/predicate/**/*.json"):
+        parts = rel.split("/")
+        ns = parts[parts.index("data") + 1]
+        pi = parts.index("predicate")
+        sub = "/".join(parts[pi + 1:]).removesuffix(".json")
+        try:
+            j = json.loads(src.read_text(rel, encoding="utf-8-sig").replace("\r", ""))
+        except Exception:
+            continue
+        res = compile_predicate_json(j)
+        if res is not None:
+            gen, ply = res
+            PREDICATES[f"{ns}:{sub}"] = gen
+            if ply is not None:
+                PREDICATES_PLAYER[f"{ns}:{sub}"] = ply
+
+
+BLOCK_TAGS: dict[str, list] = {}   # "kartmobil:ignoreblock" -> ["minecraft:stone", ...]
+
+def load_block_tags(datapack_root):
+    """data/<ns>/tags/block/<name>.json -> BLOCK_TAGS. 중첩(#) 재귀 해소."""
+    src = datapack_root if hasattr(datapack_root, "glob") else open_datapack(datapack_root)
+    raw = {}
+    for rel in src.glob("data/*/tags/block/**/*.json"):
+        parts = rel.split("/")
+        ns = parts[parts.index("data") + 1]
+        bi = parts.index("block")
+        sub = "/".join(parts[bi + 1:]).removesuffix(".json")
+        try:
+            raw[f"{ns}:{sub}"] = json.loads(src.read_text(rel, encoding="utf-8")).get("values", [])
+        except Exception:
+            continue
+    def resolve(tid, seen=None):
+        seen = seen or set()
+        if tid in seen: return []
+        seen.add(tid)
+        out = []
+        for v in raw.get(tid, []):
+            vid = v if isinstance(v, str) else v.get("id", "")
+            if vid.startswith("#"):
+                out += resolve(vid[1:], seen)
+            else:
+                out.append(vid if ":" in vid else "minecraft:" + vid)
+        return out
+    for tid in raw:
+        BLOCK_TAGS[tid] = sorted(set(resolve(tid)))
+
+
+def load_entity_type_tags(datapack_root):
+    """data/<ns>/tags/entity_type/<name>.json 들을 읽어 ENTITY_TYPE_TAGS 채움.
+       #으로 시작하는 중첩 태그 참조도 재귀 해소."""
+    src = datapack_root if hasattr(datapack_root, "glob") else open_datapack(datapack_root)
+    raw = {}
+    for rel in src.glob("data/*/tags/entity_type/**/*.json"):
+        parts = rel.split("/")
+        ns = parts[parts.index("data") + 1]
+        ei = parts.index("entity_type")
+        sub = "/".join(parts[ei + 1:]).removesuffix(".json")
+        tag_id = f"{ns}:{sub}"
+        try:
+            data = json.loads(src.read_text(rel, encoding="utf-8"))
+        except Exception:
+            continue
+        raw[tag_id] = data.get("values", [])
+
+    def resolve(tag_id, seen=None):
+        seen = seen or set()
+        if tag_id in seen:
+            return []
+        seen.add(tag_id)
+        out = []
+        for v in raw.get(tag_id, []):
+            entry = v["id"] if isinstance(v, dict) else v
+            if entry.startswith("#"):
+                out += resolve(entry[1:], seen)
+            else:
+                out.append(entry)
+        return out
+
+    for tag_id in raw:
+        ENTITY_TYPE_TAGS[tag_id] = resolve(tag_id)
+
+
+def resolve_entity_types(sel: "Selector") -> list[str] | None:
+    """셀렉터 type 을 자바 EntityType 상수 리스트로. 해소 실패 시 None."""
+    if not sel.type_id:
+        return None
+    if sel.type_is_tag:
+        ids = ENTITY_TYPE_TAGS.get(sel.type_id)
+        if not ids:
+            return None
+        out = []
+        for i in ids:
+            j = entity_type_java(i)
+            if not j:
+                return None
+            out.append(j)
+        return out
+    j = entity_type_java(sel.type_id)
+    return [j] if j else None
+
+
+def java_str_array(items: list[str]) -> str:
+    if not items:
+        return "new String[0]"
+    return "new String[]{" + ", ".join(jstr(t) for t in items) + "}"
+
+
+def at_effect_cond(raw: str) -> str | None:
+    """@a/@p/@s[...,nbt={active_effects:[{id:"ns:eff"}]}] -> '해당 효과 가진 매칭 대상 존재' boolean.
+       active_effects 외 nbt 가 섞이면 None(정확성)."""
+    m = re.match(r'@([apers])\[(.*)\]$', raw.strip())
+    if not m:
+        return None
+    base, inner = m.group(1), m.group(2)
+    em_ = re.search(r'active_effects:\[\{id:"([^"]+)"\}', inner)
+    if not em_:
+        return None
+    effect = em_.group(1)
+    # active_effects nbt 제거 후 남은 필터(tags/scores)만 허용
+    rest = re.sub(r'nbt=\{active_effects:\[[^\]]*\]\}', '', inner)
+    sel = parse_selector('@' + base + '[' + rest.strip(' ,') + ']' if rest.strip(' ,') else '@' + base)
+    if sel is None or sel.predicates or sel.type_id or sel.distance is not None or _sel_has_extra(sel):
+        return None
+    guards = [f'KfcGen.hasEffect(_pp, {jstr(effect)})']
+    guards += [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    guards += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
+        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        guards.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+    if base == "s":
+        return ('(executor instanceof net.minecraft.server.network.ServerPlayerEntity _pp && '
+                + " && ".join(guards) + ')')
+    return f'KfcGen.anyPlayerWhere(ctx, _pp -> ({" && ".join(guards)}))'
+
+
+def at_s_selecteditem_cond(raw: str) -> str | None:
+    """@s[nbt={SelectedItemSlot:N}] (+scores={...}) -> 자바 boolean. 그 외 필터 섞이면 None.
+       SelectedItemSlot = 선택된 핫바 슬롯(0-8). getSelectedSlot() 와 1:1."""
+    m = re.match(r'@s\[(.*)\]$', raw.strip())
+    if not m:
+        return None
+    inner = m.group(1)
+    sm = re.search(r'SelectedItemSlot:\s*(\d+)', inner)
+    if not sm:
+        return None
+    slot = int(sm.group(1))
+    parts = ['executor instanceof net.minecraft.entity.player.PlayerEntity',
+             f'((net.minecraft.entity.player.PlayerEntity)executor).getInventory().getSelectedSlot() == {slot}']
+    scm = re.search(r'scores=\{([^}]*)\}', inner)
+    if scm:
+        for pair in scm.group(1).split(','):
+            pair = pair.strip()
+            if not pair:
+                continue
+            mm = re.match(r'([\w.\-+]+)=(.+)', pair)
+            if not mm:
+                return None
+            obj, rng = mm.group(1), mm.group(2)
+            lo, hi = parse_range(rng)
+            lo_j = "null" if lo is None else f"Integer.valueOf({lo})"
+            hi_j = "null" if hi is None else f"Integer.valueOf({hi})"
+            parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(obj)}, {lo_j}, {hi_j})')
+    # SelectedItemSlot nbt + scores 외 다른 필터가 있으면 처리 불가(정확성 우선)
+    leftover = re.sub(r'nbt=\{[^}]*\}', '', inner)
+    leftover = re.sub(r'scores=\{[^}]*\}', '', leftover)
+    if leftover.strip(' ,'):
+        return None
+    return '(executor != null && ' + ' && '.join(parts) + ')'
+
+
+def _guard_cost(c: str) -> int:
+    """가드 식의 평가 비용 추정(단락 평가에서 싼 가드를 앞으로). 전부 순수(부작용 없음)
+       AND 결합이라 재배열해도 결과 boolean 동일 — 빠른 early-exit 만 얻는다."""
+    if ('entityMatchesNbt' in c or 'nbtMatches' in c
+            or 'Advancement' in c or 'hasAdvancement' in c or 'advancementDone' in c):
+        return 5   # writeNbt 전체 직렬화 / advancement 조회 — 가장 비쌈
+    if 'predicateMatches' in c or 'testPredicate' in c or 'KfcGen.predicate' in c:
+        return 4   # loot predicate 평가
+    if 'scoreMatches' in c:
+        return 3   # 스코어보드 조회
+    if 'posInRange' in c or 'posInBox' in c or 'squaredDistanceTo' in c:
+        return 2   # 기하 계산
+    if 'gamemodeIs' in c:
+        return 1
+    return 0       # getType()== / getCommandTags().contains / 단순 비교 — 가장 쌈
+
+
+def _order_guards(conds: list) -> list:
+    """가드 리스트를 비용 오름차순으로 stable 정렬(원래 상대순서 보존).
+       싼 가드(type/tag) 앞, 비싼 가드(predicate/nbt) 뒤 → early-exit 빈도↑.
+       모든 가드가 순수 boolean 이라 동작 동치."""
+    return sorted(conds, key=_guard_cost)
+
+
+def _selector_type_cond(sel, evar: str):
+    """셀렉터 type 필터를 단일 후보 evar 의 boolean 조건으로. (조건문자열 | None).
+       반환값 None 은 '타입 필터 없음'(조건 불필요). 해소 불가면 ('__FAIL__',) 튜플.
+       - 바닐라 타입(또는 데이터팩 로드된 타입태그) -> 컴파일타임 == 비교
+       - 미로딩 커스텀 타입태그 -> 런타임 entityInTypeTag
+       - 커스텀 단일 타입(모드 엔티티) -> 런타임 entityTypeIs (레지스트리 조회)
+    """
+    if not sel.type_id and not sel.type_is_tag:
+        return None
+    types = resolve_entity_types(sel)
+    if types and None not in types:
+        inner = " || ".join(f"{evar}.getType() == {t}" for t in types)
+        cond = f"({inner})" if len(types) > 1 else inner
+        return f"!({cond})" if sel.type_neg else cond
+    # 컴파일타임 미해소
+    if sel.type_is_tag:
+        e = f"KfcGen.entityInTypeTag({evar}, {jstr(sel.type_id)})"
+        return f"!({e})" if sel.type_neg else e
+    # 커스텀 단일 타입 id(모드 엔티티) -> 런타임 레지스트리 비교
+    if sel.type_id:
+        tid = sel.type_id if ":" in sel.type_id else "minecraft:" + sel.type_id
+        e = f"KfcGen.entityTypeIs({evar}, {jstr(tid)})"
+        return f"!({e})" if sel.type_neg else e
+    return ("__FAIL__",)
+
+
+def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: bool = False):
+    """단일 후보 엔티티 evar 에 대한 모든 셀렉터 필터를 bare boolean 조건 리스트로.
+       존재검사(if entity)·루프 가드 양쪽에서 공유하는 범용 빌더.
+       해소 불가능한 제약이 하나라도 있으면 None(->폴백).
+    """
+    conds = []
+    # 타입
+    tc = _selector_type_cond(sel, evar)
+    if tc is not None:
+        if isinstance(tc, tuple):
+            return None
+        conds.append(tc)
+    # 태그
+    conds += [f'{evar}.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    conds += [f'!{evar}.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    # 박스(dx/dy/dz)
+    if sel.volume is not None:
+        dx, dy, dz = sel.volume
+        conds.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, {evar}.getPos())')
+    # 거리
+    if sel.distance is not None:
+        lo, hi = sel.distance
+        conds.append(f'KfcGen.posInRange({src_var}.getPosition(), {evar}.getPos(), '
+                     f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+    # 회전(x_rotation/y_rotation)은 _selector_extra_conds 에서 일괄 추가(중복 방지).
+    # 게임모드
+    if sel.gamemode is not None:
+        ge = f'KfcGen.gamemodeIs({evar}, {jstr(sel.gamemode)})'
+        conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+    # 점수
+    for o2, (slo, shi) in (sel.scores or {}).items():
+        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        conds.append(f'KfcGen.scoreMatches(sb, {evar}.getNameForScoreboard(), '
+                     f'{jstr(o2)}, {slo_j}, {shi_j})')
+    # predicate (런타임 testPredicate 폴백 포함)
+    if sel.predicates:
+        pg = predicate_guards(sel.predicates, evar, player=player)
+        if pg is None:
+            return None
+        conds += pg
+    # team/name/level/nbt/advancements
+    conds += _selector_extra_conds(sel, evar)
+    return _order_guards(conds)
+
+
+def _selector_cond_general(sel, src_var: str = "source") -> str | None:
+    """selector_cond 의 범용 폴백: 특화 fast-path 가 못 푼 셀렉터를
+       단일후보 가드 람다로 일반화해 존재검사 boolean 식을 만든다.
+       @s 는 executor 직접검사, @a/@p/@r 는 anyPlayerWhere, @e/@n 는 anyEntityWhere.
+    """
+    is_player = sel.base in ("a", "p", "r")
+    if sel.base == "s":
+        guards = _selector_entity_guards(sel, "executor", src_var, player=False)
+        if guards is None:
+            return None
+        if not guards:
+            return "(executor != null)"
+        return "(executor != null && " + " && ".join(guards) + ")"
+    evar = "_se"
+    guards = _selector_entity_guards(sel, evar, src_var, player=is_player)
+    if guards is None:
+        return None
+    body = " && ".join(guards) if guards else "true"
+    if is_player:
+        return f'KfcGen.anyPlayerWhere(ctx, {evar} -> ({body}))'
+    return f'KfcGen.anyEntityWhere(ctx, {evar} -> ({body}))'
+
+
+def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
+    """`if entity <selector>` 를 자바 boolean 식으로. 불가하면 None(->브릿지).
+
+    @s          -> 실행자 자신이 태그/타입 조건을 만족하는지 직접 검사.
+    @e/@n       -> 타입별 KfcGen.anyEntity 존재 검사(OR).
+    @a/@p/@r    -> KfcGen.anyPlayer 존재 검사.
+    src_var: distance= 필터의 기준 위치 소스 변수 (positioned 등 리바인드 뒤에서는
+             리바인드된 소스를 넘겨야 함 - 수정자 체인 순서 보존).
+
+    특화 fast-path 가 못 푸는 조합(predicate+type, 커스텀 타입태그, nbt/team/level 등)은
+    _selector_cond_general 로 일반화한다(런타임 헬퍼 사용 - 정확성 유지).
+
+    회전(x_rotation/y_rotation)·부정타입(type=!X)은 단순 fast-path 가 조건을 빠뜨리거나
+    (회전 누락) 양성 타입으로 오역(type_neg)하므로, 무조건 범용 경로로 보낸다.
+    범용 경로의 _selector_entity_guards/_selector_type_cond 가 둘 다 정확히 처리한다.
+    """
+    if (_sel_has_extra(sel) or sel.x_rotation is not None or sel.y_rotation is not None
+            or sel.type_neg):
+        return _selector_cond_general(sel, src_var)
+    if (sel.volume is not None and sel.base in ("e", "n")
+            and not sel.scores and not sel.predicates and not sel.type_neg):
+        dx, dy, dz = sel.volume
+        if sel.type_id or sel.type_is_tag:
+            types = resolve_entity_types(sel) if sel.type_is_tag else [entity_type_java(sel.type_id)]
+            if not types or None in types:
+                return None
+            arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+        else:
+            arr = "null"
+        return (f'KfcGen.anyEntityInBox(ctx, {box_origin_expr(sel, src_var)}, {arr}, '
+                f'{jarr_tags(sel.tags_pos)}, {jarr_tags(sel.tags_neg)}, {dx}, {dy}, {dz})')
+    if (sel.volume is not None and sel.base in ("a", "p", "r")
+            and not sel.scores and not sel.predicates):
+        dx, dy, dz = sel.volume
+        pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+        pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        pc.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, _pe.getPos())')
+        if sel.gamemode is not None:
+            ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
+            pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+        return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc)}))' 
+    if sel.scores and sel.base != "s":
+        # @e/@n + scores 1개: anyEntityScored 로 지원 (rectangle-hitbox/calc 의 #crashed 판정 등).
+        if sel.base in ("e", "n") and len(sel.scores) == 1 and not sel.predicates:
+            jt = resolve_entity_types(sel)
+            if jt is None:
+                return _selector_cond_general(sel, src_var)
+            lo4, hi4 = sel.distance if sel.distance else (None, None)
+            d4lo = "-1" if lo4 is None else str(lo4)
+            d4hi = "-1" if hi4 is None else str(hi4)
+            (o4, (slo4, shi4)), = sel.scores.items()
+            slo_j = "null" if slo4 is None else f"Integer.valueOf({slo4})"
+            shi_j = "null" if shi4 is None else f"Integer.valueOf({shi4})"
+            arr4 = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(jt) + "}"
+            return (f'KfcGen.anyEntityScored(ctx, {src_var}.getPosition(), {arr4}, '
+                    f'{jarr_tags(sel.tags_pos)}, {jarr_tags(sel.tags_neg)}, {d4lo}, {d4hi}, '
+                    f'sb, {jstr(o4)}, {slo_j}, {shi_j})')
+        # @a/@p/@r + scores(+tag/distance): 아래 플레이어 존재검사에서 점수까지 처리.
+        if sel.base in ("a", "p", "r") and not sel.predicates:
+            pass
+        else:
+            return _selector_cond_general(sel, src_var)  # @e/@n 다중 scores / predicate 동반
+    if sel.base == "s":
+        parts = []
+        for pid in sel.predicates:
+            neg_p = pid.startswith("!")
+            key = pid[1:] if neg_p else pid
+            expr = PREDICATES.get(key)
+            if expr is None:
+                # 컴파일타임 JSON 부재 -> 런타임 LootCondition 평가
+                pid_norm = key if ":" in key else "minecraft:" + key
+                e = f'KfcGen.testPredicate(source, executor, {jstr(pid_norm)})'
+            else:
+                e = expr.replace("{E}", "executor")
+            parts.append(f'!({e})' if neg_p else e)
+        if sel.type_id:
+            jt = resolve_entity_types(sel)
+            if jt is None:
+                return _selector_cond_general(sel, src_var)
+            inner = " || ".join(f"executor.getType() == {t}" for t in jt)
+            if sel.type_neg:
+                parts.append(f"!({inner})")
+            else:
+                parts.append(f"({inner})" if len(jt) > 1 else inner)
+        for t in sel.tags_pos:
+            parts.append(f'executor.getCommandTags().contains({jstr(t)})')
+        for t in sel.tags_neg:
+            parts.append(f'!executor.getCommandTags().contains({jstr(t)})')
+        for o2, (slo, shi) in sel.scores.items():
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
+                         f'{jstr(o2)}, {slo_j}, {shi_j})')
+        rc = rotation_conds(sel, "executor")
+        if rc is None:
+            return _selector_cond_general(sel, src_var)
+        parts.extend(rc)
+        if sel.distance is not None:
+            lo, hi = sel.distance
+            parts.append(f'KfcGen.posInRange({src_var}.getPosition(), executor.getPos(), '
+                         f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+        if not parts:
+            return "(executor != null)"
+        return "(executor != null && " + " && ".join(parts) + ")"
+
+    # 존재 검사 (@e/@n/@a/@p/@r)
+    if sel.predicates:
+        # predicate 동반 플레이어 존재검사 -> 인라인 루프(predicate 를 조건식으로)
+        if sel.base in ("a", "p", "r") and not sel.type_id:
+            pexprs = []
+            ok_precompiled = True
+            for pid in sel.predicates:
+                neg = pid.startswith("!")
+                key = pid[1:] if neg else pid
+                ex = PREDICATES_PLAYER.get(key)
+                if ex is None:
+                    ok_precompiled = False
+                    break
+                e2 = ex.replace("{P}", "_pe")
+                pexprs.append(f"!({e2})" if neg else e2)
+            if not ok_precompiled:
+                # 컴파일타임 predicate JSON 부재 -> 범용 런타임 폴백(testPredicate)
+                return _selector_cond_general(sel, src_var)
+            tagconds = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+            tagconds += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            lo3, hi3 = sel.distance if sel.distance else (None, None)
+            if lo3 is not None or hi3 is not None:
+                tagconds.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
+                                f'{lo3 if lo3 is not None else -1}, {hi3 if hi3 is not None else -1})')
+            if sel.gamemode is not None:
+                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
+                tagconds.append(f'!({ge})' if sel.gamemode_neg else ge)
+            allc = " && ".join(tagconds + pexprs) if (tagconds or pexprs) else "true"
+            return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({allc}))'
+        return _selector_cond_general(sel, src_var)  # @e/@n+predicate 등 -> 범용 런타임
+    if sel.base in ("e", "n") and not sel.type_id:
+        # 타입 미지정 - 전 엔티티 순회 존재검사
+        lo2, hi2 = sel.distance if sel.distance else (None, None)
+        tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
+        return (f'KfcGen.anyEntityAnyType(ctx, {src_var}.getPosition(), {tp}, {tn}, '
+                f'{lo2 if lo2 is not None else -1}, {hi2 if hi2 is not None else -1})')
+    lo = hi = "-1"
+    if sel.distance is not None:
+        dlo, dhi = sel.distance
+        lo = dlo if dlo is not None else "-1"
+        hi = dhi if dhi is not None else "-1"
+    tp = java_str_array(sel.tags_pos)
+    tn = java_str_array(sel.tags_neg)
+    if sel.base in ("a", "p", "r"):
+        # 태그/거리만이면 단순 anyPlayer, 점수/게임모드가 섞이면 anyPlayerWhere 람다로 일반화.
+        if sel.gamemode is not None or sel.scores:
+            pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+            pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            if sel.distance is not None:
+                dl, dh = sel.distance
+                pc.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
+                          f'{dl if dl is not None else -1}, {dh if dh is not None else -1})')
+            if sel.gamemode is not None:
+                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
+                pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+            for o2, (slo, shi) in sel.scores.items():
+                slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+                shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), '
+                          f'{jstr(o2)}, {slo_j}, {shi_j})')
+            return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc) if pc else "true"}))'
+        return f'KfcGen.anyPlayer(ctx, {src_var}.getPosition(), {tp}, {tn}, {lo}, {hi})'
+    jt = resolve_entity_types(sel)
+    if jt is None:
+        # 컴파일타임 타입태그 JSON 부재 -> 런타임 EntityType.isIn(#tag) 존재검사(양성 단일 타입태그).
+        if sel.type_is_tag and not sel.type_neg and not sel.scores:
+            return (f'KfcGen.anyEntityInTypeTag(ctx, {src_var}.getPosition(), {jstr(sel.type_id)}, '
+                    f'{tp}, {tn}, {lo}, {hi})')
+        return _selector_cond_general(sel, src_var)
+    calls = [f'KfcGen.anyEntity(ctx, {src_var}.getPosition(), {t}, {tp}, {tn}, {lo}, {hi})' for t in jt]
+    return "(" + " || ".join(calls) + ")" if len(calls) > 1 else calls[0]
+
+
+# ───────────────────────── 체인 재구성 ─────────────────────────
+def split_chain(chain: list[dict]):
+    """평탄 체인을 노드 시퀀스와 인자맵으로 분리.
+       반환: (nodes:[name...], args:{name:[value,...]})  - 같은 인자명이 여러 번이면 순서 보존 리스트."""
+    nodes, args = [], {}
+    for step in chain:
+        if "node" in step:
+            nodes.append(step)
+        else:  # arg step
+            args.setdefault(step["arg"], []).append(step["value"])
+    return nodes, args
+
+
+# ───────────────────────── 타겟 커맨드 emit ─────────────────────────
+def _dynamic_dispatch(fid: str, em: "Emitted") -> "list[str] | None":
+    """`function <대상>` 의 이름에 매크로 변수(MACROVAR_i)가 들어간 동적 호출을,
+       후보 함수들에 대한 switch 디스패치로 네이티브 생성(폴백 아님).
+       대상의 정확히 한 세그먼트(네임스페이스 또는 path 구성요소)가 통째로
+       MACROVAR_i 인 경우를 지원한다(예: `$(bgm):play`). 그 외(부분 세그먼트/
+       다중 변수)는 None 을 돌려준다(상위에서 별도 처리)."""
+    if "$(" in fid:
+        em.reason = "동적 function: 매크로 토큰 미정규화"
+        return None
+    if ":" not in fid:
+        em.reason = "동적 function: 네임스페이스(:) 없음"
+        return None
+    ns, path = fid.split(":", 1)
+    segs = [ns] + path.split("/")
+    var_pos = [i for i, s in enumerate(segs) if re.fullmatch(r"MACROVAR_\d+", s)]
+    if len(var_pos) != 1 or any(("MACROVAR_" in s) for i, s in enumerate(segs) if i not in var_pos):
+        em.reason = "동적 function: 단일 전체-세그먼트 변수만 지원"
+        return None
+    vp = var_pos[0]
+    sel_token = segs[vp]   # MACROVAR_i (이후 substitute_macro_token 이 macroArgs.get(var) 로 환원)
+    # 후보 열거: vp 위치만 자유, 나머지 세그먼트는 고정 일치.
+    cands = []
+    for cf in ALL_FIDS:
+        if ":" not in cf:
+            continue
+        cns, cpath = cf.split(":", 1)
+        cs = [cns] + cpath.split("/")
+        if len(cs) != len(segs):
+            continue
+        if all(i == vp or cs[i] == segs[i] for i in range(len(segs))):
+            cands.append((cs[vp], cf))
+    # 매크로 함수 후보는 무인자 execute(source) 가 없음(원본도 무인자 호출 시 무효) -> 제외.
+    cands = [(val, cf) for val, cf in cands if cf not in MACRO_FNS]
+    if not cands:
+        em.reason = "동적 function: 호출가능 후보 없음(레지스트리 미주입/매칭 0)"
+        return None
+    cands = sorted(set(cands))
+    lines = [f"switch ({sel_token}) {{"]
+    for val, cf in cands:
+        lines.append(f"    case {jstr(val)}: {fqcn(cf)}.execute(source); break;")
+    lines.append("    default: break;")   # 알 수 없는 값 = 원본도 무효 함수(no-op)
+    lines.append("}")
+    em.kind = "native"
+    em.reason = f"동적 function 디스패치({len(cands)}개 후보)"
+    return lines
+
+
+def _external_fn_call(fid: str, args: dict, nn: list[str], em: Emitted) -> list[str]:
+    """입력 데이터팩에 본문이 없는(외부 namespace) 함수 호출 → instantExecuteFunction 으로
+       원본 mcfunction 을 직접 실행한다. with <엔티티/스토리지/블록> 매크로 인자도 런타임에 전달."""
+    ns, path = fid.split(":", 1) if ":" in fid else ("minecraft", fid)
+    idexpr = f'net.minecraft.util.Identifier.of({jstr(ns)}, {jstr(path)})'
+    if "with" in nn:
+        wi = nn.index("with")
+        kind = nn[wi + 1] if wi + 1 < len(nn) else None
+        if kind == "storage":
+            sid = first_arg(args, "source")
+            mpath = first_arg(args, "path")
+            margs = (f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(mpath)})' if mpath
+                     else f'KfcGen.storageMacroArgs(server, {jstr(sid)})')
+            return [f'KfcGen.instantExecuteFunction(source, {idexpr}, {margs});']
+        if kind == "entity":
+            sel_raw = first_arg(args, "source")
+            mpath = first_arg(args, "path") or ""
+            if sel_raw == "@s":
+                ent = "executor"
+            else:
+                ent = nearest_entity_java(parse_selector(sel_raw))
+            if ent is not None:
+                return [f'KfcGen.instantExecuteFunction(source, {idexpr}, '
+                        f'KfcGen.entityMacroArgs({ent}, {jstr(mpath)}));']
+            # 셀렉터 해소 실패 → 인자 없이라도 원본 실행(런타임이 @n 등을 재해석하진 못하나 최소 호출)
+            return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
+        if kind == "block":
+            pos = (first_arg(args, "pos") or first_arg(args, "position")
+                   or first_arg(args, "targetPos"))
+            mpath = first_arg(args, "path") or ""
+            bp = block_pos_java(pos) if pos else None
+            if bp is not None:
+                return [f'KfcGen.instantExecuteFunction(source, {idexpr}, '
+                        f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(mpath)}));']
+            return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
+        # with {compound} 리터럴 등은 런타임 측에서 처리 불가 → 인자 없이 호출
+        return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
+    # 인자 없는 단순 호출
+    return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
+
+
+def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list[str] | None:
+    """`function <fid> [with ...|{compound}]` -> 자바 호출문 리스트.
+       피호출이 매크로 함수면 Map<String,String> 인자를 만들어 넘긴다.
+       네이티브화 불가한 인자 소스(비-@s 엔티티/블록 NBT)면 None(->브릿지)."""
+    if ("MACROVAR_" in fid) or ("$(" in fid):
+        # 대상 이름에 매크로 변수 -> 런타임 동적 디스패치. 폴백이 아니라
+        # 후보 함수들에 대한 switch 를 생성해 원본 흐름 그대로 네이티브화한다.
+        return _dynamic_dispatch(fid, em)
+    # 입력 데이터팩에 본문이 없는 함수(외부 namespace 의존 등)는 자바 클래스 호출 대신
+    # 원본 mcfunction 을 instantExecuteFunction 으로 직접 실행한다. ALL_FIDS 가 비어 있으면
+    # (단독 테스트 등) 이 판정을 건너뛴다(전수 변환 가정).
+    if ALL_FIDS and fid not in ALL_FIDS:
+        return _external_fn_call(fid, args, nn, em)
+    call_cls = fqcn(fid)
+    if fid not in MACRO_FNS:
+        # 일반 함수: 인자가 붙어 있어도 mcfunction 은 무시 -> 무인자 호출.
+        return [f'{call_cls}.execute(source);']
+
+    # 매크로 함수 -> 인자 소스 결정
+    if "with" in nn:
+        wi = nn.index("with")
+        kind = nn[wi + 1] if wi + 1 < len(nn) else None
+        if kind == "storage":
+            sid = first_arg(args, "source")
+            path = first_arg(args, "path")
+            if path:
+                return [f'{call_cls}.execute(source, '
+                        f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(path)}));']
+            return [f'{call_cls}.execute(source, KfcGen.storageMacroArgs(server, {jstr(sid)}));']
+        if kind == "entity":
+            sel_raw = first_arg(args, "source")
+            path = first_arg(args, "path") or ""
+            if sel_raw == "@s":
+                return [f'{call_cls}.execute(source, '
+                        f'KfcGen.entityMacroArgs(executor, {jstr(path)}));']
+            ent = nearest_entity_java(parse_selector(sel_raw))
+            if ent is None:
+                em.reason = f"function with entity 셀렉터({sel_raw}) - 미지원"
+                return None
+            return [f'{call_cls}.execute(source, '
+                    f'KfcGen.entityMacroArgs({ent}, {jstr(path)}));']
+        if kind == "block":
+            pos = (first_arg(args, "pos") or first_arg(args, "position")
+                   or first_arg(args, "targetPos"))
+            path = first_arg(args, "path") or ""
+            bp = block_pos_java(pos)
+            if bp is None:
+                em.reason = f"function with block 좌표({pos}) - 로컬(^)/형식 미지원"
+                return None
+            return [f'{call_cls}.execute(source, '
+                    f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(path)}));']
+        em.reason = f"function with {kind} 소스 - 1차 미지원"
+        return None
+
+    # 인라인 {compound}
+    comp = first_arg(args, "arguments")
+    if comp is not None:
+        pairs = parse_compound_args(comp)
+        kv = []
+        guard_vars = []  # 매크로 변수에서 온 값 → 빈 문자열이면 NBT 파싱 실패(호출 스킵)
+        for k, v in pairs:
+            kv.append(jstr(k))
+            mv = macro_value_expr(v)
+            kv.append(mv)
+            # 값이 매크로 변수(MACROVAR_i)면, 치환 후 빈 문자열일 때 바닐라는
+            # {key:} 가 되어 NBT 파싱 실패 → 매크로 줄 전체가 스킵된다(함수 미호출).
+            # 변환도 동일하게: 해당 인자가 비어있으면 호출하지 않도록 가드.
+            if re.fullmatch(r'MACROVAR_\d+', v.strip()):
+                guard_vars.append(mv)
+        call = f'{call_cls}.execute(source, KfcGen.macroArgs({", ".join(kv)}));'
+        if guard_vars:
+            # null(인자 부재) 또는 빈 문자열이면 NBT 파싱 실패와 동일 → 호출 스킵.
+            cond = " && ".join(f'!KfcGen.macroEmpty({g})' for g in guard_vars)
+            return [f'if ({cond}) {call}']
+        return [call]
+
+    # 매크로 함수인데 인자 없음 -> 빈 맵 (mcfunction 에선 매크로 줄 도달 시 에러지만, 안전하게 빈 맵)
+    return [f'{call_cls}.execute(source, KfcGen.macroArgs());']
+
+
+def parse_compound_args(raw: str) -> list[tuple[str, str]]:
+    """SNBT compound '{k:v,k2:{...}}' -> [(k, v_text), ...]. 중괄호/대괄호/문자열 균형 고려."""
+    raw = raw.strip()
+    if raw.startswith("{"):
+        raw = raw[1:]
+    if raw.endswith("}"):
+        raw = raw[:-1]
+    out, depth, buf, instr = [], 0, "", False
+    for ch in raw:
+        if ch == '"':
+            instr = not instr; buf += ch
+        elif not instr and ch in "[{":
+            depth += 1; buf += ch
+        elif not instr and ch in "]}":
+            depth -= 1; buf += ch
+        elif not instr and ch == "," and depth == 0:
+            if buf.strip():
+                out.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(buf)
+    pairs = []
+    for item in out:
+        if ":" in item:
+            k, v = item.split(":", 1)
+            pairs.append((k.strip().strip('"'), v.strip()))
+    return pairs
+
+
+def macro_value_expr(v: str) -> str:
+    """인라인 compound 의 값 -> 자바 String 식.
+       MACROVAR_<i> 더미는 그대로 둬서 emit_macro 가 macroArgs.get 으로 환원하게 한다.
+       그 외 리터럴은 따옴표 벗겨 String 으로(매크로 인자는 항상 문자열)."""
+    v = v.strip()
+    if re.fullmatch(r'MACROVAR_\d+', v):
+        return v
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1]
+    return jstr(v)
+
+
+def nearest_entity_java(sel: "Selector") -> str | None:
+    """비-@s 엔티티 소스 셀렉터 -> 최근접 엔티티 자바 식(없으면 null 반환식). 불가 시 None."""
+    if sel is None or sel.scores or getattr(sel, "predicates", None) or _sel_has_extra(sel):
+        return None
+    lo = hi = "-1"
+    if sel.distance is not None:
+        dlo, dhi = sel.distance
+        lo = dlo if dlo is not None else "-1"
+        hi = dhi if dhi is not None else "-1"
+    tp = java_str_array(sel.tags_pos)
+    tn = java_str_array(sel.tags_neg)
+    if sel.base in ("a", "p", "r"):
+        return f'KfcGen.nearestPlayer(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
+    jt = resolve_entity_types(sel)
+    if jt is None:
+        # 타입 미지정(@n[tag=...]/@e[tag=...]) -> 전 엔티티 중 최근접
+        if not getattr(sel, "type_id", None) and not getattr(sel, "type_is_tag", False):
+            return f'KfcGen.nearestEntityAnyType(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
+        return None
+    arr = "new net.minecraft.entity.EntityType[]{" + ", ".join(jt) + "}"
+    return f'KfcGen.nearestEntity(ctx, source.getPosition(), {arr}, {tp}, {tn}, {lo}, {hi})'
+
+
+def block_pos_java(raw: str | None) -> str | None:
+    """블록 좌표 raw('~ ~ ~' / '0 64 0' / '~ ~-1 ~') -> BlockPos.ofFloored(...) 식.
+       로컬(^) 좌표나 3축이 아니면 None(->브릿지)."""
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) != 3 or any(p.startswith("^") for p in parts):
+        return None
+    bases = ["executor.getX()", "executor.getY()", "executor.getZ()"]
+    axes = []
+    for i, p in enumerate(parts):
+        if p.startswith("~"):
+            off = p[1:]
+            if off == "":
+                axes.append(bases[i])
+            else:
+                try:
+                    axes.append(f"{bases[i]} + {float(off)}")
+                except ValueError:
+                    return None
+        else:
+            try:
+                axes.append(repr(float(p)))
+            except ValueError:
+                return None
+    return f'net.minecraft.util.math.BlockPos.ofFloored({axes[0]}, {axes[1]}, {axes[2]})'
+
+
+# ───────────────────────── 선언적 매핑 테이블 ─────────────────────────
+# trees.json 의 노드 시퀀스(명령 구문 경로)를 키로, 자바 템플릿을 값으로 갖는 카탈로그.
+# 새 명령 추가 = 여기 한 항목. execute 계열/로직 필요한 명령(scoreboard/tag/data/...)은
+# 기존 전용 함수가 담당하고, 이 테이블은 '단순 타겟 명령'만 다룬다.
+#
+# 키: 노드 이름 전체 시퀀스 튜플 (command 포함). trees.json 의 chain 에서 그대로 나옴.
+# 값: SimpleRule
+#   args   : {인자명: 변환모드}
+#            raw    - 원문 그대로 (숫자 등)
+#            jstr   - 자바 문자열 리터럴로
+#            self   - 반드시 @s (아니면 규칙 부적용 -> 기존 경로 폴백)
+#            single - 단일 셀렉터(@n/@e[limit=1]/@p/@s[..]) -> 엔티티 식 (_t 에 대입됨)
+#   java   : 템플릿. {인자명} 치환. single 인자는 {인자명} 자리에 변수 _t 가 들어가고
+#            null 가드 블록으로 감싸진다.
+#   kind   : 결과 분류 (native/gated)
+#   prelude: 필요한 prelude 심볼 힌트 (executor/ctx/sb/server 는 assemble 이 자동 감지하므로
+#            템플릿에 그 식별자가 등장하면 별도 지정 불필요)
+
+@dataclass
+class SimpleRule:
+    args: dict
+    java: str
+    kind: str = "native"
+
+SIMPLE_RULES: dict[tuple, SimpleRule] = {
+    # ride <@s> mount <단일셀렉터> - 카트 탑승. 바닐라는 항상 탑승(다른 탈것이면 내린 뒤 탑승).
+    ("ride", "target", "mount", "vehicle"): SimpleRule(
+        args={"target": "self", "vehicle": "single"},
+        java="if (executor != null && {vehicle} != null && executor.getVehicle() != {vehicle}) {{ executor.stopRiding(); executor.startRiding({vehicle}, true); }}",
+        kind="native",
+    ),
+    # ride <@s> dismount
+    ("ride", "target", "dismount"): SimpleRule(
+        args={"target": "self"},
+        java="executor.stopRiding();",
+        kind="native",
+    ),
+    # xp set @s <n> levels / points
+    ("xp", "set", "target", "amount", "levels"): SimpleRule(
+        args={"target": "self", "amount": "raw"},
+        java="if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _p) _p.setExperienceLevel({amount});",
+        kind="native",
+    ),
+    ("xp", "set", "target", "amount", "points"): SimpleRule(
+        args={"target": "self", "amount": "raw"},
+        java="if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _p) _p.setExperiencePoints({amount});",
+        kind="native",
+    ),
+    # say <message> - 전체 브로드캐스트 (서버 소스 기준 mcfunction say 와 동등)
+    ("say", "message"): SimpleRule(
+        args={"message": "jstr"},
+        java='source.getServer().getPlayerManager().broadcast('
+             'net.minecraft.text.Text.literal("[server] " + {message}), false);',
+        kind="native",
+    ),
+}
+
+
+def try_simple_rule(command: str, nn: list, args: dict, em: Emitted):
+    """선언적 테이블 매치. 반환: True(변환됨) / False(규칙상 브릿지) / None(테이블 미적용->기존 경로)."""
+    key = tuple([command] + list(nn[1:])) if nn and nn[0] == command else tuple([command] + list(nn))
+    # nn 은 보통 [command, sub, ...] 형태 - command 중복 방지
+    rule = SIMPLE_RULES.get(tuple(nn)) or SIMPLE_RULES.get(key)
+    if rule is None:
+        return None
+    vals = {}
+    single_var = None
+    for name, mode in rule.args.items():
+        raw = args.get(name, [{}])[0].get("raw")
+        if raw is None:
+            return None
+        if mode == "raw":
+            vals[name] = raw
+        elif mode == "jstr":
+            vals[name] = jstr(raw)
+        elif mode == "self":
+            if raw != "@s":
+                return None  # @s 전제 불충족 -> 기존 경로/브릿지
+            vals[name] = "executor"
+        elif mode == "single":
+            ent = single_entity_expr(raw)
+            if ent is None:
+                return None
+            single_var = (name, ent)
+            vals[name] = "_t"
+        else:
+            return None
+    stmt = rule.java.format(**vals)
+    if "self" in rule.args.values():
+        stmt = f'if (executor != null) {{ {stmt} }}'
+    if single_var:
+        _, ent = single_var
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};')
+        em.java.append(f'  if (_t != null) {stmt} }}')
+    else:
+        em.java.append(stmt)
+    em.kind = rule.kind
+    return True
+
+
+def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool:
+    """비-execute(또는 run 뒤) 타겟 커맨드를 자바로. 성공 시 True, 네이티브 불가면 False."""
+    # 중첩 execute(run execute ...) - 서브체인을 그대로 execute 폴드로 재귀.
+    if command == "execute":
+        return emit_execute(line, chain, em)
+
+    nodes, args = split_chain(chain)
+    nn = [n["node"] for n in nodes]
+
+    # ---- 0) 선언적 규칙 테이블 (노드 경로 -> 템플릿) ----
+    r = try_simple_rule(command, nn, args, em)
+    if r is not None:
+        return r
+
+    # ---- scoreboard players add/remove/set/operation ----
+    if command == "scoreboard" and "players" in nn:
+        sub = nn[nn.index("players") + 1] if "players" in nn else None
+        if sub == "display" and "numberformat" in nn:
+            return emit_scoreboard_numberformat(nn, args, em)
+        return emit_scoreboard(sub, args, em)
+
+    if command == "scoreboard" and "objectives" in nn:
+        return emit_scoreboard_objectives(nn, args, em)
+
+    if command == "effect":
+        return emit_effect(nn, args, em)
+
+    if command == "xp":
+        return emit_xp(nn, args, em)
+
+    if command == "experience":
+        return emit_xp(nn, args, em)   # experience = xp 별칭 (add/set; query 는 폴백)
+
+    if command == "give":
+        return emit_give(nn, args, em)
+
+    if command == "gamerule":
+        return emit_gamerule(nn, args, em)
+
+    if command == "worldborder":
+        return emit_worldborder(nn, args, em)
+
+    if command == "damage":
+        return emit_damage(nn, args, em)
+
+    if command == "trigger":
+        return emit_trigger(nn, args, em)
+
+    if command == "schedule":
+        return emit_schedule(nn, args, em)
+
+    if command == "place":
+        return emit_place(nn, args, em)
+
+    if command == "spreadplayers":
+        return emit_spreadplayers(nn, args, em)
+
+    if command in ("tp", "teleport"):
+        return emit_tp(nn, args, em)
+
+    if command == "setworldspawn":
+        return emit_setworldspawn(nn, args, em)
+
+    if command == "spawnpoint":
+        return emit_spawnpoint(nn, args, em)
+
+    if command == "enchant":
+        return emit_enchant(nn, args, em)
+
+    # ---- tag @s add/remove ----
+    if command == "time":
+        verb = nn[1] if len(nn) > 1 else None
+        if verb in ("set", "add"):
+            LIT = {"day": 1000, "night": 13000, "noon": 6000, "midnight": 18000}
+            val = None
+            if len(nn) > 2 and nn[2] in LIT:
+                val = LIT[nn[2]]
+            else:
+                t = first_arg(args, "time")
+                if t is not None:
+                    m = re.fullmatch(r'(-?\d+)([tsd]?)', str(t).strip())
+                    if m:
+                        n = int(m.group(1)); u = m.group(2)
+                        val = n * (20 if u == "s" else 24000 if u == "d" else 1)
+            if val is not None:
+                em.java.append(f"KfcGen.{'setTime' if verb=='set' else 'addTime'}(ctx, {val}L);")
+                em.kind = "native"; return True
+        em.reason = f"time {verb} (query/형식 미지원)"
+        return False
+
+    if command == "weather":
+        wk = nn[1] if len(nn) > 1 else None
+        if wk in ("clear", "rain", "thunder"):
+            d = first_arg(args, "duration")
+            ticks = None
+            if d is not None:
+                m = re.fullmatch(r'(\d+)([tsd]?)', str(d).strip())
+                if m:
+                    n = int(m.group(1)); u = m.group(2)
+                    ticks = n * (1 if u == "t" else 24000 if u == "d" else 20)
+            t = ticks if ticks is not None else 6000
+            if wk == "clear":
+                em.java.append(f"KfcGen.setWeather(ctx, {t}, 0, false, false);")
+            elif wk == "rain":
+                em.java.append(f"KfcGen.setWeather(ctx, 0, {t}, true, false);")
+            else:
+                em.java.append(f"KfcGen.setWeather(ctx, 0, {t}, true, true);")
+            em.kind = "native"; return True
+        em.reason = f"weather {wk} 미지원"
+        return False
+
+    if command == "difficulty":
+        lvl = first_arg(args, "difficulty")
+        if lvl is None:
+            em.reason = "difficulty query(인자 없음) 미지원"; return False
+        em.java.append(f"KfcGen.setDifficulty(server, {jstr(lvl)});")
+        em.kind = "native"; return True
+
+    if command == "defaultgamemode":
+        mode = first_arg(args, "gamemode")
+        if mode is None:
+            em.reason = "defaultgamemode 인자 없음"; return False
+        em.java.append(f"KfcGen.setDefaultGameMode(server, {jstr(mode)});")
+        em.kind = "native"; return True
+
+    if command == "random":
+        sub = nn[1] if len(nn) > 1 else None
+        if sub not in ("value", "roll"):
+            em.reason = f"random {sub} (reset/sequence 1차 미지원)"; return False
+        rng = first_arg(args, "range")
+        lo, hi = parse_range(rng) if rng else (None, None)
+        if lo is None or hi is None:
+            em.reason = f"random {sub} 범위({rng}) 미지원"; return False
+        try:
+            int(lo); int(hi)
+        except (ValueError, TypeError):
+            em.reason = f"random {sub} 정수범위 아님({rng})"; return False
+        if sub == "value":
+            # 단독 random value: 결과를 store 없이 버림(바닐라도 체이닝 없으면 관측효과 없음).
+            # RNG 소비만 일으키도록 호출(부수효과). store 경로는 별도로 값을 받는다.
+            em.java.append(f"ctx.world.getRandom().nextBetween({lo}, {hi});")
+            em.kind = "native"; return True
+        # random roll: 굴린 값을 op/플레이어에게 브로드캐스트(바닐라 동작).
+        em.java.append(f"KfcGen.randomRoll(ctx, source, {lo}, {hi});")
+        em.kind = "native"; return True
+
+    if command == "gamemode":
+        mode = first_arg(args, "gamemode")
+        tgt = first_arg(args, "target") or "@s"
+        if mode is not None:
+            if tgt == "@s":
+                em.java.append(f'if (executor != null) KfcGen.setGameMode(executor, {jstr(mode)});')
+                em.kind = "native"; return True
+            if tgt.startswith("@s[") or tgt.startswith("@s "):
+                psel = parse_selector(tgt)
+                cond = selector_cond(psel) if psel else None
+                if cond is None:
+                    em.reason = "gamemode @s[...] 필터 미해소"; return False
+                stmt = f'KfcGen.setGameMode(executor, {jstr(mode)});'
+                em.java.append(stmt if cond == "true" else f'if ({cond}) {stmt}')
+                em.kind = "native"; return True
+        em.reason = f"gamemode 대상({str(tgt)[:20]}) 1차 미지원"
+        return False
+
+    if command == "tag":
+        verb = "add" if "add" in nn else ("remove" if "remove" in nn else None)
+        sel = args.get("targets", [{}])[0].get("raw")
+        name = args.get("name", [{}])[0].get("raw")
+        if verb and name is not None:
+            if sel == "@s":
+                fn = "addCommandTag" if verb == "add" else "removeCommandTag"
+                em.java.append(f'if (executor != null) executor.{fn}({jstr(name)});')
+                return True
+            if sel and (sel.startswith("@s[") or sel.startswith("@s ")):
+                psel = parse_selector(sel)
+                cond = selector_cond(psel) if psel else None
+                if cond is None:
+                    return False
+                fn = "addCommandTag" if verb == "add" else "removeCommandTag"
+                stmt = f'executor.{fn}({jstr(name)});'
+                em.java.append(f'if ({cond}) {stmt}' if cond != "true" else stmt)
+                return True
+            return emit_tag_selector(verb, sel, name, em)  # @e/@n/@p 셀렉터 -> 루프/단일
+        return False
+
+    if command == "bossbar":
+        return emit_bossbar(nn, args, em)
+
+    # ---- function ns:path [with ...|{compound}] ----
+    if command == "function":
+        fid = args.get("name", [{}])[0].get("raw")
+        if not fid:
+            return False
+        call = function_call_java(fid, args, nn, em)
+        if call is None:
+            return False  # 매크로 인자 소스 미지원 -> 브릿지
+        em.java.append(f'// -> {fid}')
+        em.java.extend(call)
+        return True
+
+    # ---- return [value] | return run function ns:path | return run <cmd> ----
+    # 함수 본문은 int executeReturn(source) 로 생성되며, mcfunction 의 return 은
+    # 실제 자바 return <값>; 으로 매핑된다(if function / store success 에서 값 사용).
+    if command == "return":
+        if "run" in nn:
+            ri = nn.index("run")
+            sub = nn[ri + 1:]
+            if sub and sub[0] == "function":
+                fid = first_arg(args, "name")
+                if not fid:
+                    em.reason = "return run function 이름 없음"
+                    return False
+                # 매크로 함수면 인자 동반 호출이 복잡 -> 1차로 무인자 executeReturn 만 지원
+                if fid in MACRO_FNS:
+                    em.reason = "return run function(매크로) 1차 미지원"
+                    return False
+                if ALL_FIDS and fid not in ALL_FIDS:
+                    _ns, _p = fid.split(":", 1) if ":" in fid else ("minecraft", fid)
+                    em.java.append(f"return KfcGen.instantExecuteFunctionReturn(source, "
+                                   f"net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)}));")
+                    return True
+                em.java.append(f"return {fqcn(fid)}.executeReturn(source);")
+                return True
+            # return run <비함수 커맨드> -> 내부 커맨드를 emit 후 결과(성공=1) 반환
+            inner_chain = []
+            seen_run = False
+            for s in chain:
+                if not seen_run:
+                    if s.get("node") == "run":
+                        seen_run = True
+                    continue
+                inner_chain.append(s)
+            sub_cmd = sub[0] if sub else None
+            inner = Emitted(line=line)
+            if sub_cmd and emit_target(line, sub_cmd, inner_chain, inner):
+                em.java.extend(inner.java)
+                em.java.append("return 1;")
+                em.kind = inner.kind
+                return True
+            em.reason = inner.reason or f"return run {sub_cmd} 네이티브화 불가"
+            return False
+        # return <value> -> 그 값을 반환. (return fail 은 0)
+        val = first_arg(args, "value")
+        rv = "0"
+        if val is not None:
+            try:
+                rv = str(int(val))
+            except ValueError:
+                rv = "1"  # 비정수 값은 보수적으로 1(참)
+        em.java.append(f"return {rv};")
+        return True
+
+    # ---- data (modify/get/...) : 질문1=A, 최대 네이티브 시도 ----
+    if command == "data":
+        return emit_data(nn, args, em)
+
+    if command == "kill":
+        holder = first_arg(args, "targets") or "@s"
+        sel = parse_selector(holder)
+        if sel is None:
+            em.reason = f"kill 셀렉터({holder[:25]}) 미지원"
+            return False
+
+        def _kill_pred_guards(entvar):
+            gs = []
+            for pid in sel.predicates:
+                neg = pid.startswith("!")
+                key = pid[1:] if neg else pid
+                pid_norm = key if ":" in key else "minecraft:" + key
+                e = f'KfcGen.testPredicate(source, {entvar}, {jstr(pid_norm)})'
+                gs.append(f'!({e})' if neg else e)
+            return gs
+
+        if sel.base == "s":
+            # @s / @s[tag/score/predicate]: 실행자 자신을 (필터 만족 시) 제거.
+            conds = [f'executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+            conds += [f'!executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            for o2, (slo, shi) in (sel.scores or {}).items():
+                slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+                shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                conds.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+            conds += _kill_pred_guards("executor")
+            conds += _selector_extra_conds(sel, "executor")
+            guard = " && ".join(["executor != null"] + conds)
+            em.java.append(f"if ({guard}) KfcGen.killEntity(executor);")
+            em.kind = "native"
+            return True
+        # 루프 대상 (@e/@a/@n): tag/type/distance 는 루프 헬퍼, scores/predicate 는 본문 가드.
+        loop = entity_loop_open(sel, "_k")
+        if loop is None:
+            em.reason = f"kill 셀렉터({holder[:25]}) 루프 미해소"
+            return False
+        em.java.extend(loop)
+        for o2, (slo, shi) in (sel.scores or {}).items():
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _k.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+        for g in _kill_pred_guards("_k"):
+            em.java.append(f'    if (!({g})) continue;')
+        em.java.append("    KfcGen.killEntity(_k);")
+        em.java.append("}")
+        em.kind = "native"
+        return True
+
+    if command == "stopsound":
+        return emit_stopsound(nn, args, em)
+    if command == "playsound":
+        return emit_playsound(nn, args, em)
+
+    if command == "attribute":
+        holder = first_arg(args, "target")
+        attr = first_arg(args, "attribute")
+        if not holder or not attr:
+            em.reason = "attribute 인자 부족"
+            return False
+        sub = nn[3] if len(nn) > 3 else None   # modifier | base | get
+        if sub == "modifier":
+            verb = nn[4] if len(nn) > 4 else None
+            if verb == "add":
+                mid = first_arg(args, "id")
+                val = first_arg(args, "value")
+                op = nn[-1] if nn[-1] in ("add_value", "add_multiplied_base",
+                                          "add_multiplied_total", "multiply_base", "multiply") else "add_value"
+                mk = lambda ent, _v=val: f'KfcGen.attrModifierAdd({ent}, {jstr(attr)}, {jstr(mid)}, {jdouble(_v) if "MACROVAR_" in str(_v) else _v}, {jstr(op)});'
+            elif verb == "remove":
+                mid = first_arg(args, "id")
+                mk = lambda ent: f'KfcGen.attrModifierRemove({ent}, {jstr(attr)}, {jstr(mid)});'
+            else:
+                em.reason = f"attribute modifier {verb} (1차 미지원)"
+                return False
+        elif sub == "base" and "set" in nn:
+            val = first_arg(args, "value")
+            mk = lambda ent: f'KfcGen.attrBaseSet({ent}, {jstr(attr)}, {val});'
+        else:
+            em.reason = f"attribute {sub} (1차 미지원)"
+            return False
+        if holder == "@s":
+            em.java.append(f'if (executor != null) {mk("executor")}')
+        else:
+            esel = single_entity_expr(holder)
+            if esel is None:
+                em.reason = f"attribute 셀렉터({holder[:20]}) 미지원"
+                return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _attrE = {esel};'
+                           f' if (_attrE != null) {mk("_attrE")} }}')
+        em.kind = "native"
+        return True
+
+    if command == "particle":
+        name = first_arg(args, "name")
+        pos = first_arg(args, "pos")
+        if not name or not pos:
+            em.reason = "particle 인자 부족"
+            return False
+        pe = cond_pos_expr(pos)
+        if pe is None:
+            em.reason = f"particle 좌표({pos}) 미지원"
+            return False
+        delta = first_arg(args, "delta") or "0 0 0"
+        dparts = delta.split()
+        if len(dparts) != 3:
+            dparts = ["0", "0", "0"]
+        speed = first_arg(args, "speed") or "0"
+        count = first_arg(args, "count") or "1"
+        # force 모드(클라 파티클 설정 무시·강제 표시)와 viewers(대상 플레이어 제한).
+        # 이 둘을 빠뜨리면 파티클이 클라 설정에 따라 샘플링돼 양이 줄고 불규칙해진다.
+        force_j = "true" if "force" in nn else "false"
+        viewers_raw = first_arg(args, "viewers")
+        viewers_j = "null"
+        if viewers_raw:
+            vexpr = _particle_viewers_expr(viewers_raw)
+            if vexpr is not None:
+                viewers_j = vexpr
+        # dust{color:[r,g,b],scale:s} 특수 처리
+        dm = re.match(r'^(?:minecraft:)?dust\{', name)
+        if dm:
+            cm = re.search(r'color:\s*\[\s*([\d.]+)f?\s*,\s*([\d.]+)f?\s*,\s*([\d.]+)f?\s*\]', name)
+            sm = re.search(r'scale:\s*([\d.]+)f?', name)
+            if not cm:
+                em.reason = f"particle dust 색상 파싱 실패: {name[:30]}"
+                return False
+            r, g, b = cm.group(1), cm.group(2), cm.group(3)
+            scale = sm.group(1) if sm else "1"
+            em.java.append(
+                f'{{ net.minecraft.util.math.Vec3d _pp = {pe};'
+                f' KfcGen.spawnDust(ctx.world, _pp.x, _pp.y, _pp.z, '
+                f'{dparts[0]}, {dparts[1]}, {dparts[2]}, {speed}, (int)({count}), '
+                f'{r}f, {g}f, {b}f, {scale}f, {force_j}, {viewers_j}); }}')
+            em.kind = "native"
+            return True
+        # 파라미터 동반 파티클(block/item 등)은 1차 미지원
+        if "[" in name or "{" in name or " " in name:
+            em.reason = f"particle 복합 타입({name[:25]}) 1차 미지원"
+            return False
+        em.java.append(
+            f'{{ net.minecraft.util.math.Vec3d _pp = {pe};'
+            f' KfcGen.spawnParticle(ctx.world, {jstr(name)}, _pp.x, _pp.y, _pp.z, '
+            f'{dparts[0]}, {dparts[1]}, {dparts[2]}, {speed}, (int)({count}), {force_j}, {viewers_j}); }}')
+        em.kind = "native"
+        return True
+
+    if command == "tellraw":
+        return emit_tellraw_title(nn, args, em, "tellraw")
+    if command == "title":
+        return emit_tellraw_title(nn, args, em, "title")
+
+    if command == "summon":
+        etype = first_arg(args, "entity")
+        pos = first_arg(args, "pos") or "~ ~ ~"
+        nbt = first_arg(args, "nbt")
+        if not etype:
+            em.reason = "summon 엔티티 타입 없음"
+            return False
+        pe = cond_pos_expr(pos)
+        if pe is None:
+            em.reason = f"summon 좌표({pos}) 미지원"
+            return False
+        nbt_j = "null" if nbt is None else jstr(nbt)
+        em.java.append(
+            f'{{ net.minecraft.util.math.Vec3d _sp = {pe};'
+            f' KfcGen.summon(ctx.world, {jstr(etype)}, _sp.x, _sp.y, _sp.z, {nbt_j}); }}')
+        em.kind = "native"
+        return True
+
+    if command == "rotate":
+        tgt = first_arg(args, "target") or "@s"
+        rot = first_arg(args, "rotation")
+        if rot is None:
+            em.reason = "rotate 회전값 없음"
+            return False
+        parts = rot.split()
+        if len(parts) != 2:
+            em.reason = f"rotate 회전 형식({rot}) 미지원"
+            return False
+        # rotate 의 ~ 는 '소스(실행 컨텍스트)의 회전' 기준(타깃 자기 회전이 아님). Vec2f: x=pitch, y=yaw.
+        def rot_comp(v, src_comp):
+            if v == "~":
+                return src_comp
+            if v.startswith("~"):
+                return f"({src_comp} + {jfloat(v[1:])})"
+            return jfloat(v)
+        yaw = rot_comp(parts[0], "source.getRotation().y")
+        pitch = rot_comp(parts[1], "source.getRotation().x")
+        if tgt == "@s":
+            em.java.append(f'if (executor != null) KfcGen.rotateTo(executor, {yaw}, {pitch});')
+            em.kind = "native"
+            return True
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"rotate 대상({tgt[:20]}) 미지원"
+            return False
+        em.java.append(f'{{ net.minecraft.entity.Entity _rotE = {ent};'
+                       f' if (_rotE != null) KfcGen.rotateTo(_rotE, {yaw}, {pitch}); }}')
+        em.kind = "native"
+        return True
+
+    if command == "setblock":
+        pos = first_arg(args, "pos")
+        block = first_arg(args, "block")
+        if pos is None or block is None:
+            em.reason = "setblock 인자 누락"
+            return False
+        pe = cond_pos_expr(pos)            # 절대/~/^ -> Vec3d (source 기준; run-target 치환과 합성)
+        if pe is None:
+            em.reason = f"setblock 좌표({pos}) 미지원"
+            return False
+        mode = next((m for m in ("replace", "destroy", "keep") if m in nn), "replace")
+        em.java.append(
+            f'KfcGen.setBlock(source.getWorld(), '
+            f'net.minecraft.util.math.BlockPos.ofFloored({pe}), {jstr(block)}, {jstr(mode)});')
+        em.kind = "native"
+        return True
+
+    if command == "team":
+        verb = nn[1] if len(nn) > 1 else None
+        if verb == "add":
+            name = first_arg(args, "team")
+            disp = first_arg(args, "displayName")
+            if not name:
+                em.reason = "team add 이름 없음"; return False
+            dj = "null" if disp is None else jstr(disp)
+            em.java.append(f'KfcGen.teamAdd(ctx, {jstr(name)}, {dj});')
+            em.kind = "native"; return True
+        if verb == "modify":
+            name = first_arg(args, "team")
+            # 옵션은 'team' 다음 노드, 값은 arg(allowed/value/displayName/...) 또는 다음 리터럴 노드.
+            opt = nn[3] if len(nn) > 3 else None
+            if not name or not opt:
+                em.reason = "team modify 형식 미지원"; return False
+            val = (first_arg(args, "allowed") or first_arg(args, "value")
+                   or first_arg(args, "displayName") or first_arg(args, "prefix")
+                   or first_arg(args, "suffix"))
+            if val is None and len(nn) > 4:
+                val = nn[4]   # nametagVisibility/collisionRule/deathMessageVisibility: 값이 리터럴 노드
+            if val is None:
+                em.reason = f"team modify {opt} 값 미해소"; return False
+            em.java.append(f'KfcGen.teamModify(ctx, {jstr(name)}, {jstr(opt)}, {jstr(val)});')
+            em.kind = "native"; return True
+        if verb in ("leave", "join", "empty", "remove"):
+            if verb == "join":
+                tname = first_arg(args, "team")
+                mem = first_arg(args, "members")
+                if not tname:
+                    em.reason = "team join 팀명 없음"; return False
+                if mem is None or mem == "@s":
+                    em.java.append(f'if (executor != null) KfcGen.teamJoin(sb, {jstr(tname)}, executor.getNameForScoreboard());')
+                    em.kind = "native"; return True
+                sel = parse_selector(mem)
+                lo = entity_loop_open(sel, "_tjE") if sel else None
+                if lo is None:
+                    ent = single_entity_expr(mem)
+                    if ent is None:
+                        em.reason = f"team join 대상({str(mem)[:20]}) 미지원"; return False
+                    em.java.append(f'{{ net.minecraft.entity.Entity _tjE = {ent};'
+                                   f' if (_tjE != null) KfcGen.teamJoin(sb, {jstr(tname)}, _tjE.getNameForScoreboard()); }}')
+                    em.kind = "native"; return True
+                em.java.extend(lo)
+                em.java.append(f'    KfcGen.teamJoin(sb, {jstr(tname)}, _tjE.getNameForScoreboard());')
+                em.java.append("}")
+                em.kind = "native"; return True
+            if verb == "leave":
+                mem = first_arg(args, "members")
+                if mem == "@s" or mem is None:
+                    em.java.append('if (executor != null) KfcGen.teamLeave(sb, executor.getNameForScoreboard());')
+                    em.kind = "native"; return True
+                sel = parse_selector(mem)
+                lo = entity_loop_open(sel, "_tmE") if sel else None
+                if lo is None:
+                    em.reason = f"team leave 대상({str(mem)[:20]}) 미지원"; return False
+                em.java.extend(lo)
+                em.java.append('    KfcGen.teamLeave(sb, _tmE.getNameForScoreboard());')
+                em.java.append("}")
+                em.kind = "native"; return True
+            em.reason = f"team {verb} (1차 미지원)"; return False
+        em.reason = f"team {verb} 미지원"; return False
+
+    if command == "fill":
+        frm = first_arg(args, "from"); to = first_arg(args, "to")
+        block = first_arg(args, "block")
+        if frm is None or to is None or block is None:
+            em.reason = "fill 인자 누락"; return False
+        fe = cond_pos_expr(frm); te = cond_pos_expr(to)
+        if fe is None or te is None:
+            em.reason = f"fill 좌표({frm} / {to}) 미지원"; return False
+        mode = next((m for m in ("replace", "destroy", "keep", "outline", "hollow") if m in nn), "replace")
+        filt = first_arg(args, "filter")
+        fj = "null" if filt is None else jstr(filt)
+        em.java.append(
+            f'{{ net.minecraft.util.math.BlockPos _ff = net.minecraft.util.math.BlockPos.ofFloored({fe});'
+            f' net.minecraft.util.math.BlockPos _ft = net.minecraft.util.math.BlockPos.ofFloored({te});'
+            f' KfcGen.fill(source.getWorld(), _ff.getX(), _ff.getY(), _ff.getZ(), '
+            f'_ft.getX(), _ft.getY(), _ft.getZ(), {jstr(block)}, {jstr(mode)}, {fj}); }}')
+        em.kind = "native"; return True
+
+    if command == "kill":
+        tgt = first_arg(args, "targets") or "@s"
+        if tgt == "@s":
+            em.java.append('if (executor != null) KfcGen.killEntity(executor);')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        if sel is None:
+            em.reason = f"kill 셀렉터({tgt[:25]}) 미지원"; return False
+        # nbt/predicate 동반은 1차 미지원(아이템/술어 매칭 필요) - 정확한 사유로 폴백
+        if getattr(sel, "nbt", None) or sel.predicates:
+            em.reason = f"kill 셀렉터 nbt/predicate 미지원({tgt[:25]})"; return False
+        lo = entity_loop_open(sel, "_kE")
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"kill 셀렉터({tgt[:25]}) 해소 불가"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _kE = {ent};'
+                           f' if (_kE != null) KfcGen.killEntity(_kE); }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        for o2, (slo, shi) in sel.scores.items():
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _kE.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+        em.java.append('    KfcGen.killEntity(_kE);')
+        em.java.append("}")
+        em.kind = "native"; return True
+
+    if command == "spectate":
+        tgt = first_arg(args, "target")
+        ply = first_arg(args, "player")   # 생략 시 실행자
+        # 관전자(player) 식
+        if ply is None or ply == "@s":
+            ply_expr = "executor"
+        else:
+            ply_expr = single_entity_expr(ply)
+            if ply_expr is None:
+                em.reason = f"spectate 관전자({ply[:20]}) 미해소"; return False
+        if tgt is None:
+            # spectate (인자 없음) - 본인 시점 복귀
+            em.java.append(f'KfcGen.spectate({ply_expr}, null);')
+            em.kind = "native"; return True
+        if tgt == "@s":
+            tgt_expr = "executor"
+        else:
+            tgt_expr = single_entity_expr(tgt)
+            if tgt_expr is None:
+                em.reason = f"spectate 대상({tgt[:20]}) 미해소"; return False
+        em.java.append(f'KfcGen.spectate({ply_expr}, {tgt_expr});')
+        em.kind = "native"; return True
+
+    if command == "ride":
+        tgt = first_arg(args, "target")
+        if tgt is None:
+            em.reason = "ride 대상 없음"; return False
+        tgt_expr = "executor" if tgt == "@s" else single_entity_expr(tgt)
+        if tgt_expr is None:
+            em.reason = f"ride 대상({tgt[:20]}) 미해소"; return False
+        if "dismount" in nn:
+            em.java.append(f'{{ net.minecraft.entity.Entity _re = {tgt_expr};'
+                           f' if (_re != null) KfcGen.rideDismount(_re); }}')
+            em.kind = "native"; return True
+        if "mount" in nn:
+            veh = first_arg(args, "vehicle")
+            veh_expr = "executor" if veh == "@s" else (single_entity_expr(veh) if veh else None)
+            if veh_expr is None:
+                em.reason = f"ride 탈것({str(veh)[:20]}) 미해소"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _re = {tgt_expr}; net.minecraft.entity.Entity _rv = {veh_expr};'
+                           f' if (_re != null && _rv != null) KfcGen.rideMount(_re, _rv); }}')
+            em.kind = "native"; return True
+        em.reason = "ride 형식 미지원"; return False
+
+    if command == "advancement":
+        verb = nn[1] if len(nn) > 1 else None
+        if verb not in ("grant", "revoke"):
+            em.reason = f"advancement {verb} 미지원"; return False
+        # only <id> / everything 지원. from/through/until(트리 범위)는 1차 미지원.
+        if "everything" in nn:
+            tgt = first_arg(args, "targets") or "@s"
+            grant = "true" if verb == "grant" else "false"
+            if tgt == "@s":
+                em.java.append(f'KfcGen.advancementAll(server, executor, {grant});')
+                em.kind = "native"; return True
+            sel = parse_selector(tgt)
+            lo = entity_loop_open(sel, "_aae") if sel else None
+            if lo is None:
+                ent = single_entity_expr(tgt)
+                if ent is None:
+                    em.reason = f"advancement everything 대상({tgt[:20]}) 미지원"; return False
+                em.java.append(f'{{ net.minecraft.entity.Entity _aae = {ent};'
+                               f' if (_aae != null) KfcGen.advancementAll(server, _aae, {grant}); }}')
+                em.kind = "native"; return True
+            em.java.extend(lo)
+            em.java.append(f'    KfcGen.advancementAll(server, _aae, {grant});')
+            em.java.append("}")
+            em.kind = "native"; return True
+        if "only" not in nn:
+            scope = next((s for s in ("from", "through", "until") if s in nn), "?")
+            em.reason = f"advancement {verb} {scope} (범위 1차 미지원)"; return False
+        advid = first_arg(args, "advancement")
+        tgt = first_arg(args, "targets") or "@s"
+        grant = "true" if verb == "grant" else "false"
+        if not advid:
+            em.reason = "advancement id 없음"; return False
+        if tgt == "@s":
+            em.java.append(f'KfcGen.advancement(server, executor, {jstr(advid)}, {grant});')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        lo = entity_loop_open(sel, "_ae") if sel else None
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"advancement 대상({tgt[:20]}) 미지원"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _ae = {ent};'
+                           f' if (_ae != null) KfcGen.advancement(server, _ae, {jstr(advid)}, {grant}); }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        em.java.append(f'    KfcGen.advancement(server, _ae, {jstr(advid)}, {grant});')
+        em.java.append("}")
+        em.kind = "native"; return True
+
+    if command == "recipe":
+        verb = nn[1] if len(nn) > 1 else None
+        if verb not in ("give", "take"):
+            em.reason = f"recipe {verb} 미지원"; return False
+        rec = first_arg(args, "recipe")        # 레시피 id 또는 '*'(전체)
+        tgt = first_arg(args, "targets") or "@s"
+        if rec is None:
+            em.reason = "recipe id 없음"; return False
+        unlock = "true" if verb == "give" else "false"
+        rj = "null" if rec == "*" else jstr(rec)
+        if tgt == "@s":
+            em.java.append(f'if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
+                           f' KfcGen.recipe(server, _rp, {rj}, {unlock});')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        lo = entity_loop_open(sel, "_re") if sel else None
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"recipe 대상({tgt[:20]}) 미지원"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _re = {ent};'
+                           f' if (_re instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
+                           f' KfcGen.recipe(server, _rp, {rj}, {unlock}); }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        em.java.append(f'    if (_re instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
+                       f' KfcGen.recipe(server, _rp, {rj}, {unlock});')
+        em.java.append("}")
+        em.kind = "native"; return True
+
+    if command == "clear":
+        tgt = first_arg(args, "targets") or "@s"
+        item = first_arg(args, "item")
+        maxc = first_arg(args, "maxCount")
+        parsed = parse_clear_item(item) if item is not None else ("*", None)
+        if parsed is None:
+            em.reason = f"clear 아이템 술어({str(item)[:25]}) 미지원"; return False
+        iid, cdata = parsed
+        cd = "null" if cdata is None else jstr(cdata)
+        mc = "-1" if maxc is None else jint(maxc)
+        iid_j = "null" if iid == "*" else jstr(iid)
+        if tgt == "@s":
+            em.java.append(f'if (executor != null) KfcGen.clearItems(executor, {iid_j}, {cd}, {mc});')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        lo = entity_loop_open(sel, "_clE") if sel else None
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"clear 대상({tgt[:20]}) 미지원"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _clE = {ent};'
+                           f' if (_clE != null) KfcGen.clearItems(_clE, {iid_j}, {cd}, {mc}); }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        em.java.append(f'    KfcGen.clearItems(_clE, {iid_j}, {cd}, {mc});')
+        em.java.append("}")
+        em.kind = "native"; return True
+
+    if command == "item":
+        verb = nn[1] if len(nn) > 1 else None
+        if verb != "replace":
+            em.reason = f"item {verb} (1차 미지원)"; return False
+        holder_kind = nn[2] if len(nn) > 2 else None
+        if holder_kind == "block":
+            # item replace block <pos> <slot> with <item> [count]  (from 변형은 1차 미지원)
+            pos = first_arg(args, "pos")
+            slot = first_arg(args, "slot")
+            if not pos or not slot:
+                em.reason = "item replace block 좌표/슬롯 없음"; return False
+            if "with" not in nn:
+                em.reason = "item replace block from (1차 미지원)"; return False
+            pe = cond_pos_expr(pos)
+            if pe is None:
+                em.reason = f"item replace block 좌표({pos}) 미지원"; return False
+            item = first_arg(args, "item")
+            cnt = first_arg(args, "count")
+            cj = "1" if cnt is None else jint(cnt)
+            ij = "null" if item is None else jstr(item)
+            em.java.append(
+                f'KfcGen.itemReplaceBlockWith(server, source.getWorld(), '
+                f'net.minecraft.util.math.BlockPos.ofFloored({pe}), {jstr(slot)}, {ij}, {cj});')
+            em.kind = "native"; return True
+        if holder_kind != "entity":
+            em.reason = f"item replace {holder_kind} 미지원"; return False
+        tgt = first_arg(args, "targets")
+        slot = first_arg(args, "slot")
+        if not tgt or not slot:
+            em.reason = "item replace 대상/슬롯 없음"; return False
+        # 본문 빌더: 타겟 엔티티 식 _it 에 대해 콜을 생성
+        if "with" in nn:
+            item = first_arg(args, "item")
+            cnt = first_arg(args, "count")
+            cj = "1" if cnt is None else jint(cnt)
+            ij = "null" if item is None else jstr(item)
+            body = lambda e: f'KfcGen.itemReplaceWith(server, {e}, {jstr(slot)}, {ij}, {cj});'
+        elif "from" in nn:
+            src = first_arg(args, "source")
+            srcslot = first_arg(args, "sourceSlot")
+            if not src or not srcslot:
+                em.reason = "item replace from 소스 없음"; return False
+            src_expr = "executor" if src == "@s" else single_entity_expr(src)
+            if src_expr is None:
+                em.reason = f"item replace from 소스({src[:20]}) 미해소"; return False
+            body = lambda e: (f'{{ net.minecraft.entity.Entity _isrc = {src_expr};'
+                              f' if (_isrc != null) KfcGen.itemReplaceFrom({e}, {jstr(slot)}, _isrc, {jstr(srcslot)}); }}')
+        else:
+            em.reason = "item replace 형식 미지원"; return False
+        # 타겟 해소: @s / 단일 / 루프
+        if tgt == "@s":
+            em.java.append(f'if (executor != null) {body("executor")}')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        lo = entity_loop_open(sel, "_it") if sel else None
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"item replace 대상({tgt[:20]}) 미지원"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _it = {ent}; if (_it != null) {body("_it")} }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        em.java.append(f'    {body("_it")}')
+        em.java.append("}")
+        em.kind = "native"; return True
+
+    if command == "clone":
+        b = first_arg(args, "begin"); e = first_arg(args, "end"); d = first_arg(args, "destination")
+        if not b or not e or not d:
+            em.reason = "clone 좌표 누락"; return False
+        be = cond_pos_expr(b); ee = cond_pos_expr(e); de = cond_pos_expr(d)
+        if be is None or ee is None or de is None:
+            em.reason = "clone 좌표 미지원"; return False
+        mask_mode = next((m for m in ("masked", "filtered", "replace") if m in nn), "replace")
+        move_mode = next((m for m in ("force", "move", "normal") if m in nn), "normal")
+        # 모드 없는 단순 clone -> 기존 경량 경로 유지.
+        if mask_mode == "replace" and move_mode == "normal":
+            em.java.append(
+                f'{{ net.minecraft.util.math.BlockPos _cb = net.minecraft.util.math.BlockPos.ofFloored({be});'
+                f' net.minecraft.util.math.BlockPos _ce2 = net.minecraft.util.math.BlockPos.ofFloored({ee});'
+                f' net.minecraft.util.math.BlockPos _cd = net.minecraft.util.math.BlockPos.ofFloored({de});'
+                f' KfcGen.clone(source.getWorld(), _cb.getX(), _cb.getY(), _cb.getZ(), '
+                f'_ce2.getX(), _ce2.getY(), _ce2.getZ(), _cd.getX(), _cd.getY(), _cd.getZ()); }}')
+            em.kind = "native"; return True
+        flt = first_arg(args, "filter")
+        fj = "null" if flt is None else jstr(flt)
+        em.java.append(
+            f'{{ net.minecraft.util.math.BlockPos _cb = net.minecraft.util.math.BlockPos.ofFloored({be});'
+            f' net.minecraft.util.math.BlockPos _ce2 = net.minecraft.util.math.BlockPos.ofFloored({ee});'
+            f' net.minecraft.util.math.BlockPos _cd = net.minecraft.util.math.BlockPos.ofFloored({de});'
+            f' KfcGen.cloneEx(source.getWorld(), _cb.getX(), _cb.getY(), _cb.getZ(), '
+            f'_ce2.getX(), _ce2.getY(), _ce2.getZ(), _cd.getX(), _cd.getY(), _cd.getZ(), '
+            f'{jstr(mask_mode)}, {fj}, {jstr(move_mode)}); }}')
+        em.kind = "native"; return True
+
+    if command == "forceload":
+        if nn[1:2] != ["add"]:
+            em.reason = f"forceload {nn[1] if len(nn) > 1 else '?'} 1차 미지원"; return False
+        frm = first_arg(args, "from"); to = first_arg(args, "to")
+        if not frm:
+            em.reason = "forceload 좌표 없음"; return False
+        # from/to 는 2D 컬럼좌표(x z). cond_pos_expr 은 3D용이라 직접 파싱.
+        def _col(raw):
+            ps = raw.split()
+            if len(ps) != 2:
+                return None
+            comps = []
+            for idx, tok in enumerate(ps):
+                axis = "x" if idx == 0 else "z"
+                if tok == "~":
+                    comps.append(f"((int)Math.floor(source.getPosition().{axis}))")
+                elif tok.startswith("~"):
+                    try:
+                        off = int(tok[1:])
+                    except ValueError:
+                        return None
+                    comps.append(f"((int)Math.floor(source.getPosition().{axis}) + {off})")
+                elif tok.startswith("^"):
+                    return None  # 로컬좌표(^) 컬럼 미지원
+                else:
+                    try:
+                        comps.append(str(int(tok)))
+                    except ValueError:
+                        return None
+            return (comps[0], comps[1])
+        fc = _col(frm); tc = _col(to) if to else fc
+        if fc is None or tc is None:
+            em.reason = f"forceload 좌표({frm}) 미지원"; return False
+        em.java.append(f'KfcGen.forceloadAdd(source.getWorld(), {fc[0]}, {fc[1]}, {tc[0]}, {tc[1]});')
+        em.kind = "native"; return True
+
+    # ---- loot (바닐라 LootCommand: source -> List<ItemStack> -> target) ----
+    if command == "loot":
+        SRC_KW = {"loot", "mine", "kill", "fish"}
+        nodes_only = [s["node"] for s in chain if "node" in s]
+        # nodes_only[0] == 'loot' 커맨드. 그 뒤 첫 SRC_KW 가 소스 키워드.
+        src_idx = None
+        for i in range(1, len(nodes_only)):
+            if nodes_only[i] in SRC_KW:
+                src_idx = i
+                break
+        if src_idx is None:
+            em.reason = "loot source 키워드 없음"
+            return False
+        target_nodes = nodes_only[1:src_idx]
+        source_nodes = nodes_only[src_idx + 1:]
+        src_kw = nodes_only[src_idx]
+        # 인자(이름별 파싱순 리스트)를 target/source 구간으로 개수 분할 (pos 충돌 대응).
+        _, all_args = split_chain(chain)
+
+        def sect(node_list, name, idx=0):
+            vals = all_args.get(name, [])
+            tcount = nodes_only[1:src_idx].count(name)  # target 구간 내 해당 인자 개수
+            seg = vals[:tcount] if node_list is target_nodes else vals[tcount:]
+            return seg[idx].get("raw") if idx < len(seg) else None
+
+        # ---- source: List<ItemStack> 식 ----
+        if src_kw == "loot":
+            table = sect(source_nodes, "loot_table")
+            if not table:
+                em.reason = "loot source table 없음"
+                return False
+            src_expr = f"KfcGen.lootFromTable(source, {jstr(table)})"
+        elif src_kw == "mine":
+            mpos = sect(source_nodes, "pos")
+            mpe = cond_pos_expr(mpos) if mpos else None
+            if mpe is None:
+                em.reason = f"loot mine 좌표({mpos}) 미지원"
+                return False
+            tool = sect(source_nodes, "tool")
+            tool_expr = f"KfcGen.lootTool(server, source, {jstr(tool) if tool is not None else 'null'})"
+            src_expr = (f"KfcGen.lootFromMine(source, "
+                        f"net.minecraft.util.math.BlockPos.ofFloored({mpe}), {tool_expr})")
+        else:
+            em.reason = f"loot source '{src_kw}' 미지원(데미지소스/희소)"
+            return False
+
+        loot_decl = f"java.util.List<net.minecraft.item.ItemStack> _loot = {src_expr};"
+
+        # ---- target ----
+        tk = target_nodes[0] if target_nodes else None
+        if tk == "spawn":
+            tpos = sect(target_nodes, "pos")
+            tpe = cond_pos_expr(tpos) if tpos else None
+            if tpe is None:
+                em.reason = f"loot spawn 좌표({tpos}) 미지원"
+                return False
+            em.java.append(f"{{ {loot_decl} KfcGen.lootSpawn(source.getWorld(), {tpe}, _loot); }}")
+            em.kind = "native"
+            return True
+
+        if tk == "give":
+            players = sect(target_nodes, "players") or sect(target_nodes, "targets")
+            if not players:
+                em.reason = "loot give players 없음"
+                return False
+            ent = single_entity_expr(players)
+            em.java.append(f"{{ {loot_decl}")
+            if ent is not None:  # @p/@n/@s/limit=1 -> 단일
+                em.java.append(f"  net.minecraft.entity.Entity _ge = {ent};")
+                em.java.append("  if (_ge instanceof net.minecraft.server.network.ServerPlayerEntity _gp)"
+                               " KfcGen.lootGive(_loot, java.util.List.of(_gp));")
+            else:
+                sel = parse_selector(players)
+                lo = entity_loop_open(sel, "_ge") if sel else None
+                if lo is None:
+                    em.reason = f"loot give 대상({str(players)[:20]}) 미지원"
+                    return False
+                em.java.extend(lo)
+                em.java.append("    if (_ge instanceof net.minecraft.server.network.ServerPlayerEntity _gp)"
+                               " KfcGen.lootGive(_loot, java.util.List.of(_gp));")
+                em.java.append("}")
+            em.java.append("}")
+            em.kind = "native"
+            return True
+
+        if tk == "replace":
+            sub = target_nodes[1] if len(target_nodes) > 1 else None
+            slot = sect(target_nodes, "slot")
+            if not slot:
+                em.reason = "loot replace slot 없음"
+                return False
+            cnt = sect(target_nodes, "count")
+            cnt_arg = cnt if cnt is not None else "-1"
+            if sub == "entity":
+                ents = sect(target_nodes, "entities")
+                ent = single_entity_expr(ents) if ents else None
+                em.java.append(f"{{ {loot_decl}")
+                if ent is not None:  # @n/@p/@s/limit=1 -> 단일
+                    em.java.append(f"  net.minecraft.entity.Entity _le = {ent};")
+                    em.java.append(f"  if (_le != null) KfcGen.lootReplaceEntity(_le, {jstr(slot)}, {cnt_arg}, _loot);")
+                else:
+                    sel = parse_selector(ents) if ents else None
+                    lo = entity_loop_open(sel, "_le") if sel else None
+                    if lo is None:
+                        em.reason = f"loot replace entity 대상({str(ents)[:20]}) 미지원"
+                        return False
+                    em.java.extend(lo)
+                    em.java.append(f"    KfcGen.lootReplaceEntity(_le, {jstr(slot)}, {cnt_arg}, _loot);")
+                    em.java.append("}")
+                em.java.append("}")
+                em.kind = "native"
+                return True
+            if sub == "block":
+                bpos = sect(target_nodes, "pos")
+                bpe = cond_pos_expr(bpos) if bpos else None
+                if bpe is None:
+                    em.reason = f"loot replace block 좌표({bpos}) 미지원"
+                    return False
+                em.java.append(f"{{ {loot_decl} KfcGen.lootReplaceBlock(source, "
+                               f"net.minecraft.util.math.BlockPos.ofFloored({bpe}), {jstr(slot)}, {cnt_arg}, _loot); }}")
+                em.kind = "native"
+                return True
+            em.reason = f"loot replace '{sub}' 미지원"
+            return False
+
+        em.reason = f"loot target '{tk}' 미지원(insert 등)"
+        return False
+
+    # ---- 이벤트성/복잡: 폴백(instantExecuteFunction) 대상 ----
+    return False
+
+
+def emit_tellraw_title(nn, args, em, cmd):
+    holder = first_arg(args, "targets")
+    if not holder:
+        em.reason = f"{cmd} 대상 없음"
+        return False
+    ss_cond = at_s_selecteditem_cond(holder)   # @s[nbt={SelectedItemSlot:N}] 특수 처리(핫바 슬롯)
+    sel = parse_selector(holder)
+    if ss_cond is None and (sel is None or sel.base not in ("a", "p", "r", "s")):
+        em.reason = f"{cmd} 셀렉터({holder[:20]}) 미지원(플레이어 한정)"
+        return False
+
+    def _player_guards(var):
+        gs = []
+        for o2, (slo, shi) in (sel.scores.items() if sel and sel.scores else []):
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            gs.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        for pid in (sel.predicates if sel else []):
+            neg_p = pid.startswith("!"); key = pid[1:] if neg_p else pid
+            pn = key if ":" in key else "minecraft:" + key
+            g = f'KfcGen.testPredicate(source, {var}, {jstr(pn)})'
+            gs.append(f'!({g})' if neg_p else g)
+        return gs
+
+    if cmd == "tellraw":
+        msg = first_arg(args, "message")
+        if msg is None:
+            em.reason = "tellraw 메시지 없음"
+            return False
+        call = f'KfcGen.tellraw(_tp, source, {jstr(msg)});'
+    else:  # title
+        # 주의: nn[0] 은 명령어 노드 'title' 자체 -> mode 탐색에서 제외해야 actionbar 가
+        #       명령어 'title' 에 가려지지 않는다. 모드 리터럴은 targets 뒤에 온다.
+        mode = next((n for n in nn[1:] if n in ("actionbar", "title", "subtitle", "times", "clear", "reset")), None)
+        if mode == "actionbar":
+            msg = first_arg(args, "title") or first_arg(args, "message")
+            call = f'KfcGen.titleActionbar(_tp, source, {jstr(msg)});'
+        elif mode in ("title", "subtitle"):
+            msg = first_arg(args, "title")
+            if msg is None:
+                em.reason = "title 텍스트 없음"
+                return False
+            call = f'KfcGen.titleText(_tp, source, {jstr(msg)}, {"true" if mode=="subtitle" else "false"});'
+        elif mode == "times":
+            fi = first_arg(args, "fadeIn"); st = first_arg(args, "stay"); fo = first_arg(args, "fadeOut")
+            if None in (fi, st, fo):
+                em.reason = "title times 인자 부족"
+                return False
+            call = f'KfcGen.titleTimes(_tp, {jint(fi)}, {jint(st)}, {jint(fo)});'
+        elif mode in ("clear", "reset"):
+            call = f'KfcGen.titleClear(_tp, {"true" if mode == "reset" else "false"});'
+        else:
+            em.reason = f"title {mode} (1차 미지원)"
+            return False
+    if ss_cond is not None:
+        em.java.append(f'if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _tp && {ss_cond}) {call}')
+        em.kind = "native"
+        return True
+    if sel.base == "s":
+        pg = _player_guards("_tp")
+        extra = (" && " + " && ".join(pg)) if pg else ""
+        em.java.append(f'if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _tp{extra}) {call}')
+        em.kind = "native"
+        return True
+    em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _tp : ctx.allPlayers) {")
+    conds = [f'_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    conds += [f'!_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    conds += _player_guards("_tp")
+    conds += _selector_extra_conds(sel, "_tp")
+    if sel.distance:
+        lo, hi = sel.distance
+        if hi is not None:
+            conds.append(f'_tp.squaredDistanceTo(source.getPosition()) <= {float(hi) ** 2}')
+        if lo is not None:
+            conds.append(f'_tp.squaredDistanceTo(source.getPosition()) >= {float(lo) ** 2}')
+    if conds:
+        em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+    em.java.append("    " + call)
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def _unquote_sel(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        return v[1:-1].replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+    return v
+
+
+def _selector_extra_conds(sel, var: str) -> list:
+    """team/level/name/nbt/advancements 를 'bare boolean 조건식'으로 반환(AND 빌더용).
+       parse 는 되지만 이 필드들을 빠뜨리는 소비경로가 있으면 셀렉터가 느슨해져
+       거짓양성(예: nbt 조건 누락)이 난다. 그 누락을 막기 위한 공통 조건 생성기."""
+    c = []
+    if sel.team is not None:
+        val, inv = sel.team
+        c.append(f'KfcGen.teamIs({var}, {jstr(val)}, {str(inv).lower()})')
+    if sel.name is not None:
+        val, inv = sel.name
+        c.append(f'KfcGen.nameIs({var}, {jstr(val)}, {str(inv).lower()})')
+    if sel.level is not None:
+        lo, hi = sel.level
+        loj = "Integer.MIN_VALUE" if lo is None else str(lo)
+        hij = "Integer.MAX_VALUE" if hi is None else str(hi)
+        c.append(f'KfcGen.levelInRange({var}, {loj}, {hij})')
+    for adv_id, spec in sel.advancements:
+        if isinstance(spec, dict):
+            for crit, exp in spec.items():
+                c.append(f'KfcGen.advancementCriterion(source, {var}, {jstr(adv_id)}, '
+                         f'{jstr(crit)}, {str(exp).lower()})')
+        else:
+            c.append(f'KfcGen.advancementDone(source, {var}, {jstr(adv_id)}, {str(spec).lower()})')
+    for nbt_str, inv in sel.nbt:
+        c.append(f'KfcGen.nbtMatches({var}, {jstr(nbt_str)}, {str(inv).lower()})')
+    # 회전(x_rotation/y_rotation): 루프 가드/존재 가드 공통 경로에서 누락되지 않도록 포함.
+    c += rotation_conds(sel, var)
+    return c
+
+
+def _sel_has_extra(sel) -> bool:
+    """단순 빌더가 처리 못하는 추가 제약(team/level/name/nbt/advancements) 보유 여부."""
+    return bool(sel.team is not None or sel.name is not None or sel.level is not None
+                or sel.advancements or sel.nbt)
+
+
+def _selector_extra_guards(sel, var: str) -> list:
+    """루프 본문 첫 줄 continue-가드(_selector_extra_conds 재사용)."""
+    return [f'    if (!({c})) continue;' for c in _selector_extra_conds(sel, var)]
+
+
+def _loop_score_pred_conds(sel, var: str):
+    """루프 변수 var 에 대한 scores + predicates 의 bare boolean 조건 리스트.
+       (단순 루프 빌더가 빠뜨리던 제약 - 누락 시 거짓양성). predicate 미해소면 None."""
+    conds = []
+    for obj_name, (slo, shi) in (sel.scores or {}).items():
+        lo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+        hi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        conds.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
+    if sel.predicates:
+        pg = predicate_guards(sel.predicates, var, player=(sel.base in ("a", "p", "r")))
+        if pg is None:
+            return None
+        conds += pg
+    return conds
+
+
+def _loop_with_guards(open_lines, sel, var: str):
+    """@e 루프 오프너 뒤에 scores/predicates 가드(`if (!c) continue;`)를 덧붙인다.
+       predicate 미해소면 None(폴백)."""
+    if open_lines is None:
+        return None
+    g = _loop_score_pred_conds(sel, var)
+    if g is None:
+        return None
+    return list(open_lines) + [f'    if (!({c})) continue;' for c in _order_guards(g)]
+
+
+def entity_loop_open(sel, var):
+    """엔티티 루프 헬퍼(공개 진입점): 코어 + team/level/name 가드."""
+    out = _entity_loop_open_core(sel, var)
+    if out is None:
+        return None
+    return list(out) + _selector_extra_guards(sel, var)
+
+
+def _entity_loop_open_core(sel, var: str):
+    """셀렉터 -> 'for (Entity var : ...) {' 여는 줄들. @a/@e 지원. 못하면 None."""
+    tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
+    lo, hi = sel.distance if sel.distance else (None, None)
+    dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+    if sel.base == "a":
+        if sel.sort in ("nearest", "furthest"):
+            # sort=nearest/furthest — origin(현재 source 위치, at 으로 rebind 됨) 기준 정렬 순회.
+            # 순위 부여(거리순 max 증가) 알고리즘에서 정렬 순서가 결과를 좌우한다.
+            _furth = "true" if sel.sort == "furthest" else "false"
+            out = [f"for (net.minecraft.entity.Entity {var} : "
+                   f"KfcGen.sortedPlayersByDist(ctx, source.getPosition(), {_furth})) {{"]
+        else:
+            out = [f"for (net.minecraft.entity.Entity {var} : ctx.allPlayers) {{"]
+        conds = [f'{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+        conds += [f'!{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        if sel.volume is not None:
+            dx, dy, dz = sel.volume
+            conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, '
+                         f'{dx}, {dy}, {dz}, {var}.getPos())')
+        if sel.gamemode is not None:
+            ge = f'KfcGen.gamemodeIs({var}, {jstr(sel.gamemode)})'
+            conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+        if sel.distance:
+            _dlo, _dhi = sel.distance
+            _dmin = "-1" if _dlo is None else str(_dlo)
+            _dmax = "-1" if _dhi is None else str(_dhi)
+            conds.append(f'KfcGen.inRange({box_origin_expr(sel, "source")}, {var}, {_dmin}, {_dmax})')
+        _sp = _loop_score_pred_conds(sel, var)
+        if _sp is None:
+            return None
+        conds += _sp
+        if conds:
+            out.append(f'    if (!({" && ".join(_order_guards(conds))})) continue;')
+        return out
+    if sel.base in ("e", "n"):
+        # type=!X : 양성 타입으로 순회하면 의미가 정반대가 된다.
+        # -> 전 엔티티 순회 후 해소된 타입(들)을 제외 가드로 거른다(범용·정확).
+        if sel.type_neg and (sel.type_id or sel.type_is_tag):
+            ntypes = (resolve_entity_types(sel) if sel.type_is_tag
+                      else [entity_type_java(sel.type_id)])
+            if ntypes and None not in ntypes:
+                excl = " || ".join(f"{var}.getType() == {t}" for t in ntypes)
+                return _loop_with_guards(
+                    [f'for (net.minecraft.entity.Entity {var} : '
+                     f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{',
+                     f'    if ({excl}) continue;'], sel, var)
+            if sel.type_is_tag:
+                # 미해소 타입태그 -> 런타임 EntityType.isIn(#tag) 으로 제외.
+                return _loop_with_guards(
+                    [f'for (net.minecraft.entity.Entity {var} : '
+                     f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{',
+                     f'    if (KfcGen.entityInTypeTag({var}, {jstr(sel.type_id)})) continue;'], sel, var)
+            return None  # 모드 커스텀 단일 타입 부정 - 1차 미지원(폴백)
+        if sel.volume is not None and not sel.type_neg:
+            dx, dy, dz = sel.volume
+            if sel.type_id or sel.type_is_tag:
+                types = resolve_entity_types(sel) if sel.type_is_tag else [entity_type_java(sel.type_id)]
+                if not types or None in types:
+                    return None
+                arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+            else:
+                arr = "null"
+            return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
+                    f'KfcGen.allEntitiesInBox(ctx, {box_origin_expr(sel, "source")}, {arr}, '
+                    f'{tp}, {tn}, {dx}, {dy}, {dz})) {{'], sel, var)
+        # 타입 미지정 @e/@n -> 전 엔티티 순회(태그/거리 필터). kill/tag/as 등 모든 호출부 공통 적용.
+        # limit=N 이면 가까운 N개만(바닐라 sort 미지정=nearest).
+        if not sel.type_id and not sel.type_is_tag:
+            if (sel.limit or 0) >= 1:
+                return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
+                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit})) {{'], sel, var)
+            return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
+                    f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{'], sel, var)
+        types = resolve_entity_types(sel) if sel.type_is_tag else (
+            [entity_type_java(sel.type_id)] if sel.type_id else None)
+        if sel.type_is_tag and (not types or None in types):
+            # 컴파일타임 타입태그 JSON 부재 -> 전 엔티티 순회 + 런타임 EntityType.isIn(#tag) 가드.
+            neg = "" if sel.type_neg else "!"
+            return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
+                    f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{',
+                    f'    if ({neg}(KfcGen.entityInTypeTag({var}, {jstr(sel.type_id)}))) continue;'], sel, var)
+        if not types or None in types:
+            return None
+        arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit})'
+              if (sel.limit or 0) >= 1 else
+              f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
+        return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : {_q}) {{'], sel, var)
+    return None
+
+
+def emit_stopsound(nn: list[str], args: dict, em: Emitted) -> bool:
+    holder = first_arg(args, "targets")
+    sound = first_arg(args, "sound")   # 없으면 카테고리 전체 정지
+    cat = next((n for n in nn[1:] if n in (
+        "master", "music", "record", "weather", "block", "hostile",
+        "neutral", "player", "ambient", "voice")), None)
+    sel = parse_selector(holder) if holder else None
+    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "p", "s"):
+        em.reason = f"stopsound 셀렉터({(holder or '?')[:25]}) 미지원(플레이어 한정)"
+        return False
+    cj = "null" if cat is None else jstr(cat)
+    sj = "null" if sound is None else jstr(sound)
+    call = f'KfcGen.stopSound(_sp, {cj}, {sj});'
+    if sel.base == "s":
+        em.java.append('if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _sp) ' + call)
+        em.kind = "native"
+        return True
+    em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _sp : ctx.allPlayers) {")
+    conds = [f'_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    conds += [f'!_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    if conds:
+        em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+    em.java.append("    " + call)
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
+    sound = first_arg(args, "sound")
+    cat = next((n for n in nn if n in (
+        "master", "music", "record", "weather", "block", "hostile",
+        "neutral", "player", "ambient", "voice")), "master")
+    holder = first_arg(args, "targets")
+    pos = first_arg(args, "pos") or "~ ~ ~"
+    vol = first_arg(args, "volume")
+    pitch = first_arg(args, "pitch")
+    vol = vol if vol is not None else "1"
+    pitch = pitch if pitch is not None else "1"
+    if not sound or not holder:
+        em.reason = "playsound 인자 부족"
+        return False
+    pe = cond_pos_expr(pos)
+    if pe is None:
+        em.reason = f"playsound 좌표({pos}) 미지원"
+        return False
+    sel = parse_selector(holder)
+    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "p", "r", "s"):
+        em.reason = f"playsound 셀렉터({holder[:25]}) 미지원(플레이어 한정)"
+        return False
+    call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
+            f'{pe}.x, {pe}.y, {pe}.z, {jfloat(vol)}, {jfloat(pitch)});')
+    if sel.base == "s":
+        em.java.append('if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _ps) '
+                       + call)
+        em.kind = "native"
+        return True
+    em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
+    conds = [f'_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    conds += [f'!_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    if conds:
+        em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+    em.java.append("    " + call)
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def predicate_guards(predicates, var: str, player: bool = False):
+    """predicate id 목록 -> var 대상 boolean 식 리스트. 미컴파일 predicate 있으면 None.
+
+    player=True 면 PREDICATES_PLAYER({P}) 우선(대상이 ServerPlayerEntity 인 경우),
+    없으면 일반식 PREDICATES({E}) 로 폴백. player-input 의 instanceof 바인딩 `_kp` 는
+    인덱스로 유니크화하여 같은 식/줄에서 다중 predicate 사용 시 변수 충돌을 막는다.
+    `!pred` 접두는 부정 가드로 변환.
+    """
+    out = []
+    for i, pid in enumerate(predicates):
+        neg = pid.startswith("!")
+        key = pid[1:] if neg else pid
+        ex = (PREDICATES_PLAYER.get(key) if player else None) or PREDICATES.get(key)
+        if ex is None:
+            # 컴파일타임 predicate JSON 부재 -> 런타임 LootCondition 평가로 대체.
+            pid_norm = key if ":" in key else "minecraft:" + key
+            e = f'KfcGen.testPredicate(source, {var}, {jstr(pid_norm)})'
+        else:
+            e = ex.replace("{P}", var).replace("{E}", var).replace("_kp", f"_kp{i}")
+        out.append(f"!({e})" if neg else e)
+    return out
+
+
+def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
+    """tag add/remove 의 셀렉터 홀더. @n/@e[limit=1]/@p -> 단일, @e[...]/@a -> 전체 루프.
+       predicate 동반 시: 컴파일 가능한 predicate 면 본문 가드로 허용, 아니면 거부."""
+    sel = parse_selector(holder)
+    if sel is None or _sel_has_extra(sel):
+        em.reason = f"tag 셀렉터 홀더({holder[:25] if holder else '?'}) 미지원"
+        return False
+    if sel.predicates and predicate_guards(sel.predicates, "_t", player=False) is None:
+        em.reason = f"tag 셀렉터 predicate 미해소({holder[:25]})"
+        return False
+    fn = "addCommandTag" if verb == "add" else "removeCommandTag"
+    single = (sel.base in ("n", "p", "r")) or (sel.limit == 1)
+    if single:
+        ent = single_entity_expr(holder)
+        if ent is None:
+            em.reason = f"tag 단일 셀렉터({holder[:25]}) 해소 불가"
+            return False
+        pg = predicate_guards(sel.predicates, "_t", player=False) if sel.predicates else []
+        cond = "_t != null" + "".join(f" && {g}" for g in pg)
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                       f' if ({cond}) _t.{fn}({jstr(name)}); }}')
+        em.kind = "native"
+        return True
+    if sel.base == "a":
+        em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _t : ctx.allPlayers) {")
+        conds = [f'_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+        conds += [f'!_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        if sel.predicates:
+            conds += predicate_guards(sel.predicates, "_t", player=True)
+        if sel.distance is not None:
+            dlo, dhi = sel.distance
+            conds.append(f'KfcGen.posInRange(source.getPosition(), _t.getPos(), '
+                         f'{dlo if dlo is not None else -1}, {dhi if dhi is not None else -1})')
+        if sel.gamemode is not None:
+            gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
+            conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
+        for o2, (slo, shi) in sel.scores.items():
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            conds.append(f'KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        if conds:
+            em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+        em.java.append(f'    _t.{fn}({jstr(name)});')
+        em.java.append("}")
+        em.kind = "native"
+        return True
+    types = resolve_entity_types(sel) if sel.type_is_tag else (
+        [entity_type_java(sel.type_id)] if sel.type_id else None)
+    runtime_type_tag = None
+    if sel.type_is_tag and (not types or None in types):
+        # 컴파일타임 엔티티타입 태그 JSON 부재 -> 런타임 EntityType.isIn(#tag) 필터로 처리.
+        # (모드가 제공하는 #kartmobil:kartmodels 등은 게임 런타임엔 등록돼 있다.)
+        runtime_type_tag = (sel.type_id, sel.type_neg)
+        types = None
+    elif (not types or None in types) and sel.type_id:
+        em.reason = f"tag @e 셀렉터 타입 미해소({holder[:25]})"
+        return False
+    tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
+    lo, hi = sel.distance if sel.distance else (None, None)
+    dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+    if types:
+        arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit})'
+              if (sel.limit or 0) >= 1 else
+              f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
+    else:
+        # 타입 미지정 @e (또는 런타임 타입태그) - 전 엔티티 순회
+        _q = f'KfcGen.allEntitiesAny(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
+    em.java.append(f'for (net.minecraft.entity.Entity _t : {_q}) {{')
+    if runtime_type_tag is not None:
+        tid, tneg = runtime_type_tag
+        chk = f'KfcGen.entityInTypeTag(_t, {jstr(tid)})'
+        em.java.append(f'    if ({"" if tneg else "!"}({chk})) continue;')
+    for o2, (slo, shi) in sel.scores.items():
+        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        em.java.append(f'    if (!KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+    if sel.predicates:
+        for g in predicate_guards(sel.predicates, "_t", player=False):
+            em.java.append(f'    if (!({g})) continue;')
+    em.java.append(f'    _t.{fn}({jstr(name)});')
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def _num(v):
+    try: return float(str(v))
+    except (TypeError, ValueError): return None
+
+
+def _time_to_ticks(v):
+    """'10' / '10t' / '5s' / '1d' -> 정수 틱. 파싱불가 시 None."""
+    s = str(v).strip()
+    mult = 1.0
+    if s.endswith("t"): s = s[:-1]
+    elif s.endswith("s"): s, mult = s[:-1], 20.0
+    elif s.endswith("d"): s, mult = s[:-1], 24000.0
+    try: return int(float(s) * mult)
+    except ValueError: return None
+
+
+def _blockpos_java(pos) -> str | None:
+    """좌표 문자열 -> BlockPos 자바식. 생략 -> 실행 위치. 상대(~/^) -> None(폴백)."""
+    if pos is None or str(pos).strip() == "":
+        return "net.minecraft.util.math.BlockPos.ofFloored(source.getPosition())"
+    parts = str(pos).split()
+    if len(parts) != 3 or any(("~" in p or "^" in p) for p in parts):
+        return None
+    try:
+        xi, yi, zi = int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
+    except ValueError:
+        return None
+    return f"new net.minecraft.util.math.BlockPos({xi}, {yi}, {zi})"
+
+
+def _angle_java(a) -> str | None:
+    """각도 -> float 리터럴. 상대(~/^)는 None(폴백)."""
+    s = str(a).strip()
+    if s.startswith("~") or s.startswith("^"):
+        return None
+    try:
+        return f"{float(s)}f"
+    except ValueError:
+        return None
+
+
+def _player_targets(em: Emitted, targets: str, var: str, body) -> bool | None:
+    """플레이어/엔티티 대상 해소(@s/루프/단일) -> body(식). 미해소면 None."""
+    if targets == "@s":
+        em.java.append(f'if (executor != null) {body("executor")}')
+        return True
+    sel = parse_selector(targets)
+    lo = entity_loop_open(sel, var) if sel else None
+    if lo is None:
+        ent = single_entity_expr(targets)
+        if ent is None:
+            return None
+        em.java.append(f'{{ net.minecraft.entity.Entity {var} = {ent}; if ({var} != null) {body(var)} }}')
+        return True
+    em.java.extend(lo)
+    em.java.append(f'    {body(var)}')
+    em.java.append("}")
+    return True
+
+
+def emit_setworldspawn(nn: list[str], args: dict, em: Emitted) -> bool:
+    """setworldspawn [pos] [angle] - 월드 스폰 설정."""
+    bp = _blockpos_java(first_arg(args, "pos"))
+    if bp is None:
+        em.reason = "setworldspawn 좌표 미지원(절대/생략만)"; return False
+    angle = first_arg(args, "angle")
+    ang = "0.0f" if angle is None else _angle_java(angle)
+    if ang is None:
+        em.reason = "setworldspawn 각도 미지원(절대만)"; return False
+    em.java.append(f"source.getWorld().setSpawnPos({bp}, {ang});")
+    em.kind = "native"; return True
+
+
+def emit_spawnpoint(nn: list[str], args: dict, em: Emitted) -> bool:
+    """spawnpoint [targets] [pos] [angle] - 플레이어 스폰포인트 설정."""
+    targets = first_arg(args, "targets") or "@s"
+    bp = _blockpos_java(first_arg(args, "pos"))
+    if bp is None:
+        em.reason = "spawnpoint 좌표 미지원(절대/생략만)"; return False
+    angle = first_arg(args, "angle")
+    ang = "0.0f" if angle is None else _angle_java(angle)
+    if ang is None:
+        em.reason = "spawnpoint 각도 미지원(절대만)"; return False
+    body = lambda p: f"KfcGen.setSpawnPoint(source, {p}, {bp}, {ang});"
+    ok = _player_targets(em, targets, "_spnE", body)
+    if ok is None:
+        em.reason = f"spawnpoint 대상({targets[:20]}) 미해소"; return False
+    em.kind = "native"; return True
+
+
+def emit_enchant(nn: list[str], args: dict, em: Emitted) -> bool:
+    """enchant <targets> <enchantment> [level] - 주손 아이템에 인챈트 부여."""
+    targets = first_arg(args, "targets")
+    ench = first_arg(args, "enchantment")
+    if targets is None or ench is None:
+        em.reason = "enchant 대상/인챈트 없음"; return False
+    level = first_arg(args, "level")
+    lvl = "1" if level is None else jint(level)
+    body = lambda p: f"KfcGen.enchantHeld(source, {p}, {jstr(str(ench))}, {lvl});"
+    ok = _player_targets(em, targets, "_encE", body)
+    if ok is None:
+        em.reason = f"enchant 대상({targets[:20]}) 미해소"; return False
+    em.kind = "native"; return True
+
+
+def _tp_rot_comp(v: str, field: str) -> str:
+    """tp 회전 성분. field 'y'=yaw, 'x'=pitch. 상대(~)는 source 회전 기준."""
+    if v == "~":
+        return f"source.getRotation().{field}"
+    if v.startswith("~"):
+        return f"(source.getRotation().{field} + {jfloat(v[1:])})"
+    return jfloat(v)
+
+
+def _tp_targets(em: Emitted, targets: str, body) -> bool | None:
+    """tp 대상 해소(@s/루프/단일) 후 body(엔티티식) 호출. 미해소면 None."""
+    if targets == "@s":
+        em.java.append(f'if (executor != null) {body("executor")}')
+        return True
+    sel = parse_selector(targets)
+    lo = entity_loop_open(sel, "_tpE") if sel else None
+    if lo is None:
+        ent = single_entity_expr(targets)
+        if ent is None:
+            return None
+        em.java.append(f'{{ net.minecraft.entity.Entity _tpE = {ent}; if (_tpE != null) {body("_tpE")} }}')
+        return True
+    em.java.extend(lo)
+    em.java.append(f'    {body("_tpE")}')
+    em.java.append("}")
+    return True
+
+
+def emit_tp(nn: list[str], args: dict, em: Emitted) -> bool:
+    """tp/teleport 전체: 엔티티 목적지 / 좌표(절대·상대·caret) / +회전 / +facing(좌표·엔티티)."""
+    targets_raw = first_arg(args, "targets")
+    dest_ent = first_arg(args, "destination")
+    location = first_arg(args, "location")
+    rotation = first_arg(args, "rotation")
+    facing_loc = first_arg(args, "facingLocation")
+    facing_ent = first_arg(args, "facingEntity")
+    targets = targets_raw if targets_raw is not None else "@s"
+
+    # ── 목적지가 엔티티 ──
+    if dest_ent is not None and location is None:
+        dexpr = "executor" if dest_ent == "@s" else single_entity_expr(dest_ent)
+        if dexpr is None:
+            em.reason = f"tp 목적지 엔티티({dest_ent[:20]}) 미해소"; return False
+        em.java.append("{")
+        em.java.append(f"    net.minecraft.entity.Entity _tpDest = {dexpr};")
+        ok = _tp_targets(em, targets,
+                         lambda t: f"{{ if (_tpDest != null) KfcGen.teleportToEntity({t}, _tpDest); }}")
+        em.java.append("}")
+        if ok is None:
+            em.reason = f"tp 대상({targets[:20]}) 미해소"; return False
+        em.kind = "native"; return True
+
+    # ── 목적지가 좌표 ──
+    if location is None:
+        em.reason = "tp 목적지 없음"; return False
+    posv = cond_pos_expr(location, "source")
+    if posv is None:
+        em.reason = f"tp 좌표({location[:20]}) 미지원(혼합 caret)"; return False
+
+    # 후처리: 회전 / facing
+    rot = None
+    face = None  # ("pos",) | ("ent", eyes_bool)
+    if rotation is not None:
+        rp = str(rotation).split()
+        if len(rp) != 2:
+            em.reason = "tp 회전 형식 오류"; return False
+        rot = (_tp_rot_comp(rp[0], "y"), _tp_rot_comp(rp[1], "x"))   # (yaw, pitch)
+    elif facing_loc is not None:
+        fv = cond_pos_expr(facing_loc, "source")
+        if fv is None:
+            em.reason = "tp facing 좌표 미지원"; return False
+        face = ("pos",)
+    elif facing_ent is not None:
+        fexpr = "executor" if facing_ent == "@s" else single_entity_expr(facing_ent)
+        if fexpr is None:
+            em.reason = f"tp facing 엔티티({facing_ent[:20]}) 미해소"; return False
+        face = ("ent", ("eyes" in nn))
+
+    em.java.append("{")
+    em.java.append(f"    net.minecraft.util.math.Vec3d _tpPos = {posv};")
+    if face == ("pos",):
+        em.java.append(f"    net.minecraft.util.math.Vec3d _tpFace = {fv};")
+    elif face is not None and face[0] == "ent":
+        em.java.append(f"    net.minecraft.entity.Entity _tpFE = {fexpr};")
+
+    if rot is not None:
+        yaw, pitch = rot
+        body = lambda t: f"KfcGen.teleportToWithRot({t}, _tpPos.x, _tpPos.y, _tpPos.z, {yaw}, {pitch});"
+    elif face == ("pos",):
+        body = lambda t: f"KfcGen.teleportToFacing({t}, _tpPos.x, _tpPos.y, _tpPos.z, _tpFace.x, _tpFace.y, _tpFace.z);"
+    elif face is not None and face[0] == "ent":
+        eyes = "true" if face[1] else "false"
+        body = lambda t: f"{{ if (_tpFE != null) KfcGen.teleportToFacingEntity({t}, _tpPos.x, _tpPos.y, _tpPos.z, _tpFE, {eyes}); }}"
+    else:
+        # 전부 상대(~/^) 미세이동은 movePosition(보간/승객 유지), 절대 혼합은 풀 teleportTo.
+        _all_rel = all(p and p[0] in "~^" for p in str(location).split())
+        _call = "movePosition" if _all_rel else "teleportTo"
+        body = lambda t: f"KfcGen.{_call}({t}, _tpPos.x, _tpPos.y, _tpPos.z);"
+
+    ok = _tp_targets(em, targets, body)
+    em.java.append("}")
+    if ok is None:
+        em.reason = f"tp 대상({targets[:20]}) 미해소"; return False
+    em.kind = "native"; return True
+
+
+def emit_place(nn: list[str], args: dict, em: Emitted) -> bool:
+    """place feature <id> [pos] - 구성된 피처 배치. structure/jigsaw/template 는 1차 폴백."""
+    sub = nn[1] if len(nn) > 1 else None
+    if sub != "feature":
+        em.reason = f"place {sub} 1차 미지원(feature 만)"; return False
+    fid = first_arg(args, "feature") or first_arg(args, "id")
+    if fid is None:
+        # 인자 이름이 다를 경우 첫 값 사용
+        for vs in args.values():
+            if vs and vs[0].get("raw"):
+                fid = vs[0]["raw"]; break
+    if fid is None:
+        em.reason = "place feature id 없음"; return False
+    posj = _blockpos_java(first_arg(args, "pos"))
+    if posj is None:
+        em.reason = "place feature 좌표 미지원(절대/생략만)"; return False
+    em.java.append(f"KfcGen.placeFeature(source, {jstr(str(fid))}, {posj});")
+    em.kind = "native"; return True
+
+
+def emit_spreadplayers(nn: list[str], args: dict, em: Emitted) -> bool:
+    """spreadplayers <center> <spread> <maxRange> <respectTeams> <targets> - 분산 텔레포트.
+       (RNG 산포라 바닐라와 비트동일은 아니나, 중심/최대범위/최소간격/표면배치/팀존중 계약 충족)"""
+    if "under" in nn:
+        em.reason = "spreadplayers under 변형 1차 미지원"; return False
+    center = str(first_arg(args, "center") or "")
+    parts = center.split()
+    if len(parts) != 2 or any(("~" in p or "^" in p) for p in parts):
+        em.reason = f"spreadplayers center({center[:20]}) 절대좌표만"; return False
+    cx, cz = _num(parts[0]), _num(parts[1])
+    spread = _num(first_arg(args, "spreadDistance"))
+    maxr = _num(first_arg(args, "maxRange"))
+    rt = first_arg(args, "respectTeams")
+    tgt = first_arg(args, "targets")
+    if None in (cx, cz, spread, maxr) or tgt is None:
+        em.reason = "spreadplayers 인자 부족"; return False
+    rtj = "true" if str(rt).lower() == "true" else "false"
+    sel = parse_selector(tgt)
+    lo = entity_loop_open(sel, "_spE") if sel else None
+    em.java.append("{ java.util.List<net.minecraft.entity.Entity> _spT = new java.util.ArrayList<>();")
+    if lo is not None:
+        em.java.extend(lo)
+        em.java.append("    _spT.add(_spE);")
+        em.java.append("}")
+    elif tgt == "@s":
+        em.java.append("    if (executor != null) _spT.add(executor);")
+    else:
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"spreadplayers 대상({tgt[:20]}) 미해소"; return False
+        em.java.append(f"    {{ net.minecraft.entity.Entity _spE = {ent}; if (_spE != null) _spT.add(_spE); }}")
+    em.java.append(f"    KfcGen.spreadPlayers(source, {cx}, {cz}, {spread}, {maxr}, {rtj}, _spT);")
+    em.java.append("}")
+    em.kind = "native"; return True
+
+
+def emit_worldborder(nn: list[str], args: dict, em: Emitted) -> bool:
+    """worldborder set/add <size> [time] | center <x> <z> | damage amount/buffer | warning distance/time."""
+    sub = nn[1] if len(nn) > 1 else None
+    WB = "source.getWorld().getWorldBorder()"
+    if sub in ("set", "add"):
+        size = _num(first_arg(args, "distance"))
+        if size is None:
+            em.reason = f"worldborder {sub} 거리 파싱불가"; return False
+        t = _num(first_arg(args, "time")) or 0.0
+        tgt = f"{size}" if sub == "set" else f"_wb.getSize() + {size}"
+        if t <= 0:
+            if sub == "set":
+                em.java.append(f"{WB}.setSize({size});")
+            else:
+                em.java.append(f"{{ net.minecraft.world.border.WorldBorder _wb = {WB}; _wb.setSize({tgt}); }}")
+        else:
+            ms = int(t * 1000)
+            em.java.append(f"{{ net.minecraft.world.border.WorldBorder _wb = {WB}; "
+                           f"_wb.interpolateSize(_wb.getSize(), {tgt}, {ms}L); }}")
+        em.kind = "native"; return True
+    if sub == "center":
+        pos = first_arg(args, "pos") or ""
+        parts = str(pos).split()
+        if len(parts) != 2 or any(("~" in p or "^" in p) for p in parts):
+            em.reason = f"worldborder center 좌표({pos[:20]}) 미지원(절대좌표만)"; return False
+        x, z = _num(parts[0]), _num(parts[1])
+        if x is None or z is None:
+            em.reason = "worldborder center 좌표 파싱불가"; return False
+        em.java.append(f"{WB}.setCenter({x}, {z});")
+        em.kind = "native"; return True
+    if sub == "damage":
+        what = nn[2] if len(nn) > 2 else None
+        val = _num(first_arg(args, "damagePerBlock") or first_arg(args, "distance"))
+        if val is None:
+            em.reason = "worldborder damage 값 파싱불가"; return False
+        if what == "amount":
+            em.java.append(f"{WB}.setDamagePerBlock({val});")
+        elif what == "buffer":
+            em.java.append(f"{WB}.setSafeZone({val});")
+        else:
+            em.reason = f"worldborder damage {what} 미지원"; return False
+        em.kind = "native"; return True
+    if sub == "warning":
+        what = nn[2] if len(nn) > 2 else None
+        val = first_arg(args, "distance") or first_arg(args, "time")
+        if val is None:
+            em.reason = "worldborder warning 값 없음"; return False
+        if what == "distance":
+            em.java.append(f"{WB}.setWarningBlocks({jint(val)});")
+        elif what == "time":
+            em.java.append(f"{WB}.setWarningTime({jint(val)});")
+        else:
+            em.reason = f"worldborder warning {what} 미지원"; return False
+        em.kind = "native"; return True
+    em.reason = f"worldborder {sub} 미지원(get 등)"; return False
+
+
+def emit_damage(nn: list[str], args: dict, em: Emitted) -> bool:
+    """damage <target> <amount> [<type>] - 엔티티에 데미지. by/at/from 동반은 1차 폴백."""
+    if any(x in nn for x in ("by", "at", "from")):
+        em.reason = "damage by/at/from 1차 미지원"; return False
+    tgt = first_arg(args, "target")
+    amount = _num(first_arg(args, "amount"))
+    if tgt is None or amount is None:
+        em.reason = "damage 대상/양 없음"; return False
+    dtype = first_arg(args, "damageType")
+    tj = "null" if dtype is None else jstr(str(dtype))
+    body = lambda exp: f"KfcGen.applyDamage({exp}, source.getWorld(), {amount}f, {tj});"
+    if tgt == "@s":
+        em.java.append(f'if (executor != null) {body("executor")}')
+        em.kind = "native"; return True
+    sel = parse_selector(tgt)
+    lo = entity_loop_open(sel, "_dmgE") if sel else None
+    if lo is None:
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"damage 대상({tgt[:20]}) 미해소"; return False
+        em.java.append(f'{{ net.minecraft.entity.Entity _dmgE = {ent}; if (_dmgE != null) {body("_dmgE")} }}')
+        em.kind = "native"; return True
+    em.java.extend(lo)
+    em.java.append(f'    {body("_dmgE")}')
+    em.java.append("}")
+    em.kind = "native"; return True
+
+
+def emit_trigger(nn: list[str], args: dict, em: Emitted) -> bool:
+    """trigger <objective> [add <v> | set <v>] - 실행 플레이어(@s)의 트리거 점수. enable/lock 시맨틱 재현."""
+    obj = first_arg(args, "objective")
+    if obj is None:
+        em.reason = "trigger 목표 없음"; return False
+    val = first_arg(args, "value")
+    if "set" in nn:
+        mode, v = 2, (jint(val) if val is not None else "0")
+    elif "add" in nn:
+        mode, v = 1, (jint(val) if val is not None else "1")
+    else:
+        mode, v = 1, "1"   # trigger <obj> == add 1
+    em.java.append(f"KfcGen.triggerScore(source, {jstr(str(obj))}, {mode}, {v});")
+    em.kind = "native"; return True
+
+
+def emit_schedule(nn: list[str], args: dict, em: Emitted) -> bool:
+    """schedule function <fn> <time> [append|replace] | schedule clear <fn>."""
+    fn = first_arg(args, "function")
+    if fn is None:
+        em.reason = "schedule 함수 없음"; return False
+    fn = str(fn)
+    if fn.startswith("#"):
+        em.reason = "schedule 함수태그(#) 1차 미지원"; return False
+    if "clear" in nn:
+        em.java.append(f"KfcGen.scheduleClear(source, {jstr(fn)});")
+        em.kind = "native"; return True
+    time = first_arg(args, "time")
+    ticks = _time_to_ticks(time) if time is not None else None
+    if ticks is None:
+        em.reason = f"schedule 시간({time}) 파싱불가"; return False
+    append = "append" in nn
+    em.java.append(f"KfcGen.scheduleFunction(source, {jstr(fn)}, {ticks}L, {str(append).lower()});")
+    em.kind = "native"; return True
+
+
+def emit_give(nn: list[str], args: dict, em: Emitted) -> bool:
+    """give <targets> <item> [count] - 플레이어에게 아이템 지급(오버플로우 자동 드롭)."""
+    tgt = first_arg(args, "targets") or "@s"
+    item = first_arg(args, "item")
+    count = first_arg(args, "count")
+    if item is None:
+        em.reason = "give 아이템 없음"; return False
+    item = str(item)
+    cj = "1" if count is None else jint(count)
+    if "[" in item or "{" in item:
+        # 컴포넌트/데이터 동반 아이템 -> 런타임 ItemStackArgumentType 파싱(정확).
+        ij = jstr(item)
+        callc = (lambda p: f'if ({p} instanceof net.minecraft.server.network.ServerPlayerEntity _gp) '
+                           f'KfcGen.giveItemString(source, _gp, {ij}, {cj});')
+        if tgt == "@s":
+            em.java.append(f'if (executor != null) {{ {callc("executor")} }}')
+            em.kind = "native"; return True
+        sel = parse_selector(tgt)
+        lo = entity_loop_open(sel, "_gE") if sel else None
+        if lo is None:
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"give 대상({tgt[:20]}) 미해소"; return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _gE = {ent}; if (_gE != null) {{ {callc("_gE")} }} }}')
+            em.kind = "native"; return True
+        em.java.extend(lo)
+        em.java.append(f'    {callc("_gE")}')
+        em.java.append("}")
+        em.kind = "native"; return True
+    ij = jstr(item)
+    call = (lambda p: f'if ({p} instanceof net.minecraft.server.network.ServerPlayerEntity _gp) '
+                      f'KfcGen.giveItem(_gp, {ij}, {cj});')
+    if tgt == "@s":
+        em.java.append(f'if (executor != null) {{ {call("executor")} }}')
+        em.kind = "native"; return True
+    sel = parse_selector(tgt)
+    lo = entity_loop_open(sel, "_gE") if sel else None
+    if lo is None:
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"give 대상({tgt[:20]}) 미해소"; return False
+        em.java.append(f'{{ net.minecraft.entity.Entity _gE = {ent}; if (_gE != null) {{ {call("_gE")} }} }}')
+        em.kind = "native"; return True
+    em.java.extend(lo)
+    em.java.append(f'    {call("_gE")}')
+    em.java.append("}")
+    em.kind = "native"; return True
+
+
+def emit_gamerule(nn: list[str], args: dict, em: Emitted) -> bool:
+    """gamerule <rule> <value> - 룰 설정. 룰명은 리터럴(nn[1]). 조회(값 없음)는 폴백."""
+    rule = nn[1] if len(nn) > 1 else None
+    if rule is None:
+        em.reason = "gamerule 룰명 없음"; return False
+    value = first_arg(args, "value")
+    if value is None:
+        em.reason = f"gamerule {rule} 조회(미지원)"; return False
+    em.java.append(f'KfcGen.setGameRule(source, {jstr(rule)}, {jstr(str(value))});')
+    em.kind = "native"; return True
+
+
+def emit_xp(nn: list[str], args: dict, em: Emitted) -> bool:
+    """xp add|set <players> <amount> [points|levels] - 플레이어 셀렉터 루프."""
+    verb = "set" if "set" in nn else ("add" if "add" in nn else None)
+    if verb is None:
+        return False
+    sel = first_arg(args, "target")
+    amount = first_arg(args, "amount")
+    if sel is None or amount is None:
+        return False
+    unit = "levels" if "levels" in nn else "points"
+    method = {
+        ("add", "points"): "addExperience",
+        ("add", "levels"): "addExperienceLevels",
+        ("set", "points"): "setExperiencePoints",
+        ("set", "levels"): "setExperienceLevel",
+    }[(verb, unit)]
+    coll = bossbar_player_collection(sel, "_xpList")
+    if coll is None:
+        return False
+    lines, expr = coll
+    em.java.extend(lines)
+    em.java.append(f'for (net.minecraft.server.network.ServerPlayerEntity _xpp : {expr}) {{')
+    em.java.append(f'    _xpp.{method}({int(amount)});')
+    em.java.append('}')
+    return True
+
+
+def bossbar_player_collection(sel_raw: str, var: str):
+    """bossbar set players <sel> 의 플레이어 셀렉터 -> (자바 줄들, 컬렉션 식) 또는 None.
+       @a[tag,predicate] / @s 만 1차 지원. type/scores/distance 동반은 보수적으로 None(브릿지)."""
+    sel = parse_selector(sel_raw)
+    if sel is None or sel.type_id or sel.distance is not None or _sel_has_extra(sel):
+        return None
+    if sel.predicates and predicate_guards(sel.predicates, "_pp", player=True) is None:
+        return None
+
+    def _score_guards():
+        gs = []
+        for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
+            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            gs.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        return gs
+
+    lines = [f'java.util.List<net.minecraft.server.network.ServerPlayerEntity> {var} '
+             f'= new java.util.ArrayList<>();']
+    if sel.base == "a":
+        lines.append(f'for (net.minecraft.server.network.ServerPlayerEntity _pp : ctx.allPlayers) {{')
+        conds = [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+        conds += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        if sel.predicates:
+            conds += predicate_guards(sel.predicates, "_pp", player=True)
+        conds += _score_guards()
+        if conds:
+            lines.append(f'    if (!({" && ".join(conds)})) continue;')
+        lines.append(f'    {var}.add(_pp);')
+        lines.append("}")
+        return lines, var
+    if sel.base == "s":
+        guards = ["executor instanceof net.minecraft.server.network.ServerPlayerEntity _pp"]
+        for t in sel.tags_pos:
+            guards.append(f'_pp.getCommandTags().contains({jstr(t)})')
+        for t in sel.tags_neg:
+            guards.append(f'!_pp.getCommandTags().contains({jstr(t)})')
+        if sel.predicates:
+            guards += predicate_guards(sel.predicates, "_pp", player=True)
+        guards += _score_guards()
+        lines.append(f'if ({" && ".join(guards)}) {var}.add(_pp);')
+        return lines, var
+    return None
+
+
+def emit_bossbar(nn: list[str], args: dict, em: Emitted) -> bool:
+    """bossbar add / set <prop> 네이티브화. source(ServerCommandSource) 가 본문에 있음.
+       set: value/color/name/max/visible/players 지원. style/get/list/remove 는 미지원(브릿지)."""
+    if len(nn) < 2:
+        return False
+    verb = nn[1]
+    idr = first_arg(args, "id")
+    if idr is None:
+        em.reason = "bossbar id 없음"
+        return False
+    idj = jstr(idr)
+
+    if verb == "add":
+        name = first_arg(args, "name")
+        if name is None:
+            return False
+        em.java.append(f'KfcGen.bossbarAdd(source, {idj}, {jstr(name)});')
+        em.kind = "native"
+        return True
+
+    if verb == "set":
+        prop = nn[3] if len(nn) > 3 else None
+        if prop == "value":
+            v = first_arg(args, "value")
+            if v is None:
+                return False
+            em.java.append(f'KfcGen.bossbarSetValue(source, {idj}, {int(v)});')
+            em.kind = "native"; return True
+        if prop == "max":
+            v = first_arg(args, "max")
+            if v is None:
+                return False
+            em.java.append(f'KfcGen.bossbarSetMaxValue(source, {idj}, {int(v)});')
+            em.kind = "native"; return True
+        if prop == "color":
+            color = nn[4] if len(nn) > 4 else None    # color 다음 리터럴(red/blue/...)
+            if color is None:
+                return False
+            em.java.append(f'KfcGen.bossbarSetColor(source, {idj}, {jstr(color)});')
+            em.kind = "native"; return True
+        if prop == "name":
+            name = first_arg(args, "name")
+            if name is None:
+                return False
+            em.java.append(f'KfcGen.bossbarSetName(source, {idj}, {jstr(name)});')
+            em.kind = "native"; return True
+        if prop == "visible":
+            vis = nn[4] if len(nn) > 4 else None       # true/false 리터럴
+            if vis not in ("true", "false"):
+                return False
+            em.java.append(f'KfcGen.bossbarSetVisible(source, {idj}, {vis});')
+            em.kind = "native"; return True
+        if prop == "players":
+            sel_raw = first_arg(args, "targets")
+            if sel_raw is None:
+                # `bossbar set <id> players`(인자 없음) = 전체 제거
+                em.java.append(f'KfcGen.bossbarSetPlayers(source, {idj}, java.util.List.of());')
+                em.kind = "native"; return True
+            pc = bossbar_player_collection(sel_raw, "_bp")
+            if pc is None:
+                em.reason = f"bossbar players 셀렉터({sel_raw[:25]}) 미지원"
+                return False
+            lines, expr = pc
+            em.java.append("{")
+            for l in lines:
+                em.java.append("    " + l)
+            em.java.append(f'    KfcGen.bossbarSetPlayers(source, {idj}, {expr});')
+            em.java.append("}")
+            em.kind = "native"; return True
+        if prop == "style":
+            style = nn[4] if len(nn) > 4 else None     # progress/notched_6/notched_10/notched_12/notched_20
+            if style is None:
+                return False
+            em.java.append(f'KfcGen.bossbarSetStyle(source, {idj}, {jstr(style)});')
+            em.kind = "native"; return True
+        em.reason = f"bossbar set {prop} 미지원"
+        return False
+
+    if verb == "remove":
+        em.java.append(f'KfcGen.bossbarRemove(source, {idj});')
+        em.kind = "native"; return True
+
+    em.reason = f"bossbar {verb} 미지원"
+    return False
+
+
+def emit_scoreboard_numberformat(nn: list[str], args: dict, em: Emitted) -> bool:
+    """scoreboard players display numberformat <targets> <objective> [fixed <text>|blank|...].
+       순위 표시(timerdisplay 에 '$(rank)등' 고정)의 핵심 — 폴백되면 화면 갱신이 안 된다."""
+    holder = first_arg(args, "targets")
+    obj_n = first_arg(args, "objective")
+    if not holder or not obj_n:
+        em.reason = "numberformat 대상/objective 없음"
+        return False
+    # format type: numberformat 다음 토큰
+    try:
+        fmt = nn[nn.index("numberformat") + 1]
+    except (ValueError, IndexError):
+        fmt = None
+    # fixed/blank/styled/(없음=reset). styled 는 미지원(폴백).
+    if "fixed" in nn:
+        contents = first_arg(args, "contents")
+        if contents is None:
+            em.reason = "numberformat fixed 텍스트 없음"
+            return False
+        text_j = jstr(contents)  # MACROVAR 치환은 후처리(substitute_macro_token)가 처리
+        call = (f'KfcGen.displayNumberFormatFixed(source, sb, {{H}}, {jstr(obj_n)}, {text_j});')
+    elif "blank" in nn:
+        call = f'KfcGen.displayNumberFormatBlank(sb, {{H}}, {jstr(obj_n)});'
+    elif fmt in (None, "objective") or fmt not in ("fixed", "blank", "styled"):
+        # 인자 없는 numberformat = 기본 복원
+        call = f'KfcGen.displayNumberFormatReset(sb, {{H}}, {jstr(obj_n)});'
+    else:
+        em.reason = f"numberformat {fmt} 미지원(폴백)"
+        return False
+
+    # holder 해소: @s / #이름 / 셀렉터 (call 에 'server' 가 등장하면 prelude 자동 주입)
+    hg = self_holder_guard(holder)
+    if hg is not None:
+        h, guard = hg
+        stmt = call.replace("{H}", h)
+        em.java.append(f'if ({guard}) {stmt}' if guard else stmt)
+        em.kind = "native"
+        return True
+    if holder.startswith("#") or not holder.startswith("@"):
+        em.java.append(call.replace("{H}", jstr(holder)))
+        em.kind = "native"
+        return True
+    ent = single_entity_expr(holder)
+    if ent is not None:
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                       f' if (_t != null) {call.replace("{H}", "_t.getNameForScoreboard()")} }}')
+        em.kind = "native"
+        return True
+    sel = parse_selector(holder)
+    lo = entity_loop_open(sel, "_nfE") if sel else None
+    if lo is None:
+        em.reason = f"numberformat 셀렉터({holder[:25]}) 미지원"
+        return False
+    em.java.extend(lo)
+    em.java.append("    " + call.replace("{H}", "_nfE.getNameForScoreboard()"))
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def emit_scoreboard(sub: str, args: dict, em: Emitted) -> bool:
+    if sub == "reset":
+        holder = args["targets"][0]["raw"]
+        obj_n = args["objective"][0]["raw"] if args.get("objective") else None
+        hg = self_holder_guard(holder)
+        if hg is not None:
+            h, guard = hg
+            stmt = f'KfcGen.resetScore(sb, {h}, {("null" if obj_n is None else jstr(obj_n))});'
+            em.java.append(f'if ({guard}) {stmt}' if guard else stmt)
+            em.kind = "native"
+            return True
+        if holder.startswith("#") or not holder.startswith("@"):
+            em.java.append(f'KfcGen.resetScore(sb, {jstr(holder)}, {("null" if obj_n is None else jstr(obj_n))});')
+            em.kind = "native"
+            return True
+        ent = single_entity_expr(holder)
+        if ent is not None:
+            em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                           f' if (_t != null) KfcGen.resetScore(sb, _t.getNameForScoreboard(), '
+                           f'{("null" if obj_n is None else jstr(obj_n))}); }}')
+            em.kind = "native"
+            return True
+        sel = parse_selector(holder)
+        lo = entity_loop_open(sel, "_rstE") if sel else None
+        if lo is None:
+            em.reason = f"scoreboard reset 셀렉터({holder[:25]}) 미지원"
+            return False
+        em.java.extend(lo)
+        em.java.append(f'    KfcGen.resetScore(sb, _rstE.getNameForScoreboard(), '
+                       f'{("null" if obj_n is None else jstr(obj_n))});')
+        em.java.append("}")
+        em.kind = "native"
+        return True
+    if sub == "enable":
+        holder = args["targets"][0]["raw"]
+        obj_n = args["objective"][0]["raw"]
+        hg = self_holder_guard(holder)
+        if hg is not None:
+            h, guard = hg
+            stmt = f'KfcGen.enableTrigger(sb, {h}, {jstr(obj_n)});'
+            em.java.append(f'if ({guard}) {stmt}' if guard else stmt)
+            return True
+        sel = parse_selector(holder)
+        if sel is None or sel.predicates:
+            em.reason = f"scoreboard enable 셀렉터({holder[:25]}) 미지원"
+            return False
+        if sel.base == "a":
+            em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _t : ctx.allPlayers) {")
+            conds = [f'_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+            conds += [f'!_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            conds += _selector_extra_conds(sel, "_t")
+            if conds:
+                em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+            em.java.append(f'    KfcGen.enableTrigger(sb, _t.getNameForScoreboard(), {jstr(obj_n)});')
+            em.java.append("}")
+            em.kind = "native"
+            return True
+        ent = single_entity_expr(holder)
+        if ent is None:
+            em.reason = f"scoreboard enable 셀렉터({holder[:25]}) 해소 불가"
+            return False
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                       f' if (_t != null) KfcGen.enableTrigger(sb, _t.getNameForScoreboard(), {jstr(obj_n)}); }}')
+        em.kind = "native"
+        return True
+    if sub in ("add", "remove", "set"):
+        holder = args["targets"][0]["raw"]
+        obj = args["objective"][0]["raw"]
+        n = args["score"][0]["raw"]
+        hg = self_holder_guard(holder)
+        if hg is None:
+            # 셀렉터 홀더 -> 단일/전체 엔티티 루프로 처리
+            return emit_scoreboard_selector(sub, holder, obj, n, em)
+        h, guard = hg
+        nj = jint(n)
+        if sub == "set":
+            stmt = f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {nj});'
+        elif sub == "add":
+            stmt = f'KfcGen.addScore(sb, {h}, {jstr(obj)}, {nj});'
+        else:
+            stmt = f'KfcGen.addScore(sb, {h}, {jstr(obj)}, -({nj}));'
+        em.java.append(f'if ({guard}) {stmt}' if guard else stmt)
+        return True
+    if sub == "operation":
+        dhg = self_holder_guard(args["targets"][0]["raw"])
+        do = args["targetObjective"][0]["raw"]
+        op = args["operation"][0]["raw"]
+        shg = self_holder_guard(args["source"][0]["raw"])
+        so = args["sourceObjective"][0]["raw"]
+        if dhg is None or shg is None:
+            # operation 의 셀렉터 홀더: 대상이 단일이면 처리, 아니면 1차 브릿지(연쇄 시맨틱 복잡)
+            return emit_scoreboard_op_selector(args, em)
+        dh, dguard = dhg
+        sh, sguard = shg
+        guards = [g for g in (dguard, sguard) if g]
+        stmt = f'KfcGen.opScore(sb, {dh}, {jstr(do)}, {jstr(op)}, {sh}, {jstr(so)});'
+        if guards:
+            stmt = f'if ({" && ".join(guards)}) {stmt}'
+        em.java.append(stmt)
+        return True
+    return False
+
+
+def emit_effect(nn: list[str], args: dict, em: Emitted) -> bool:
+    """effect give/clear. 대상은 LivingEntity (@s/@a/@e/@n). give: seconds×20틱."""
+    verb = "give" if "give" in nn else ("clear" if "clear" in nn else None)
+    if verb is None:
+        em.reason = "effect 하위명령 미지원"
+        return False
+    holder = first_arg(args, "targets")
+    if not holder:
+        em.reason = "effect 대상 없음"
+        return False
+    sel = parse_selector(holder)
+    if sel is None or sel.scores or sel.predicates:
+        em.reason = f"effect 셀렉터({holder[:25]}) 미지원"
+        return False
+    eff = first_arg(args, "effect")
+
+    if verb == "give":
+        if not eff:
+            em.reason = "effect give 효과 없음"
+            return False
+        secs = first_arg(args, "seconds")
+        amp = first_arg(args, "amplifier") or "0"
+        hide = first_arg(args, "hideParticles")
+        if secs is None or secs == "infinite":
+            dur = "-1"
+        else:
+            try:
+                dur = str(int(float(secs)) * 20)
+            except ValueError:
+                em.reason = f"effect give 지속시간({secs}) 미지원"
+                return False
+        show = "false" if (hide and hide.lower() == "true") else "true"
+        call = f'KfcGen.effectGive({{E}}, {jstr(eff)}, {dur}, {amp}, {show});'
+    else:  # clear
+        call = (f'KfcGen.effectClear({{E}}, {jstr(eff)});' if eff
+                else 'KfcGen.effectClearAll({E});')
+
+    if sel.base == "s":
+        em.java.append("if (executor != null) " + call.replace("{E}", "executor"))
+        em.kind = "native"
+        return True
+    # 단일 셀렉터(@n/@p/@r/@e[limit=1]) -> 단일 엔티티 해소
+    if sel.base in ("n", "p", "r") or sel.limit == 1:
+        ent = single_entity_expr(holder)
+        if ent is not None:
+            stmt = call.replace("{E}", "_fx")
+            em.java.append("{ net.minecraft.entity.Entity _fx = " + ent
+                           + "; if (_fx != null) " + stmt + " }")
+            em.kind = "native"
+            return True
+    loop = entity_loop_open(sel, "_fx")
+    if loop is None:
+        em.reason = f"effect 대상 루프({holder[:25]}) 미해소"
+        return False
+    em.java.extend(loop)
+    em.java.append("    " + call.replace("{E}", "_fx"))
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def emit_scoreboard_objectives(nn: list[str], args: dict, em: Emitted) -> bool:
+    """scoreboard objectives add/remove. add 는 멱등(이미 있으면 무시). 그 외(setdisplay/modify)는 폴백."""
+    oi = nn.index("objectives")
+    verb = nn[oi + 1] if oi + 1 < len(nn) else None
+    if verb == "add":
+        name = first_arg(args, "objective")
+        crit = first_arg(args, "criteria") or first_arg(args, "criterion") or "dummy"
+        disp = first_arg(args, "displayName")
+        if not name:
+            em.reason = "objectives add 이름 없음"
+            return False
+        if disp is not None:
+            em.java.append(f'KfcGen.ensureObjective(sb, {jstr(name)}, {jstr(crit)});')
+            em.java.append(f'KfcGen.setObjectiveDisplay(sb, server, {jstr(name)}, {jstr(disp)});')
+            em.kind = "native"
+            return True
+        em.java.append(f'KfcGen.ensureObjective(sb, {jstr(name)}, {jstr(crit)});')
+        em.kind = "native"
+        return True
+    if verb == "modify":
+        name = first_arg(args, "objective")
+        if not name:
+            em.reason = "objectives modify 이름 없음"
+            return False
+        if "displayname" in nn:
+            disp = first_arg(args, "displayName")
+            if disp is None:
+                em.reason = "objectives modify displayname 값 없음"
+                return False
+            em.java.append(f'KfcGen.setObjectiveDisplay(sb, server, {jstr(name)}, {jstr(disp)});')
+            em.kind = "native"
+            return True
+        em.reason = f"objectives modify {[n for n in nn if n not in ('scoreboard','objectives','modify')]} 1차 미지원"
+        return False
+    if verb == "remove":
+        name = first_arg(args, "objective")
+        if not name:
+            em.reason = "objectives remove 이름 없음"
+            return False
+        em.java.append(f'KfcGen.removeObjective(sb, {jstr(name)});')
+        em.kind = "native"
+        return True
+    em.reason = f"scoreboard objectives {verb} 1차 미지원"
+    return False
+
+
+def emit_scoreboard_selector(sub: str, holder: str, obj: str, n: str, em: Emitted) -> bool:
+    """scoreboard set/add/remove 의 셀렉터 홀더. @n/@e[limit=1]/@p -> 단일, @e[...] -> 전체 루프."""
+    sel = parse_selector(holder)
+    if sel is None:
+        em.reason = f"scoreboard 셀렉터 홀더({holder[:25]}) 미지원"
+        return False
+    fn = {"set": "setScore", "add": "addScore", "remove": "addScore"}[sub]
+    nj = jint(n)   # 매크로 토큰(MACROVAR_i) -> Integer.parseInt(...) 로 감싸 String->int 오류 방지
+    val = f"-({nj})" if sub == "remove" else nj
+
+    # 단일 대상(@n / limit=1 / @p / @s[..])
+    single = (sel.base in ("n", "p", "r")) or (sel.limit == 1) or (sel.base == "s")
+    if single:
+        ent = single_entity_expr(holder)
+        if ent is None:
+            em.reason = f"scoreboard 단일 셀렉터({holder[:25]}) 해소 불가"
+            return False
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                       f' if (_t != null) KfcGen.{fn}(sb, _t.getNameForScoreboard(), {jstr(obj)}, {val}); }}')
+        em.kind = "native"
+        return True
+
+    # 전체 루프(@e[...] / @a) -> entity_loop_open 으로 모든 가드(predicate/scores/type태그/extra) 일괄.
+    lo2 = entity_loop_open(sel, "_t")
+    if lo2 is None:
+        em.reason = f"scoreboard 루프 셀렉터({holder[:25]}) 미해소"
+        return False
+    em.java.extend(lo2)
+    em.java.append(f'    KfcGen.{fn}(sb, _t.getNameForScoreboard(), {jstr(obj)}, {val});')
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
+    """operation 의 셀렉터 홀더. 대상=단일, 소스=단일 인 경우만 1차 지원(가장 흔한 @n 패턴)."""
+    dholder = args["targets"][0]["raw"]
+    do = args["targetObjective"][0]["raw"]
+    op = args["operation"][0]["raw"]
+    sholder = args["source"][0]["raw"]
+    so = args["sourceObjective"][0]["raw"]
+
+    def name_expr(raw):
+        hg = self_holder_guard(raw)
+        if hg is not None:
+            h, guard = hg
+            return h, guard, None
+        sel = parse_selector(raw)
+        if sel is None or sel.predicates or _sel_has_extra(sel):
+            return None
+        single = (sel.base in ("n", "p", "r")) or (sel.limit == 1)
+        if not single:
+            return None  # operation 에 다중 대상은 연쇄 시맨틱 복잡 -> 미지원
+        ent = single_entity_expr(raw)
+        if ent is None:
+            return None
+        return None, None, ent
+
+    d = name_expr(dholder); s = name_expr(sholder)
+    if d is None and s is not None:
+        # 다중 '대상' × 단일 소스 - 바닐라는 대상 각각에 연산 적용(소스 고정).
+        dsel = parse_selector(dholder)
+        if dsel is not None and not dsel.predicates and dsel.base in ("e", "a"):
+            sexpr0, sguard0, sent0 = s
+            pre = []
+            if sent0 is not None:
+                pre.append(f'net.minecraft.entity.Entity _ops = {sent0};')
+                sname0 = '_ops.getNameForScoreboard()'; sguard0 = '_ops != null'
+            else:
+                sname0 = sexpr0
+            lo = entity_loop_open(dsel, "_od") if dsel.base == "e" else None
+            if dsel.base == "a":
+                body = [f'for (net.minecraft.server.network.ServerPlayerEntity _od : ctx.allPlayers) {{']
+                cs = [f'_od.getCommandTags().contains({jstr(t)})' for t in dsel.tags_pos]
+                cs += [f'!_od.getCommandTags().contains({jstr(t)})' for t in dsel.tags_neg]
+                if cs:
+                    body.append(f'    if (!({" && ".join(cs)})) continue;')
+            elif lo is not None:
+                body = list(lo)
+            else:
+                em.reason = f"scoreboard operation 다중 대상({dholder[:25]}) 타입 미해소"
+                return False
+            for o2, (slo2, shi2) in (dsel.scores or {}).items():
+                slo_j = "null" if slo2 is None else f"Integer.valueOf({slo2})"
+                shi_j = "null" if shi2 is None else f"Integer.valueOf({shi2})"
+                body.append(f'    if (!KfcGen.scoreMatches(sb, _od.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+            body.append(f'    KfcGen.opScore(sb, _od.getNameForScoreboard(), {jstr(do)}, {jstr(op)}, {sname0}, {jstr(so)});')
+            body.append("}")
+            if sguard0:
+                body = [f'if ({sguard0}) {{'] + ["    " + b for b in body] + ["}"]
+            em.java.append("{ " + " ".join(pre) + (" " if pre else ""))
+            em.java.extend(body)
+            em.java.append("}")
+            em.kind = "native"
+            return True
+    if d is None or s is None:
+        em.reason = "scoreboard operation 셀렉터 홀더(다중/predicate) 미지원"
+        return False
+    # 엔티티 식이 있으면 임시 변수로 뽑아 null 가드
+    pre = []
+    dexpr, dguard, dent = d
+    sexpr, sguard, sent = s
+    decls = []
+    if dent is not None:
+        decls.append(f'net.minecraft.entity.Entity _d = {dent};')
+        dname = '_d.getNameForScoreboard()'; dnull = '_d != null'
+    else:
+        dname = dexpr; dnull = None
+    if sent is not None:
+        decls.append(f'net.minecraft.entity.Entity _s = {sent};')
+        sname = '_s.getNameForScoreboard()'; snull = '_s != null'
+    else:
+        sname = sexpr; snull = None
+    guards = [g for g in (dguard, sguard, dnull, snull) if g]
+    body = f'KfcGen.opScore(sb, {dname}, {jstr(do)}, {jstr(op)}, {sname}, {jstr(so)});'
+    if guards:
+        body = f'if ({" && ".join(guards)}) {body}'
+    em.java.append("{ " + " ".join(decls + [body]) + " }")
+    em.kind = "native"
+    return True
+
+
+def _data_source_read_expr(skind: str, args: dict):
+    """data modify ... set from <source> 의 NBT 읽기 식. 미지원이면 None."""
+    spath = first_arg(args, "sourcePath")
+    if not spath:
+        return None
+    if skind == "entity":
+        ssel = first_arg(args, "source")
+        if ssel == "@s":
+            return f'KfcGen.nbtGetEntity(executor, {jstr(spath)})'
+        sent = single_entity_expr(ssel) if ssel else None
+        if sent is None:
+            return None
+        return f'KfcGen.nbtGetEntity({sent}, {jstr(spath)})'
+    if skind == "storage":
+        sid = first_arg(args, "source")
+        if not sid:
+            return None
+        return f'KfcGen.nbtGetStorage(server, {jstr(sid)}, {jstr(spath)})'
+    if skind == "block":
+        spos = first_arg(args, "sourcePos")
+        pe = cond_pos_expr(spos) if spos else None
+        if pe is None:
+            return None
+        return f'KfcGen.nbtGetBlock(ctx.world, {pe}, {jstr(spath)})'
+    return None
+
+
+def _data_target_write(tkind: str, args: dict, valvar: str):
+    """data modify <target> ... 의 NBT 쓰기(set) 식. 미지원이면 None."""
+    tpath = first_arg(args, "targetPath")
+    if not tpath:
+        return None
+    if tkind == "entity":
+        tsel = first_arg(args, "target")
+        if tsel == "@s":
+            return f'KfcGen.nbtSetEntity(executor, {jstr(tpath)}, {valvar})'
+        tent = single_entity_expr(tsel) if tsel else None
+        if tent is None:
+            return None
+        return f'KfcGen.nbtSetEntity({tent}, {jstr(tpath)}, {valvar})'
+    if tkind == "storage":
+        tid = first_arg(args, "target")
+        if not tid:
+            return None
+        return f'KfcGen.nbtSetStorage(server, {jstr(tid)}, {jstr(tpath)}, {valvar})'
+    return None
+
+
+def emit_data(nn: list[str], args: dict, em: Emitted) -> bool:
+    op = nn[1] if len(nn) > 1 else None       # modify / get / merge / remove
+    tgtkind = nn[2] if len(nn) > 2 else None   # entity / storage / block
+
+    # ---- data modify ----
+    if op == "modify":
+        # set value / set from
+        is_from = "from" in nn
+        # ── set from <entity|storage|block> (NBT 복사) ──
+        if is_from:
+            mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
+            fi = nn.index("from")
+            skind = nn[fi + 1] if fi + 1 < len(nn) else None
+            if mode in ("append", "prepend"):
+                read = _data_source_read_expr(skind, args)
+                if read is None:
+                    em.reason = f"data {mode} from {skind} 소스 미지원"
+                    return False
+                prep = "true" if mode == "prepend" else "false"
+                if tgtkind == "storage":
+                    tid = first_arg(args, "target"); tpath = first_arg(args, "targetPath")
+                    em.java.append(f'{{ net.minecraft.nbt.NbtElement _v = {read};'
+                                   f' if (_v != null) KfcGen.nbtAppendStorage(server, {jstr(tid)}, {jstr(tpath)}, _v, {prep}); }}')
+                    em.kind = "native"; return True
+                if tgtkind == "entity":
+                    tsel = first_arg(args, "target"); tpath = first_arg(args, "targetPath")
+                    tent = "executor" if tsel == "@s" else single_entity_expr(tsel)
+                    if tent is None:
+                        em.reason = f"data {mode} entity 대상({tsel}) 미지원"; return False
+                    em.java.append(f'{{ net.minecraft.nbt.NbtElement _v = {read}; net.minecraft.entity.Entity _te = {tent};'
+                                   f' if (_v != null && _te != null) KfcGen.nbtAppendEntity(_te, {jstr(tpath)}, _v, {prep}); }}')
+                    em.kind = "native"; return True
+                em.reason = f"data {mode} from -> {tgtkind} 타겟 미지원"
+                return False
+            if mode != "set":
+                em.reason = f"data modify {mode} from (리스트 복사 1차 미지원)"
+                return False
+            read = _data_source_read_expr(skind, args)
+            write = _data_target_write(tgtkind, args, "_v")
+            if read is None:
+                em.reason = f"data set from {skind} 소스 미지원"
+                return False
+            if write is None:
+                em.reason = f"data set from -> {tgtkind} 타겟 미지원"
+                return False
+            em.java.append(f'{{ net.minecraft.nbt.NbtElement _v = {read};'
+                           f' if (_v != null) {write}; }}')
+            em.kind = "native"
+            return True
+        if tgtkind == "entity":
+            sel = first_arg(args, "target")
+            path = first_arg(args, "targetPath")
+            mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
+            # append/prepend value {snbt} (리스트 추가) 지원. from 복사·merge 는 별도.
+            if not is_from and mode in ("append", "prepend"):
+                if sel == "@s":
+                    ent_expr2 = "executor"
+                else:
+                    ent_expr2 = single_entity_expr(sel)
+                    if ent_expr2 is None:
+                        em.reason = f"data modify entity 셀렉터({sel}) 미지원"
+                        return False
+                val2 = args.get("value", [{}])[0]
+                raw2 = val2.get("raw")
+                if raw2 is None:
+                    em.reason = "data modify entity append 값 raw 없음"
+                    return False
+                prep2 = "true" if mode == "prepend" else "false"
+                if sel == "@s":
+                    em.java.append(f'if (executor != null) KfcGen.entityAppendSnbt(executor, {jstr(path)}, {jstr(raw2)}, {prep2});')
+                else:
+                    em.java.append(f'{{ net.minecraft.entity.Entity _de = {ent_expr2};'
+                                   f' if (_de != null) KfcGen.entityAppendSnbt(_de, {jstr(path)}, {jstr(raw2)}, {prep2}); }}')
+                em.kind = "native"
+                return True
+            if is_from or mode != "set":
+                em.reason = f"data modify entity {mode}{'/from' if is_from else ''} (NBT 복사/리스트 1차 미지원)"
+                return False
+            # 대상 엔티티 식 결정
+            if sel == "@s":
+                ent_expr, guard = "executor", "executor != null"
+            else:
+                ent_expr = single_entity_expr(sel)
+                if ent_expr is None:
+                    em.reason = f"data modify entity 셀렉터({sel}) 미지원"
+                    return False
+            val = args.get("value", [{}])[0]
+            jval = nbt_value_java(val)
+            # 알려진 경로(숫자) -> 자바 API (executor 한정)
+            if sel == "@s" and path in KNOWN_ENTITY_PATHS and jval is not None:
+                kind, tmpl = KNOWN_ENTITY_PATHS[path]
+                em.java.append(f'if (executor != null) {tmpl.format(v=val["raw"])}')
+                em.kind = "native"
+                return True
+            raw = val.get("raw")
+            if raw is None:
+                em.reason = "data modify entity 값 raw 없음"
+                return False
+            if sel == "@s":
+                em.java.append(f'if (executor != null) KfcGen.entityPutSnbt(executor, {jstr(path)}, {jstr(raw)});')
+            else:
+                em.java.append(f'{{ net.minecraft.entity.Entity _de = {ent_expr};'
+                               f' if (_de != null) KfcGen.entityPutSnbt(_de, {jstr(path)}, {jstr(raw)}); }}')
+            em.kind = "native"
+            return True
+        elif tgtkind == "storage":
+            sid = first_arg(args, "target")
+            path = first_arg(args, "targetPath")
+            if is_from:
+                em.reason = "data modify storage set from (NBT 복사) 1차 미지원"
+                return False
+            mode = next((m for m in ("set", "append", "prepend", "merge", "insert") if m in nn), "set")
+            if mode == "insert":
+                em.reason = "data modify storage insert (인덱스 삽입) 1차 미지원"
+                return False
+            val = args.get("value", [{}])[0]
+            jval = nbt_value_java(val)
+            if mode == "set" and jval is not None:
+                # 숫자 값은 타입 보존 경로 유지
+                ntype = {"NbtInt":"int","NbtFloat":"float","NbtDouble":"double"}.get(val.get("kind"),"int")
+                em.java.append(f'KfcGen.storagePutNumber(server, {jstr(sid)}, {jstr(path)}, {jval}, {jstr(ntype)});')
+                em.kind = "native"
+                return True
+            # 임의 SNBT 값(리스트/문자열/컴파운드) - 원문 raw 를 그대로 파싱해 기록
+            raw = val.get("raw")
+            if raw is None:
+                em.reason = "data modify storage 값 raw 없음"
+                return False
+            em.java.append(f'KfcGen.storagePutSnbt(server, {jstr(sid)}, {jstr(path)}, {jstr(raw)}, {jstr(mode)});')
+            em.kind = "native"
+            return True
+        return False
+
+    # ---- data remove ----
+    if op == "remove":
+        path = first_arg(args, "path")
+        if tgtkind == "entity":
+            sel = first_arg(args, "target")
+            if sel == "@s":
+                em.java.append(f'if (executor != null) KfcGen.entityRemovePath(executor, {jstr(path)});')
+                em.kind = "native"
+                return True
+            ent = single_entity_expr(sel)
+            if ent is None:
+                em.reason = f"data remove entity 셀렉터({sel}) 미해소"
+                return False
+            em.java.append(f'{{ net.minecraft.entity.Entity _de = {ent};'
+                           f' if (_de != null) KfcGen.entityRemovePath(_de, {jstr(path)}); }}')
+            em.kind = "native"
+            return True
+        elif tgtkind == "storage":
+            sid = first_arg(args, "target")
+            em.java.append(f'KfcGen.storageRemovePath(server, {jstr(sid)}, {jstr(path)});')
+            em.kind = "native"
+            return True
+        return False
+
+    # ---- data get (단독; 보통 store 와 함께 쓰임. 단독은 부수효과 없어 무시 가능하나 안전히 브릿지) ----
+    if op == "get":
+        em.reason = "단독 data get (부수효과 없음 - 보통 store 와 결합; 단독은 브릿지)"
+        return False
+
+    # ---- data merge ----
+    if op == "merge":
+        if tgtkind == "entity":
+            sel = first_arg(args, "target")
+            raw = first_arg(args, "nbt")
+            if raw is None:
+                em.reason = "data merge entity nbt 없음"
+                return False
+            if sel == "@s":
+                em.java.append(f'if (executor != null) KfcGen.entityMergeSnbt(executor, {jstr(raw)});')
+            else:
+                ent_expr = single_entity_expr(sel)
+                if ent_expr is None:
+                    em.reason = f"data merge entity 셀렉터({sel}) 미지원"
+                    return False
+                em.java.append(f'{{ net.minecraft.entity.Entity _de = {ent_expr};'
+                               f' if (_de != null) KfcGen.entityMergeSnbt(_de, {jstr(raw)}); }}')
+            em.kind = "native"
+            return True
+        if tgtkind == "storage":
+            sid = first_arg(args, "target")
+            raw = first_arg(args, "nbt")
+            if raw is None or not sid:
+                em.reason = "data merge storage nbt 없음"
+                return False
+            em.java.append(f'KfcGen.storageMergeSnbt(server, {jstr(sid)}, {jstr(raw)});')
+            em.kind = "native"
+            return True
+        em.reason = f"data merge {tgtkind} (NBT 컴파운드 병합 - 1차 미지원)"
+        return False
+
+    return False
+
+
+def nbt_value_java(val: dict) -> str | None:
+    """NBT 값 -> 자바 리터럴. 숫자류만 (문자열/컴파운드는 None->브릿지)."""
+    kind = val.get("kind")
+    raw = val.get("raw", "")
+    if kind == "NbtInt":
+        return raw
+    if kind == "NbtFloat":
+        return raw if raw.endswith(("f", "F")) else raw + "f"
+    if kind == "NbtDouble":
+        return raw.rstrip("dD")
+    if kind == "NbtShort":
+        return f"(short)({raw.rstrip('sS')})"
+    if kind == "NbtByte":
+        r = raw.strip()
+        if r.lower() in ("true", "false"):
+            return "(byte)1" if r.lower() == "true" else "(byte)0"
+        return f"(byte)({r.rstrip('bB')})"
+    if kind == "NbtLong":
+        return raw if raw.endswith(("l","L")) else raw + "L"
+    return None  # NbtString / NbtCompound / NbtList -> 1차 브릿지
+
+
+# 알려진 엔티티 NBT 경로 -> 자바 API. 미지원 경로는 NBT 트리 조작 헬퍼로.
+KNOWN_ENTITY_PATHS = {
+    "Pos[0]": ("set", "if (executor != null) executor.setPos({v}, executor.getY(), executor.getZ());"),
+    "Pos[1]": ("set", "if (executor != null) executor.setPos(executor.getX(), {v}, executor.getZ());"),
+    "Pos[2]": ("set", "if (executor != null) executor.setPos(executor.getX(), executor.getY(), {v});"),
+}
+
+
+# ───────────────────────── execute emit ─────────────────────────
+# execute 의 수정자를 의미별로 분해.
+def cond_pos_expr(raw: str, src_var: str = "source"):
+    """조건(if block/loaded)용 좌표 식 - src_var 소스 기준 절대/상대/caret -> Vec3d 식."""
+    parts = raw.split()
+    if len(parts) != 3:
+        return None
+    if all(p.startswith('^') for p in parts):
+        v = [jdouble(p[1:] or '0') for p in parts]
+        return (f'KfcGen.localOffset({src_var}.getPosition(), {src_var}.getRotation(), '
+                f'{v[0]}, {v[1]}, {v[2]})')
+    if any(p.startswith('^') for p in parts):
+        return None
+    comps = []
+    for i, p in enumerate(parts):
+        base = f'{src_var}.getPosition().' + ('x', 'y', 'z')[i]
+        comps.append(base if p == '~' else (f'({base} + {jdouble(p[1:])})' if p.startswith('~') else jdouble(p)))
+    return f'new net.minecraft.util.math.Vec3d({", ".join(comps)})'
+
+
+def pos_rebind_expr(raw: str, src_var: str):
+    """positioned <pos> -> withPosition 식. caret(^)/상대(~)/절대 지원. 혼합(^와 ~/절대)은 None."""
+    parts = raw.split()
+    if len(parts) != 3:
+        return None
+    if all(p.startswith('^') for p in parts):
+        vals = [jdouble(p[1:] or '0') for p in parts]
+        return (f'{src_var}.withPosition(KfcGen.localOffset({src_var}.getPosition(), '
+                f'{src_var}.getRotation(), {vals[0]}, {vals[1]}, {vals[2]}))')
+    if any(p.startswith('^') for p in parts):
+        return None  # caret 혼합은 마크도 불허
+    comps = []
+    for i, p in enumerate(parts):
+        base = f'{src_var}.getPosition().' + ('x', 'y', 'z')[i]
+        if p == '~':
+            comps.append(base)
+        elif p.startswith('~'):
+            comps.append(f'({base} + {jdouble(p[1:])})')
+        else:
+            comps.append(jdouble(p))
+    return f'{src_var}.withPosition(new net.minecraft.util.math.Vec3d({", ".join(comps)}))'
+
+
+def rot_rebind_expr(raw: str, src_var: str):
+    """rotated <yaw> <pitch> -> withRotation 식. Vec2f(x=pitch, y=yaw)."""
+    parts = raw.split()
+    if len(parts) != 2:
+        return None
+    def comp(v, field):
+        if v == '~':
+            return f'{src_var}.getRotation().{field}'
+        if v.startswith('~'):
+            return f'({src_var}.getRotation().{field} + {jfloat(v[1:])})'
+        return jfloat(v)
+    yaw = comp(parts[0], 'y')
+    pitch = comp(parts[1], 'x')
+    return f'{src_var}.withRotation(new net.minecraft.util.math.Vec2f({pitch}, {yaw}))'
+
+
+# rebind 뒤에 와도 안전한(위치 비의존) head 노드들
+_REBIND_SAFE_AFTER = {"if", "unless", "score", "target", "targetObjective", "matches", "range",
+                      "source", "sourceObjective", "positioned", "pos", "rotated", "rotation",
+                      "items", "entity", "entities", "slots", "item_predicate", "run"}
+
+def extract_rebinds(head: list[dict]):
+    """head 에서 positioned/rotated(수치)/positioned as @s/align 을 떼어 소스 재바인딩 문장으로.
+       반환 (new_head, rebind_stmts, final_src_var) 또는 None(전처리 불가)."""
+    nn0 = [s.get("node") for s in head if "node" in s]
+    if not any(n in ("positioned", "rotated", "align", "at") for n in nn0):
+        return None
+    new_head = []
+    rebinds = []
+    src_var = "source"
+    i = 0
+    while i < len(head):
+        s = head[i]
+        n = s.get("node")
+        if n == "positioned":
+            nxt = head[i + 1].get("node") if i + 1 < len(head) else None
+            if nxt == "as":
+                # positioned as <@s> - 소스 위치를 실행자 위치로
+                raw = None
+                j = i + 2
+                while j < len(head) and (head[j].get("node") == "targets" or head[j].get("arg") == "targets"):
+                    if head[j].get("arg") == "targets":
+                        raw = head[j]["value"]["raw"]
+                    j += 1
+                if raw != "@s":
+                    return None  # 비-@s 1차 미지원
+                nv = f"kfcSrc{_uid()}"
+                # executor 없으면 원본은 명령 실패 - 위치 유지로 절충(틱 루트에서 안전)
+                rebinds.append(f'ServerCommandSource {nv} = (executor != null ? '
+                               f'{src_var}.withPosition(executor.getPos()) : {src_var});')
+                src_var = nv
+                i = j
+                continue
+            raw = None
+            j = i + 1
+            while j < len(head) and (head[j].get("node") == "pos" or head[j].get("arg") == "pos"):
+                if head[j].get("arg") == "pos":
+                    raw = head[j]["value"]["raw"]
+                j += 1
+            if raw is None:
+                return None
+            expr = pos_rebind_expr(raw, src_var)
+            if expr is None:
+                return None
+            nv = f"kfcSrc{_uid()}"
+            rebinds.append(f'ServerCommandSource {nv} = {expr};')
+            src_var = nv
+            i = j
+            continue
+        if n == "rotated":
+            raw = None
+            j = i + 1
+            while j < len(head) and (head[j].get("node") in ("rotation", "rot")
+                                      or head[j].get("arg") in ("rotation", "rot")):
+                if head[j].get("arg") in ("rotation", "rot"):
+                    raw = head[j]["value"]["raw"]
+                j += 1
+            if raw is None:
+                return None  # rotated as <selector> - 1차 미지원
+            expr = rot_rebind_expr(raw, src_var)
+            if expr is None:
+                return None
+            nv = f"kfcSrc{_uid()}"
+            rebinds.append(f'ServerCommandSource {nv} = {expr};')
+            src_var = nv
+            i = j
+            continue
+        if n == "at":
+            # at <@s> = positioned as @s + rotated as @s (위치 + 회전 둘 다 @s 로).
+            # 바닐라 at 은 회전도 옮기므로, 이후 rotate @s ~ 등 '~' 가 @s 자기 회전을 쓰게 된다.
+            # (회전 리바인드를 빠뜨리면 부모 소스 회전을 써서 모델이 엉뚱한 방향으로 스냅함.)
+            raw = None
+            j = i + 1
+            while j < len(head) and (head[j].get("node") == "targets" or head[j].get("arg") == "targets"):
+                if head[j].get("arg") == "targets":
+                    raw = head[j]["value"]["raw"]
+                j += 1
+            if raw != "@s":
+                return None  # 비-@s at 1차 미지원
+            nv = f"kfcSrc{_uid()}"
+            rebinds.append(f'ServerCommandSource {nv} = (executor != null ? '
+                           f'{src_var}.withPosition(executor.getPos())'
+                           f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) '
+                           f': {src_var});')
+            src_var = nv
+            i = j
+            continue
+        if n == "align":
+            raw = None
+            j = i + 1
+            while j < len(head) and (head[j].get("node") == "axes" or head[j].get("arg") == "axes"):
+                if head[j].get("arg") == "axes":
+                    raw = head[j]["value"]["raw"]
+                j += 1
+            if raw is None:
+                return None
+            comps = []
+            for ax in ("x", "y", "z"):
+                p = f"{src_var}.getPosition().{ax}"
+                comps.append(f"Math.floor({p})" if ax in raw else p)
+            nv = f"kfcSrc{_uid()}"
+            rebinds.append(f'ServerCommandSource {nv} = {src_var}.withPosition('
+                           f'new net.minecraft.util.math.Vec3d({", ".join(comps)}));')
+            src_var = nv
+            i = j
+            continue
+        new_head.append(s)
+        i += 1
+    if not rebinds:
+        return None
+    # 사후 검증: 남은 head 에 위치 의존/미지원 요소가 없어야 (조건은 src_var 기준으로 생성됨)
+    safe = {"if", "unless", "score", "target", "targetObjective", "matches", "range",
+            "source", "sourceObjective", "items", "entity", "entities", "slots",
+            "item_predicate", "predicate", "loaded", "block", "pos", "data", "path",
+            "rot", "rotation", "axes", "objective", "name"}
+    for s in new_head:
+        n = s.get("node")
+        if n is not None and n not in safe:
+            return None
+    # 순서 의존성 검사: rebind 가 2개 이상이고 그 사이에 위치의존 조건(if/unless block-loaded)이
+    # 끼면, 조건들이 전부 최종 src 기준으로 평가돼 의미가 틀어진다. 그런 교차는 폴백.
+    rebind_count = 0
+    cond_between = False
+    bad_interleave = False
+    pending_cond = False
+    for idx, s in enumerate(head):
+        nd = s.get("node")
+        if nd in ("positioned", "rotated", "align"):
+            if pending_cond and rebind_count >= 1:
+                bad_interleave = True
+            rebind_count += 1
+            pending_cond = False
+        elif nd in ("block", "loaded") and rebind_count >= 1:
+            # rebind 후 등장한 위치의존 조건 - 다음 rebind 와 교차하면 문제
+            pending_cond = True
+    if bad_interleave:
+        return None
+    return (new_head, rebinds, src_var)
+
+
+_on_depth = 0  # on passengers/vehicle 재귀 깊이 - 변수명 유일화용 (emit_line 마다 리셋)
+
+
+def emit_execute_with_src(line: str, chain: list[dict], em: Emitted, src_var: str) -> bool:
+    """emit_execute 를 돌리되, 생성된 본문의 'source' 를 src_var 로 치환.
+       on passengers/vehicle 의 재귀 본문에서 새 소스를 쓰게 하기 위함."""
+    tmp = Emitted(line=line)
+    if not emit_execute(line, chain, tmp):
+        em.reason = tmp.reason
+        return False
+    em.java = [re.sub(r'\bsource\b', src_var, b) for b in tmp.java]
+    em.kind = tmp.kind
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compile_execute_v2 - execute 를 "소스 변환 파이프라인" 폴드로 일반화.
+#
+#   execute m1 m2 ... mN run leaf  =  m1 을 접고 그 결과 각각에 m2 ..., 최내곽에서 leaf 1회.
+#   각 모디파이어는 코드 형태가 셋 중 하나:
+#     - 게이트(if/unless)         : ["if (cond) {"], ["}"]
+#     - 리바인드(positioned/...)  : 소스 변수 교체 (parse_modifiers 재사용)
+#     - 팬아웃(as/on/...)         : for/if 루프 프레임 + ctx(실행자-소스) 교체
+#   리프는 기존 emit_target 으로 뽑고 executor/source 를 현재 ctx 변수로 치환.
+#   store 는 모디파이어가 아니라 결과 싱크(다음 단계). 골격은 store 미포함 -> 기존 경로가 처리.
+#
+# 회귀 방어: 기존 _emit_execute_legacy 가 먼저 시도되고, 실패할 때만 폴드가 호출(순증가만).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _v2_store_dst(sub, exe, src):
+    """store 서브슬라이스 -> writer(valexpr)->list[str]. result 만 지원(success/block/bossbar -> None)."""
+    nodes, args = split_chain(sub)
+    nn = [n["node"] for n in nodes]
+    if len(nn) < 3 or nn[0] != "store" or nn[1] != "result":
+        return None
+    dsttype = nn[2]
+    if dsttype == "score":
+        holder, obj = store_score_dst(args)
+        if holder is None or obj is None:
+            return None
+        if holder == "@s":
+            name = f'({exe} == null ? "<no-executor>" : {exe}.getNameForScoreboard())'
+            return lambda v: [f'if ({exe} != null) KfcGen.setScore(sb, {name}, {jstr(obj)}, (int)({v}));']
+        h = holder_expr(holder)
+        if h is not None:
+            return lambda v: [f'KfcGen.setScore(sb, {h}, {jstr(obj)}, (int)({v}));']
+        ent = single_entity_expr(holder)
+        if ent is None:
+            return None
+        ent = _v2_subst([ent], exe, src)[0]
+        return lambda v: [f'{{ net.minecraft.entity.Entity _se = {ent};'
+                          f' if (_se != null) KfcGen.setScore(sb, _se.getNameForScoreboard(), '
+                          f'{jstr(obj)}, (int)({v})); }}']
+    if dsttype == "storage":
+        sid = first_arg(args, "target"); path = first_arg(args, "path")
+        if sid is None or path is None:
+            return None
+        ntype = nbt_store_type(nn, 0); scale = first_arg(args, "scale") or "1"
+        return lambda v: [f'KfcGen.storagePutNumber(server, {jstr(sid)}, {jstr(path)}, '
+                          f'{scaled(v, scale)}, {jstr(ntype)});']
+    if dsttype == "entity":
+        esel = first_arg(args, "target"); path = first_arg(args, "path")
+        if path is None:
+            return None
+        etype = nbt_store_type(nn, 0); escale = first_arg(args, "scale") or "1"
+        ent = exe if esel == "@s" else None
+        if ent is None:
+            ent = single_entity_expr(esel)
+            if ent is None:
+                return None
+            ent = _v2_subst([ent], exe, src)[0]
+        return lambda v: [f'{{ net.minecraft.entity.Entity _se = {ent};'
+                          f' if (_se != null) KfcGen.entityPutNumberPath(_se, {jstr(path)}, '
+                          f'{jstr(etype)}, {scaled(v, escale)}); }}']
+    return None
+
+
+def _v2_is_multi(sel_raw):
+    """셀렉터가 다중(루프 필요)인지. 단일(@s/@n/@p/@r/limit=1)이면 False."""
+    sel = parse_selector(sel_raw)
+    if sel is None:
+        return False
+    if sel.base == "s" or sel.base in ("n", "p", "r"):
+        return False
+    if sel.limit == 1:
+        return False
+    return True  # @a / @e(무제한)
+
+
+def _v2_segments(head: list[dict]):
+    """head 를 순서대로 분할:
+       ("pre", subslice) | ("as", sel) | ("on", rel) | ("posrot", (mode, sel))
+       팬아웃은 as/on 및 다중 셀렉터 at/rotated as/positioned as. 단일 at/rotated/positioned 는 pre."""
+    segs = []
+    i = 0
+    pre_start = 0
+
+    def flush(end):
+        if end > pre_start:
+            segs.append(("pre", head[pre_start:end]))
+
+    def targets_after(k):
+        """head[k] 이후의 targets 노드+arg 에서 sel_raw 와 다음 인덱스 반환."""
+        if k < len(head) and head[k].get("node") == "targets":
+            if k + 1 < len(head) and head[k + 1].get("arg") == "targets":
+                return head[k + 1]["value"]["raw"], k + 2
+            return head[k].get("range"), k + 1
+        return None, k
+
+    while i < len(head):
+        node = head[i].get("node")
+        if node == "store":
+            flush(i)
+            STOP = {"if", "unless", "as", "at", "on", "run", "store",
+                    "positioned", "rotated", "facing", "anchored", "align", "in"}
+            j = i + 1
+            while j < len(head):
+                nd = head[j].get("node")
+                if nd is not None and nd in STOP:
+                    break
+                j += 1
+            segs.append(("store", head[i:j]))
+            i = pre_start = j
+        elif node == "facing" and i + 1 < len(head) and head[i + 1].get("node") == "entity":
+            # facing entity <sel> [anchor]  - 다중이면 팬아웃, 단일/좌표 facing 은 pre
+            sel_raw = head[i + 2].get("range") if (i + 2 < len(head)
+                       and head[i + 2].get("node") == "targets") else None
+            anchor_raw = head[i + 3].get("range") if (i + 3 < len(head)
+                          and head[i + 3].get("node") == "anchor") else "feet"
+            if sel_raw is not None and _v2_is_multi(sel_raw):
+                flush(i)
+                segs.append(("facing", (sel_raw, anchor_raw == "eyes")))
+                STOP = {"if", "unless", "as", "at", "on", "run", "store",
+                        "positioned", "rotated", "facing", "anchored", "align", "in"}
+                j = i + 1
+                while j < len(head):
+                    nd = head[j].get("node")
+                    if nd is not None and nd in STOP:
+                        break
+                    j += 1
+                i = pre_start = j
+            else:
+                i += 1
+        elif node == "as":
+            sel_raw, j = targets_after(i + 1)
+            if sel_raw is None:
+                return None
+            flush(i)
+            segs.append(("as", sel_raw))
+            i = pre_start = j
+        elif node == "on":
+            rel = head[i + 1].get("node") if i + 1 < len(head) else None
+            if rel not in ("passengers", "vehicle", "attacker", "target"):
+                return None
+            flush(i)
+            segs.append(("on", rel))
+            i = pre_start = i + 2
+        elif node == "at":
+            sel_raw, j = targets_after(i + 1)
+            if sel_raw is not None and _v2_is_multi(sel_raw):
+                flush(i)
+                segs.append(("posrot", ("at", sel_raw)))
+                i = pre_start = j
+            else:
+                i += 1  # 단일 at -> pre(parse_modifiers)
+        elif node in ("rotated", "positioned") and i + 1 < len(head) and head[i + 1].get("node") == "as":
+            sel_raw, j = targets_after(i + 2)
+            mode = "rotated_as" if node == "rotated" else "positioned_as"
+            # rotated/positioned as <셀렉터> 는 parse_modifiers(pre)가 처리 못 하므로
+            # 단일-다중 무관하게 항상 팬아웃(loop+rebind). 루프가 0/1/N 엔티티를 균일하게 처리
+            # (0개면 leaf 미실행 - 바닐라 동일). @s 면 executor 1회 루프.
+            if sel_raw is not None:
+                flush(i)
+                segs.append(("posrot", (mode, sel_raw)))
+                i = pre_start = j
+            else:
+                i += 1
+        else:
+            i += 1
+    flush(len(head))
+    return segs
+
+
+def _v2_fanout_facing(sel_raw, eyes, exe, src, depth):
+    """facing entity <셀렉터> - 각 엔티티를 바라보는 회전 팬아웃(실행자 불변).
+       단일(@s/@n/@p/@r/limit=1)은 루프 없이 1회 재바인딩."""
+    sel = parse_selector(sel_raw)
+    if sel is None:
+        return None
+    nt, ns = f"_vT{depth}", f"_vS{depth}"
+    single = (sel.base == "s") or (sel.base in ("n", "p", "r")) or (sel.limit == 1)
+    if single:
+        ent = single_entity_expr(sel_raw)
+        if ent is None:
+            return None
+        ent = _v2_subst([ent], exe, src)[0]
+        opens = [f"{{ net.minecraft.entity.Entity {nt} = {ent};",
+                 f"  if ({nt} != null) {{",
+                 f"    ServerCommandSource {ns} = KfcGen.facingEntity({src}, {nt}, {'true' if eyes else 'false'});"]
+        return (opens, ["} }"], exe, ns)
+    loop = entity_loop_open(sel, nt)
+    if loop is None:
+        return None
+    loop = _v2_subst(loop, exe, src)
+    rebind = f"ServerCommandSource {ns} = KfcGen.facingEntity({src}, {nt}, {'true' if eyes else 'false'});"
+    opens = list(loop) + ["    " + rebind]
+    return (opens, ["}"], exe, ns)
+
+
+def _v2_fanout_posrot(mode, sel_raw, exe, src, depth):
+    """at/rotated as/positioned as <셀렉터> - 위치/회전 팬아웃(실행자 불변, 소스만 교체).
+       단일(@s/@n/@p/@r/limit=1)은 루프 없이 single_entity_expr 로 1회 재바인딩."""
+    sel = parse_selector(sel_raw)
+    if sel is None:
+        return None
+    nt, ns = f"_vT{depth}", f"_vS{depth}"
+
+    def _rebind_expr(tv):
+        if mode == "at":
+            return (f"{src}.withPosition({tv}.getPos())"
+                    f".withRotation(new net.minecraft.util.math.Vec2f({tv}.getPitch(), {tv}.getYaw()))")
+        elif mode == "rotated_as":
+            return (f"{src}.withRotation("
+                    f"new net.minecraft.util.math.Vec2f({tv}.getPitch(), {tv}.getYaw()))")
+        else:  # positioned_as
+            return f"{src}.withPosition({tv}.getPos())"
+
+    single = (sel.base == "s") or (sel.base in ("n", "p", "r")) or (sel.limit == 1)
+    if single:
+        ent = single_entity_expr(sel_raw)
+        if ent is None:
+            return None
+        ent = _v2_subst([ent], exe, src)[0]
+        opens = [f"{{ net.minecraft.entity.Entity {nt} = {ent};",
+                 f"  if ({nt} != null) {{",
+                 f"    ServerCommandSource {ns} = {_rebind_expr(nt)};"]
+        return (opens, ["} }"], exe, ns)
+
+    loop = entity_loop_open(sel, nt)
+    if loop is None:
+        return None
+    loop = _v2_subst(loop, exe, src)
+    opens = list(loop) + ["    ServerCommandSource " + ns + " = " + _rebind_expr(nt) + ";"]
+    return (opens, ["}"], exe, ns)   # 실행자(exe) 불변
+
+
+def _v2_subst(lines, exe, src):
+    out = []
+    for b in lines:
+        if exe != "executor":
+            b = re.sub(r'\bexecutor\b', exe, b)
+        if src != "source":
+            b = re.sub(r'\bsource\b', src, b)
+        out.append(b)
+    return out
+
+
+
+
+def _nullprop_rebinds(rebinds):
+    """rebind 체인에서 한 번 nullable(셀렉터 매치실패/facingEntity) 이 생기면, 이후 그 소스를
+       deref 하는 모든 rebind 를 (base == null ? null : expr) 로 균일 래핑한다.
+       (개별 핸들러의 ': null' 삼항이 base 자신의 null 은 못 막는 문제를 일괄 해소.)"""
+    out = []
+    nullable = set()
+    src_pat = re.compile(r'\b(kfcSrc\w*|source|_asSrc\w*|_vS\d+|_on\w*)\b')
+    for line in rebinds:
+        m = re.match(r'^(\s*)ServerCommandSource (\w+) = (.+);\s*$', line)
+        if not m:
+            out.append(line); continue
+        ind, var, rhs = m.groups()
+        refs = set(src_pat.findall(rhs)) - {var}
+        base_null = refs & nullable
+        if base_null:
+            base = sorted(base_null)[0]
+            if not rhs.lstrip().startswith(f'({base} == null ? null'):
+                rhs = f'({base} == null ? null : {rhs})'
+        out.append(f'{ind}ServerCommandSource {var} = {rhs};')
+        if (': null)' in rhs) or ('KfcGen.facingEntity(' in rhs) or ('== null ? null' in rhs):
+            nullable.add(var)
+    return out
+
+
+def _rebinds_nullable(rebinds) -> bool:
+    """셀렉터 rebind 의 매치실패(null 소스) 가능성이 체인에 존재하는지.
+       facingEntity 는 대상 엔티티 없으면 null 반환(fork 사망)하므로 nullable."""
+    return any((" : null)" in s) or ("== null ? null" in s) or ("KfcGen.facingEntity(" in s)
+               for s in (rebinds or []))
+
+
+def _v2_final_src(rebinds, default):
+    last = default
+    for s in rebinds:
+        m = re.search(r'ServerCommandSource\s+(\w+)\s*=', s)
+        if m:
+            last = m.group(1)
+    return last
+
+
+def _v2_pre_frame(sub, exe, src):
+    """조건/단순리바인드 구간 -> (opens, closes, new_src). 미지원/루프/store 면 None."""
+    mods = parse_modifiers(sub, src)
+    if mods is None:
+        return None
+    conds, loops, uns, rebinds = mods
+    if uns or loops:
+        return None
+    if exe != "executor":
+        rebinds = _v2_subst(rebinds, exe, src)
+        conds = _v2_subst(conds, exe, src)
+    new_src = _v2_final_src(rebinds, src)
+    opens, closes = [], []
+    if rebinds:
+        opens += ["{"] + ["    " + s for s in rebinds]
+        closes = ["}"] + closes
+        if _rebinds_nullable(rebinds):
+            opens.append(f"    if ({new_src} != null) {{")
+            closes = ["    }"] + closes
+    for c in conds:
+        opens.append(f"if ({c}) {{")
+        closes = ["}"] + closes
+    return (opens, closes, new_src)
+
+
+def _v2_fanout_as(sel_raw, exe, src, depth):
+    sel = parse_selector(sel_raw)
+    if sel is None:
+        return None
+    ne, ns = f"_vE{depth}", f"_vS{depth}"
+    single = (sel.base == "s") or (sel.base in ("n", "p", "r")) or (sel.limit == 1)
+    if single:
+        ent = single_entity_expr(sel_raw)
+        if ent is None:
+            return None
+        ent = _v2_subst([ent], exe, src)[0]
+        opens = [f"{{ net.minecraft.entity.Entity {ne} = {ent};",
+                 f"  if ({ne} != null) {{",
+                 f"    ServerCommandSource {ns} = {src}.withEntity({ne});"]
+        return (opens, ["} }"], ne, ns)
+    loop = entity_loop_open(sel, ne)
+    if loop is None:
+        return None
+    loop = _v2_subst(loop, exe, src)
+    opens = list(loop) + [f"    ServerCommandSource {ns} = {src}.withEntity({ne});"]
+    return (opens, ["}"], ne, ns)
+
+
+def _v2_fanout_on(rel, exe, src, depth):
+    ne, ns = f"_vE{depth}", f"_vS{depth}"
+    _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget"}
+    if rel in _single:
+        opens = [f"{{ ServerCommandSource {ns} = KfcGen.{_single[rel]}({src});",
+                 f"  if ({ns} != null) {{",
+                 f"    net.minecraft.entity.Entity {ne} = {ns}.getEntity();"]
+        return (opens, ["} }"], ne, ns)
+    if rel == "passengers":
+        opens = [f"for (ServerCommandSource {ns} : KfcGen.onPassengers({src})) {{",
+                 f"    net.minecraft.entity.Entity {ne} = {ns}.getEntity();"]
+        return (opens, ["}"], ne, ns)
+    return None
+
+
+def _v2_leaf(line, tail, exe, src):
+    if not tail:
+        return None
+    cmd = next((s["node"] for s in tail if "node" in s), None)
+    if cmd is None:
+        return None
+    inner = Emitted(line=line)
+    if not emit_target(line, cmd, tail, inner):
+        return None
+    return _v2_subst(inner.java, exe, src)
+
+
+def compile_execute_v2(line: str, chain: list[dict], em: Emitted) -> bool:
+    run_idx = next((i for i, s in enumerate(chain)
+                    if s.get("node") == "run" and s.get("type") == "LiteralCommandNode"), None)
+    if run_idx is None:
+        return False
+    head = chain[1:run_idx]
+    tail = chain[run_idx + 1:]
+    segs = _v2_segments(head)
+    if segs is None:
+        return False
+    if not any(k in ("as", "on", "posrot", "facing") for k, _ in segs):
+        return False
+    exe, src = "executor", "source"
+    frames = []
+    sinks = []          # store 결과 싱크: writer(valexpr)->list[str], 등록 시점 ctx 로 빌드
+    depth = 0
+    for kind, payload in segs:
+        if kind == "pre":
+            fr = _v2_pre_frame(payload, exe, src)
+            if fr is None:
+                return False
+            opens, closes, src = fr
+            frames.append((opens, closes))
+        elif kind == "store":
+            w = _v2_store_dst(payload, exe, src)
+            if w is None:
+                return False
+            sinks.append(w)
+        elif kind == "as":
+            depth += 1
+            fr = _v2_fanout_as(payload, exe, src, depth)
+            if fr is None:
+                return False
+            opens, closes, exe, src = fr
+            frames.append((opens, closes))
+        elif kind == "on":
+            depth += 1
+            fr = _v2_fanout_on(payload, exe, src, depth)
+            if fr is None:
+                return False
+            opens, closes, exe, src = fr
+            frames.append((opens, closes))
+        elif kind == "posrot":
+            depth += 1
+            mode, sel_raw = payload
+            fr = _v2_fanout_posrot(mode, sel_raw, exe, src, depth)
+            if fr is None:
+                return False
+            opens, closes, exe, src = fr
+            frames.append((opens, closes))
+        elif kind == "facing":
+            depth += 1
+            sel_raw, eyes = payload
+            fr = _v2_fanout_facing(sel_raw, eyes, exe, src, depth)
+            if fr is None:
+                return False
+            opens, closes, exe, src = fr
+            frames.append((opens, closes))
+        else:
+            return False
+
+    if sinks:
+        # store: 리프를 '값 모드'로 컴파일(result 정수) 후 각 싱크에 기록.
+        sv = Emitted(line=line)
+        valexpr = source_value_expr(tail, sv, self_expr=exe, src_expr=src)
+        if valexpr is None:
+            return False
+        leaf = list(sv.side_effects)
+        leaf.append(f"int _stv = {valexpr};")
+        for w in sinks:
+            leaf += w("_stv")
+    else:
+        leaf = _v2_leaf(line, tail, exe, src)
+        if leaf is None:
+            return False
+
+    body = leaf
+    for opens, closes in reversed(frames):
+        body = opens + ["    " + b for b in body] + closes
+    em.java.extend(body)
+    em.kind = "native"
+    return True
+
+
+def _emit_store_cond(head, em) -> bool:
+    """execute [<선행수정자>] store result score <H> <O> if|unless <조건>  (run 없음).
+       저장 값 = store 뒤 조건의 결과:
+         if entity <sel>      -> 매치 엔티티 수 (unless 면 0개일때 1 else 0)
+         if score <h> <o> matches <range> -> 조건 참이면 1 else 0 (unless 면 반전)
+       선행 수정자(if score 등 단순 조건/리바인드)는 가드로 감싼다."""
+    if not any(s.get("node") == "store" for s in head):
+        return False
+    sidx = next(i for i, s in enumerate(head) if s.get("node") == "store")
+    pre = head[:sidx]
+    cond_idx = next((i for i in range(sidx + 1, len(head))
+                     if head[i].get("node") in ("if", "unless")), None)
+    if cond_idx is None:
+        em.reason = "store 무-run 값조건 없음"
+        return False
+    directive = head[sidx:cond_idx]
+    value_part = head[cond_idx:]
+
+    dnn = [s["node"] for s in directive if "node" in s]
+    if len(dnn) < 2 or dnn[1] != "result":
+        em.reason = "store 무-run result 외 미지원"
+        return False
+    if dnn[2:3] != ["score"]:
+        em.reason = f"store {dnn[2] if len(dnn) > 2 else '?'} <조건> 미지원"
+        return False
+
+    _, dargs = split_chain(directive)
+    holder, obj = store_score_dst(dargs)
+    h = holder_expr(holder) if holder else None
+    if h is None:
+        em.reason = f"store 대상 셀렉터({holder}) <조건> 미지원"
+        return False
+
+    vnn = [s["node"] for s in value_part if "node" in s]
+    _, vargs = split_chain(value_part)
+    if vnn.count("if") + vnn.count("unless") != 1:
+        em.reason = "store 무-run 다중 값조건 미지원"
+        return False
+    negate = "unless" in vnn
+    ci = vnn.index("unless" if negate else "if")
+    ctype = vnn[ci + 1] if ci + 1 < len(vnn) else None
+
+    guard_lines, guard_close = [], []
+    if pre:
+        pmods = parse_modifiers(pre)
+        if pmods is None:
+            em.reason = "store 선행수정자 파싱 실패"
+            return False
+        pconds, ploops, puns, prebinds = pmods
+        if puns or ploops:
+            em.reason = f"store 선행수정자 미지원: {puns or 'loop'}"
+            return False
+        if prebinds:
+            guard_lines += ["{"] + ["    " + s for s in prebinds]
+            guard_close = ["}"] + guard_close
+        for c in pconds:
+            guard_lines.append(f"if ({c}) {{")
+            guard_close = ["}"] + guard_close
+
+    body = []
+    if ctype == "entity":
+        sel_raw = first_arg(vargs, "entities")
+        sel = parse_selector(sel_raw) if sel_raw else None
+        if sel is None:
+            em.reason = f"store if entity 셀렉터({str(sel_raw)[:25]}) 미지원"
+            return False
+        if sel.base in ("n", "p", "r") or sel.limit:
+            em.reason = "store if entity 단일/limit 카운트 미지원"
+            return False
+        lo = entity_loop_open(sel, "_ce")
+        if lo is None:
+            em.reason = f"store if entity({str(sel_raw)[:25]}) 해소 불가"
+            return False
+        cnt = _fresh_var("scnt")
+        body.append(f"int {cnt} = 0;")
+        body.extend(lo)
+        body.append(f"    {cnt}++;")
+        body.append("}")
+        valexpr = f"({cnt} == 0 ? 1 : 0)" if negate else cnt
+    elif ctype == "score":
+        if "matches" not in vnn:
+            em.reason = "store if score 비교(matches 외) 미지원"
+            return False
+        sh = first_arg(vargs, "target")
+        so = first_arg(vargs, "targetObjective")
+        shg = holder_expr(sh) if sh else None
+        if shg is None or not so:
+            em.reason = f"store if score 셀렉터홀더({sh}) 미지원"
+            return False
+        slo, shi = parse_range(first_arg(vargs, "range") or "")
+        lo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+        hi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        basec = f"KfcGen.scoreMatches(sb, {shg}, {jstr(so)}, {lo_j}, {hi_j})"
+        valexpr = f"(!({basec}) ? 1 : 0)" if negate else f"({basec} ? 1 : 0)"
+    else:
+        em.reason = f"store if {ctype} <조건> 미지원"
+        return False
+
+    body.append(f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {valexpr});')
+    if guard_lines:
+        em.java.extend(guard_lines)
+        em.java.extend(["    " + b for b in body])
+        em.java.extend(guard_close)
+    else:
+        em.java.extend(body)
+    em.kind = "native"
+    return True
+
+
+
+def emit_execute(line: str, chain: list[dict], em: Emitted) -> bool:
+    """기존 경로 우선 -> 실패 시 compile_execute_v2 폴드(회귀 0, 순증가)."""
+    if _emit_execute_legacy(line, chain, em):
+        return True
+    em2 = Emitted(line=line)
+    if compile_execute_v2(line, chain, em2):
+        em.java = em2.java
+        em.kind = em2.kind
+        return True
+    return False
+
+
+def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
+    """
+    체인을 'run' 기준으로 둘로 나눈다:
+      head = execute 수정자들 (as/at/if/on/positioned/facing/store/...)
+      tail = run 뒤의 타겟 커맨드
+    head 의 조건/루프를 자바로 만들고, tail 을 그 안에 넣는다.
+    네이티브 불가 수정자가 있으면 False(-> 브릿지).
+    """
+    # run 인덱스 찾기
+    global _on_depth
+    run_idx = next((i for i, s in enumerate(chain)
+                    if s.get("node") == "run" and s.get("type") == "LiteralCommandNode"), None)
+
+    head = chain[1:run_idx] if run_idx is not None else chain[1:]  # execute 리터럴 제외
+    tail = chain[run_idx + 1:] if run_idx is not None else []
+
+    # ---- run 없는 store result <조건> (엔티티 수/score matches 캡처) ----
+    if run_idx is None and any(s.get("node") == "store" for s in head):
+        if _emit_store_cond(head, em):
+            return True
+        return False  # em.reason 은 _emit_store_cond 가 채움
+
+    # ---- as <셀렉터> + 컨텍스트 수정자(on/at/facing/rotated as) ----
+    # as 가 head 선두이고 그 뒤에 재바인딩성 수정자가 오면, 셀렉터 루프 + 본문 재귀로 처리한다.
+    # (parse_modifiers 단독으론 on/at 등을 못 풀어 __AS_LOOP__ 로 폴백되던 경로를 구제)
+    if head and head[0].get("node") == "as":
+        nn_head = [s.get("node") for s in head if "node" in s]
+        has_ctx_mod = any(n in ("on", "facing") for n in nn_head[1:])
+        # at <비-@s> 또는 rotated as <셀렉터> 도 포함
+        if not has_ctx_mod:
+            for i, s in enumerate(head[1:], 1):
+                if s.get("node") == "at":
+                    for s2 in head[i + 1:i + 3]:
+                        if s2.get("arg") == "targets" and s2["value"]["raw"] != "@s":
+                            has_ctx_mod = True
+                if s.get("node") == "rotated":
+                    nxt = head[i + 1] if i + 1 < len(head) else None
+                    if nxt and nxt.get("node") == "as":
+                        has_ctx_mod = True
+        if has_ctx_mod:
+            sel_raw = next((s["value"]["raw"] for s in head if s.get("arg") == "targets"), "")
+            sel0 = parse_selector(sel_raw)
+            if sel0 is not None:
+                if _emit_as_loop_recursive(line, head, tail, em, sel0):
+                    return True
+                # 재귀 실패 시 아래 일반 경로로 진행(폴백 사유는 em.reason 에 기록됨)
+
+    # ---- at <루프 셀렉터> (@a[tag] / 다중 @e) ----
+    # 위치+회전만 대상으로 재바인딩(executor 불변). 대상이 여럿이면 루프로 각각 실행.
+    at_idx = None
+    for i, s in enumerate(head):
+        if s.get("node") == "at":
+            # 바로 뒤 targets 인자
+            nx = head[i + 1] if i + 1 < len(head) else None
+            traw = None
+            for s2 in head[i + 1:i + 3]:
+                if s2.get("arg") == "targets":
+                    traw = s2["value"]["raw"]
+            if traw and traw != "@s":
+                psel = parse_selector(traw)
+                is_single = psel and ((psel.base in ("n", "p", "r")) or psel.limit == 1)
+                if not is_single:  # 루프 대상만 여기서 처리(단일은 parse_modifiers rebind)
+                    at_idx = i
+                    at_raw = traw
+                    at_sel = psel
+                    break
+    if at_idx is not None:
+        _on_depth += 1
+        depth = _on_depth
+        av = f"_atSrc{depth}"
+        pre_head = head[:at_idx]
+        post_head = head[at_idx + 2:]  # at + targets(arg는 node아님) 다음
+        # at 의 targets 는 arg 라 node 시퀀스에선 at 다음이 바로 post. arg 제거 위해 필터.
+        post_head = [s for s in post_head if not (s.get("arg") == "targets")]
+        pre_mods = parse_modifiers(pre_head)
+        if pre_mods is None:
+            _on_depth -= 1
+            return False
+        pre_conds, pre_loops, pre_uns, pre_rebinds = pre_mods
+        if pre_uns:
+            em.reason = f"at 앞 수정자 미지원: {pre_uns}"
+            _on_depth -= 1
+            return False
+        loop_open = entity_loop_open(at_sel, f"_atE{depth}")
+        if loop_open is None and at_sel is not None and at_sel.base == "s":
+            # at @s[guards] = 실행자 단일. 루프가 아니라 가드 통과 시 실행자 위치로 positioned.
+            g = selector_cond(at_sel)
+            if g is None:
+                em.reason = f"at @s[{at_raw[:20]}] 가드 미해소"
+                _on_depth -= 1
+                return False
+            inner = Emitted(line=line)
+            rebuilt = [{"node": "execute", "type": "LiteralCommandNode"}] + post_head
+            if tail:
+                rebuilt += [{"node": "run", "type": "LiteralCommandNode"}] + tail
+            if not emit_execute_with_src(line, rebuilt, inner, av):
+                em.reason = inner.reason or f"at @s[...] 본문 미지원"
+                _on_depth -= 1
+                return False
+            _on_depth -= 1
+            guard = "executor != null" if g == "true" else f"executor != null && ({g})"
+            out = [f'if ({guard}) {{',
+                   f'    net.minecraft.server.command.ServerCommandSource {av} = '
+                   f'source.withPosition(executor.getPos()).withRotation('
+                   f'new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw()));']
+            for b in inner.java:
+                out.append("    " + b)
+            out.append("}")
+            wrapped = out
+            for cond in reversed(pre_conds):
+                wrapped = [f'if ({cond}) {{'] + ["    " + b for b in wrapped] + ["}"]
+            if pre_rebinds:
+                wrapped = pre_rebinds + wrapped
+            em.java.extend(wrapped)
+            em.kind = "native"
+            return True
+        if loop_open is None:
+            em.reason = f"at {at_raw[:25]} 루프 미해소"
+            _on_depth -= 1
+            return False
+        inner = Emitted(line=line)
+        rebuilt = [{"node": "execute", "type": "LiteralCommandNode"}] + post_head
+        if tail:
+            rebuilt += [{"node": "run", "type": "LiteralCommandNode"}] + tail
+        if not emit_execute_with_src(line, rebuilt, inner, av):
+            em.reason = inner.reason or f"at {at_raw[:25]} 본문 미지원"
+            _on_depth -= 1
+            return False
+        _on_depth -= 1
+        out = list(loop_open)  # for (Entity _atEN : ...) {
+        out.append(f'    ServerCommandSource {av} = source.withPosition(_atE{depth}.getPos())'
+                   f'.withRotation(new net.minecraft.util.math.Vec2f(_atE{depth}.getPitch(), _atE{depth}.getYaw()));')
+        for b in inner.java:
+            out.append("    " + b)
+        out.append("}")
+        wrapped = out
+        for cond in reversed(pre_conds):
+            wrapped = [f'if ({cond}) {{'] + ["    " + b for b in wrapped] + ["}"]
+        if pre_rebinds:
+            wrapped = pre_rebinds + wrapped
+        em.java.extend(wrapped)
+        em.kind = "native"
+        return True
+
+    # ---- on passengers / on vehicle ----
+    # source 엔티티를 승객(루프)/탈것(단일)으로 재바인딩하고, 그 이후 전체를 새 컨텍스트로 재귀.
+    on_idx = next((i for i, s in enumerate(head)
+                   if s.get("node") == "on"), None)
+    if on_idx is not None:
+        # store result ... on vehicle (on vehicle)* run <소스>:
+        #   store 가 on-재바인딩 컨텍스트의 소스 값을 캡처. emit_store 가 직접 처리.
+        head_nodes = [s.get("node") for s in head]
+        if "store" in head_nodes and tail:
+            rest = head_nodes[on_idx:]
+            if len(rest) % 2 == 0 and all(
+                    rest[k] == "on" and rest[k + 1] == "vehicle"
+                    for k in range(0, len(rest), 2)):
+                st = Emitted(line=line)
+                if emit_store(line, head, tail, st):
+                    # store 앞 if/unless 조건(있으면)으로 감싸기
+                    si2 = head_nodes.index("store")
+                    cmods = parse_modifiers(head[:si2])
+                    wrapped = st.java
+                    if cmods is not None and not cmods[2]:   # unsupported 없을 때만
+                        for cond in reversed(cmods[0]):
+                            wrapped = [f'if ({cond}) {{'] + ["    " + b for b in wrapped] + ["}"]
+                    em.java.extend(wrapped)
+                    em.kind = st.kind
+                    return True
+        rel = None
+        for s in head[on_idx + 1:on_idx + 2]:
+            rel = s.get("node")
+        if rel not in ("passengers", "vehicle", "attacker", "target"):
+            em.reason = f"on {rel} (1차 미지원)"
+            return False
+        _on_depth += 1
+        depth = _on_depth
+        ov, oe = f"_on{depth}", f"_onEnt{depth}"
+        pre_head = head[:on_idx]                               # on 이전 수정자
+        post_head = head[on_idx + 2:]                          # on X 이후 수정자
+        # on 이전 수정자(조건/위치)는 현재 source 기준으로 평가
+        pre_mods = parse_modifiers(pre_head)
+        if pre_mods is None:
+            _on_depth -= 1
+            return False
+        pre_conds, pre_loops, pre_uns, pre_rebinds = pre_mods
+        if pre_uns:
+            em.reason = f"on 앞 수정자 미지원: {pre_uns}"
+            _on_depth -= 1
+            return False
+        # on 앞의 재바인딩(positioned/rotated/rotated as <셀렉터> 등)의 최종 소스를
+        # on 의 입력으로 써야 한다. (이전엔 pre_rebinds 를 버리고 원본 source 를 써서
+        # `rotated as @p ... on passengers` 같은 회전 리바인드가 통째로 누락됐음.)
+        pre_src = "source"
+        if pre_rebinds:
+            m = re.match(r'\s*ServerCommandSource (kfcSrc\d+)', pre_rebinds[-1])
+            if m:
+                pre_src = m.group(1)
+            # kfcSrc 변수명을 on-depth 로 네임스페이스 - 중첩 재귀 본문이 쓰는 평범한 kfcSrcN 과
+            # 같은 메서드에서 충돌(Java 는 중첩 블록 동명 지역변수 불가)하지 않도록.
+            def _ns(s):
+                return re.sub(r'\bkfcSrc(\d+)\b', rf'kfcSrcOn{depth}_\1', s)
+            pre_rebinds = [_ns(b) for b in pre_rebinds]
+            pre_conds = [_ns(c) for c in pre_conds]
+            pre_src = _ns(pre_src)
+        # on 이후 + tail 을 새 소스(ov)로 재귀 emit
+        inner = Emitted(line=line)
+        rebuilt = [{"node": "execute", "type": "LiteralCommandNode"}] + post_head
+        if tail:
+            rebuilt += [{"node": "run", "type": "LiteralCommandNode"}] + tail
+        if not emit_execute_with_src(line, rebuilt, inner, ov):
+            em.reason = inner.reason or f"on {rel} 본문 미지원"
+            _on_depth -= 1
+            return False
+        inner_body = inner.java
+        # on 으로 바뀐 executor 도 ov 기준이어야 - executor 참조를 oe 로 치환
+        inner_body = [re.sub(r'\bexecutor\b', oe, b) for b in inner_body]
+        _on_depth -= 1
+        out = []
+        _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget"}
+        if rel in _single:
+            out.append(f"{{ ServerCommandSource {ov} = KfcGen.{_single[rel]}({pre_src});")
+            out.append(f"  if ({ov} != null) {{")
+            out.append(f"    net.minecraft.entity.Entity {oe} = {ov}.getEntity();")
+            for b in inner_body:
+                out.append("    " + b)
+            out.append("  } }")
+        else:  # passengers
+            out.append(f"for (ServerCommandSource {ov} : KfcGen.onPassengers({pre_src})) {{")
+            out.append(f"    net.minecraft.entity.Entity {oe} = {ov}.getEntity();")
+            for b in inner_body:
+                out.append("    " + b)
+            out.append("}")
+        # on 앞 재바인딩은 선언이므로 가드 밖(앞)에 두고, 조건+on루프만 null 가드로 감싼다.
+        inner_w = out
+        for cond in reversed(pre_conds):
+            inner_w = [f'if ({cond}) {{'] + ["    " + b for b in inner_w] + ["}"]
+        if pre_rebinds and _rebinds_nullable(pre_rebinds):
+            inner_w = [f'if ({pre_src} != null) {{'] + ["    " + b for b in inner_w] + ["}"]
+        wrapped = list(pre_rebinds) + inner_w
+        for loop in reversed(pre_loops):
+            wrapped = [loop] + ["    " + b for b in wrapped] + ["}"]
+        # 재바인딩 변수(kfcSrcN)가 같은 함수 내 다른 줄과 충돌하지 않도록 블록 격리
+        if pre_rebinds:
+            wrapped = ["{"] + ["    " + b for b in wrapped] + ["}"]
+        em.java.extend(wrapped)
+        em.kind = "native"
+        return True
+
+    mods = parse_modifiers(head, "source")
+    if mods is None:
+        return False  # 지원 안 하는 수정자 -> 브릿지
+
+    conds, loops, unsupported, rebind_stmts = mods
+    if unsupported:
+        if unsupported.startswith("__AS_LOOP__"):
+            return emit_as_loop(line, head, tail, em)
+        if unsupported.startswith("__STORE__"):
+            if not emit_store(line, head, tail, em):
+                return False
+            body = em.java
+            # store 앞의 위치/회전 재바인딩(positioned/rotated/facing)이 있으면, store 본문
+            # (특히 run <소스>=함수/데이터 호출)의 source 를 재바인딩된 소스로 치환해야 한다.
+            # (이전엔 rebind 문장만 emit 하고 본문은 원본 source 를 써서, facing/positioned 가
+            #  store 의 run 대상 함수에 전달되지 않았음 - 벽충돌 밀어내기 방향 오류의 원인.)
+            if rebind_stmts:
+                m = re.match(r'\s*ServerCommandSource (kfcSrc\d+)', rebind_stmts[-1])
+                rsrc = m.group(1) if m else "source"
+                body = [re.sub(r'\bsource\b', rsrc, b) for b in body]
+            # store 앞의 if/unless 조건들로 감싸기 (conds 는 parse_modifiers 가 채움)
+            wrapped = body
+            for cond in reversed(conds):
+                wrapped = [f'if ({cond}) {{'] + ["    " + b for b in wrapped] + ["}"]
+            if rebind_stmts and _rebinds_nullable(rebind_stmts):
+                wrapped = [f'if ({rsrc} != null) {{'] + ["    " + b for b in wrapped] + ["}"]
+            if rebind_stmts:
+                # 재바인딩 변수(kfcSrcN)가 같은 함수 내 다른 줄과 충돌하지 않도록 블록 격리
+                wrapped = ["{"] + ["    " + s for s in rebind_stmts] + ["    " + w for w in wrapped] + ["}"]
+            em.java = wrapped
+            return True
+        em.reason = f"execute 수정자 미지원: {unsupported}"
+        return False
+
+    # tail(타겟) emit - 임시 Emitted 에 담아 본문으로
+    inner = Emitted(line=line)
+    if tail:
+        tail_command = next((s["node"] for s in tail if "node" in s), None)
+        ok = emit_target(line, tail_command, tail, inner)
+        if not ok:
+            # run 대상(타겟 커맨드)이 네이티브 불가면 그 구체 사유를 위로 전파
+            # (이게 없으면 emit_line 이 일반 "execute 네이티브화 불가" 로 뭉뚱그림).
+            em.reason = inner.reason or f"run {tail_command} 네이티브화 불가"
+            return False
+    else:
+        return False
+
+    # 본문은 마지막 재바인딩 소스를 써야 한다. parse_modifiers 가 만든 마지막 kfcSrcN 으로 치환.
+    body = inner.java
+    final_src = "source"
+    body_nullable = False
+    if rebind_stmts:
+        # 마지막 rebind 가 선언한 변수명 추출
+        m = re.match(r'\s*ServerCommandSource (kfcSrc\d+)', rebind_stmts[-1])
+        if m:
+            final_src = m.group(1)
+        body = [re.sub(r'\bsource\b', final_src, b) for b in body]
+        body_nullable = _rebinds_nullable(rebind_stmts)
+
+    # 조건/루프로 본문 감싸기 (조건은 이미 cur_src 기준으로 생성됨)
+    wrapped = body
+    for cond in reversed(conds):
+        wrapped = [f'if ({cond}) {{'] + ["    " + b for b in wrapped] + ["}"]
+    # 셀렉터 rebind 매치실패 = fork 사망. 조건식도 nullable 소스를 참조하므로
+    # 조건+본문 전체를 final_src != null 로 감싼다(조건 평가 NPE 방지).
+    if body_nullable:
+        wrapped = [f'if ({final_src} != null) {{'] + ["    " + b for b in wrapped] + ["}"]
+    for loop in reversed(loops):
+        wrapped = [loop["open"]] + ["    " + b for b in wrapped] + ["}"]
+
+    # 재바인딩 문장을 가장 앞에 - 등장 순서대로 누적돼 있고, 조건/본문이 이를 참조한다.
+    # 변수명(kfcSrcN) 충돌 방지를 위해 블록 스코프로 격리.
+    if rebind_stmts:
+        wrapped = ["{"] + ["    " + s for s in rebind_stmts] + ["    " + w for w in wrapped] + ["}"]
+
+    em.java.extend(wrapped)
+    if loops or rebind_stmts or any("// gated" in c for c in conds):
+        em.kind = "native"
+    return True
+
+
+def parse_modifiers(head: list[dict], src_var: str = "source"):
+    """execute 수정자 시퀀스를 (conds, loops, unsupported) 로.
+       conds: 자바 boolean 식 리스트
+       loops: {open: 'for(...){'} 리스트
+       unsupported: 비면 None-아님 (지원 안 하는 첫 수정자 설명)"""
+    nodes, args = split_chain(head)
+    nn = [n["node"] for n in nodes]
+    conds, loops = [], []
+    cur_src = src_var      # 현재 소스 변수(positioned/rotated/align 이 갱신)
+    rebinds = []           # 누적 재바인딩 문장 - 등장 순서대로 본문 앞에 배치
+    src_nullable = False   # 셀렉터 rebind 매치실패(null 소스) 가능 여부
+
+    i = 0
+    arg_cursor = {}  # 같은 인자명 여러 번 -> 순서대로 소비
+    def next_arg(name):
+        idx = arg_cursor.get(name, 0)
+        arg_cursor[name] = idx + 1
+        vals = args.get(name, [])
+        return vals[idx] if idx < len(vals) else None
+
+    while i < len(nn):
+        tok = nn[i]
+        if tok == "if" or tok == "unless":
+            neg = (tok == "unless")
+            sub = nn[i + 1] if i + 1 < len(nn) else None
+            if sub == "score":
+                # 노드 시퀀스: if score target targetObjective <disc> ...
+                #   <disc> == "matches" -> 범위 검사
+                #   <disc> in {<,<=,=,>=,>} -> 비교형
+                disc = nn[i + 4] if i + 4 < len(nn) else None
+                tgt = next_arg("target")
+                tobj = next_arg("targetObjective")
+                h = holder_expr(tgt["raw"]) if tgt else None
+                # 셀렉터 홀더(@s[tag], @n, @p, @e[limit=1]) -> 단일 엔티티 식
+                ent_expr = None
+                if h is None and tgt:
+                    ent_expr = single_entity_expr(tgt["raw"])
+                    if ent_expr is None:
+                        return ("UNS", [], f"if score 비-@s/# 홀더: {tgt}", [])
+                if disc == "matches":
+                    rng = next_arg("range")
+                    lo, hi = parse_range(rng["raw"])
+                    lo = "null" if lo is None else f"Integer.valueOf({lo})"
+                    hi = "null" if hi is None else f"Integer.valueOf({hi})"
+                    if ent_expr is not None:
+                        # 셀렉터 홀더: neg 를 helper 안에서(null 체크 뒤) 적용 -> 빈 셀렉터는 if/unless 무관 미실행
+                        c = (f'KfcGen.entityScoreMatches(sb, {ent_expr}, {jstr(tobj["raw"])}, '
+                             f'{lo}, {hi}, {"true" if neg else "false"})')
+                        conds.append(c)
+                    else:
+                        c = f'KfcGen.scoreMatches(sb, {h}, {jstr(tobj["raw"])}, {lo}, {hi})'
+                        conds.append(f'!({c})' if neg else c)
+                    i = skip_after(nn, i, "range")
+                    continue
+                elif disc in ("<", "<=", "=", ">=", ">"):
+                    src = next_arg("source")
+                    sobj = next_arg("sourceObjective")
+                    hb = holder_expr(src["raw"]) if src else None
+                    src_ent = None
+                    if hb is None and src:
+                        src_ent = single_entity_expr(src["raw"])
+                        if src_ent is None:
+                            return ("UNS", [], f"if score 비교형 비-@s/# 소스홀더: {src}", [])
+                    # 대상/소스가 셀렉터(단일 엔티티)면 식을 그대로 인자로 넘긴다
+                    #  (오버로드가 1회 평가 + null->false 처리).
+                    if ent_expr is not None or src_ent is not None:
+                        a_arg = ent_expr if ent_expr is not None else h
+                        b_arg = src_ent if src_ent is not None else hb
+                        # 셀렉터 홀더: neg 를 helper 안에서(null 체크 뒤) 적용
+                        c = (f'KfcGen.scoreCmp(sb, {a_arg}, {jstr(tobj["raw"])}, '
+                             f'{jstr(disc)}, {b_arg}, {jstr(sobj["raw"])}, {"true" if neg else "false"})')
+                        conds.append(c)
+                        i = skip_after(nn, i, "sourceObjective")
+                        continue
+                    c = (f'KfcGen.scoreCmp(sb, {h}, {jstr(tobj["raw"])}, '
+                         f'{jstr(disc)}, {hb}, {jstr(sobj["raw"])})')
+                    conds.append(f'!({c})' if neg else c)
+                    i = skip_after(nn, i, "sourceObjective")
+                    continue
+                else:
+                    return ("UNS", [], f"if score 판별자({disc}) 미지원", [])
+            elif sub == "entity":
+                # if entity <selector> : @s -> 실행자 검사 / @e-@p-@n -> 존재 검사
+                if "data" in nn[i:i + 3]:
+                    return ("UNS", [], "if data entity (NBT 조건, 1차 미지원)", [])
+                ent = next_arg("entities")
+                # @s[nbt={SelectedItemSlot:N}] (+scores) - 핫바 선택슬롯 검사
+                if ent:
+                    ssc = at_s_selecteditem_cond(ent["raw"])
+                    if ssc is not None:
+                        conds.append(f'!({ssc})' if neg else ssc)
+                        i = skip_after(nn, i, "entities")
+                        continue
+                    efc = at_effect_cond(ent["raw"])   # nbt={active_effects:[{id:..}]}
+                    if efc is not None:
+                        conds.append(f'!({efc})' if neg else efc)
+                        i = skip_after(nn, i, "entities")
+                        continue
+                sel = parse_selector(ent["raw"]) if ent else None
+                if sel is None:
+                    return ("UNS", [], f"if entity 셀렉터 파싱 실패: {ent}", [])
+                c = selector_cond(sel, cur_src)
+                if c is None:
+                    return ("UNS", [], f"if entity @{sel.base} 미지원 필터", [])
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "entities")
+                continue
+            elif sub == "items":
+                # if items entity <entities> <slots> <item_predicate>
+                src_kind = nn[i + 2] if i + 2 < len(nn) else None
+                if src_kind != "entity":
+                    return ("UNS", [], f"if items {src_kind} (block 소스 1차 미지원)", [])
+                ent = next_arg("entities")
+                slot = next_arg("slots")
+                pred = next_arg("item_predicate")
+                if not ent or not slot:
+                    return ("UNS", [], "if items 대상/슬롯 없음", [])
+                parsed = parse_clear_item(pred["raw"] if pred else "*")
+                if parsed is None:
+                    return ("UNS", [], f"if items 술어 미지원: {pred and pred['raw'][:40]}", [])
+                item_id, custom_nbt = parsed
+                nbt_j = "null" if custom_nbt is None else jstr(custom_nbt)
+                iid_j = "null" if item_id == "*" else jstr(item_id)
+                if ent["raw"] == "@s":
+                    eexpr = "executor"
+                else:
+                    eexpr = single_entity_expr(ent["raw"])
+                    if eexpr is None:
+                        return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
+                c = f'KfcGen.itemsMatchSlots({eexpr}, {jstr(slot["raw"])}, {iid_j}, {nbt_j})'
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "item_predicate")
+                continue
+            elif sub == "data":
+                # if data entity @s <path> / if data storage <id> <path> - 존재 검사
+                kind3 = nn[i + 2] if i + 2 < len(nn) else None
+                if kind3 == "entity":
+                    ent = next_arg("source") or next_arg("target")
+                    p = next_arg("path")
+                    if not ent or not p:
+                        return ("UNS", [], "if data entity 경로 없음", [])
+                    praw = p["raw"]
+                    # path 가 '{...}' 로 시작하면 NbtPath 가 아니라 컴파운드 부분일치 검사
+                    # (예: if data entity @s {brightness:{sky:15,block:15}}). entityHasPath 는
+                    # 경로 존재 검사용이라 이 형태를 처리 못한다 → entityMatchesNbt 로 분기.
+                    is_compound_match = praw.lstrip().startswith("{")
+                    if ent["raw"] == "@s":
+                        eexpr = "executor"
+                    else:
+                        eexpr = single_entity_expr(ent["raw"])
+                        if eexpr is None:
+                            return ("UNS", [], f"if data entity 셀렉터({ent['raw'][:20]}) 미해소", [])
+                    if is_compound_match:
+                        c = f'KfcGen.entityMatchesNbt({eexpr}, {jstr(praw)})'
+                    else:
+                        c = f'KfcGen.entityHasPath({eexpr}, {jstr(praw)})'
+                elif kind3 == "storage":
+                    sid = next_arg("source") or next_arg("target")
+                    p = next_arg("path")
+                    if not sid or not p:
+                        return ("UNS", [], "if data storage 인자 없음", [])
+                    c = (f'KfcGen.storageHasPath(source.getServer(), '
+                         f'{jstr(sid["raw"])}, {jstr(p["raw"])})')
+                else:
+                    return ("UNS", [], f"if data {kind3} (1차 미지원)", [])
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "path")
+                continue
+            elif sub == "predicate":
+                pid = next_arg("predicate")
+                if not pid:
+                    return ("UNS", [], "if predicate 이름 없음", [])
+                expr = PREDICATES.get(pid["raw"])
+                if expr is None:
+                    pid_norm = pid["raw"] if ":" in pid["raw"] else "minecraft:" + pid["raw"]
+                    c = f'KfcGen.testPredicate(source, executor, {jstr(pid_norm)})'
+                else:
+                    c = expr.replace("{E}", "executor")
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "predicate")
+                continue
+            elif sub == "function":
+                fname = next_arg("name")
+                if not fname:
+                    return ("UNS", [], "if function 이름 없음", [])
+                fid_called = fname["raw"]
+                if fid_called in MACRO_FNS:
+                    return ("UNS", [], f"if function(매크로 {fid_called[:20]}) 1차 미지원", [])
+                # 함수의 executeReturn 결과가 0이 아니면 참 (mcfunction return 값 시맨틱).
+                # 반드시 현재 rebind 소스(cur_src)로 호출 - facing/positioned/rotated 로 바뀐
+                # 위치-회전 문맥이 조건 함수에 전달돼야 한다(예: 벽충돌 facing->wall-condition).
+                if ALL_FIDS and fid_called not in ALL_FIDS:
+                    _ns, _p = fid_called.split(":", 1) if ":" in fid_called else ("minecraft", fid_called)
+                    c = (f'(KfcGen.instantExecuteFunctionReturn({cur_src}, '
+                         f'net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)})) != 0)')
+                else:
+                    c = f'({fqcn(fid_called)}.executeReturn({cur_src}) != 0)'
+                conds.append(f'!{c}' if neg else c)
+                i = skip_after(nn, i, "name")
+                continue
+            elif sub == "loaded":
+                pos = next_arg("pos")
+                pe = cond_pos_expr(pos["raw"], cur_src) if pos else None
+                if pe is None:
+                    return ("UNS", [], "if loaded 좌표 미지원", [])
+                c = f'KfcGen.posLoaded(ctx.world, {pe})'
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "pos")
+                continue
+            elif sub == "block":
+                pos = next_arg("pos")
+                blk = next_arg("block")
+                pe = cond_pos_expr(pos["raw"], cur_src) if pos else None
+                if pe is None or not blk:
+                    return ("UNS", [], "if block 좌표/블록 미지원", [])
+                braw = blk["raw"]
+                # 블록 종류 + 상태([..]) 지원. NBT({..})는 1차 미지원(블록엔티티 NBT 비교 필요).
+                nbt_part = ""; state_part = ""; base = braw
+                bm = re.search(r'\{', braw)
+                if bm:
+                    nbt_part = braw[bm.start():]; base = braw[:bm.start()]
+                sm = re.search(r'\[(.*?)\]', base)
+                if sm:
+                    state_part = sm.group(1).strip(); base = base[:sm.start()]
+                base = base.strip()
+                if nbt_part:
+                    return ("UNS", [], "if block NBT 술어 미지원", [])
+                if state_part:
+                    c = f'KfcGen.blockStateMatches(ctx.world, {pe}, {jstr(base)}, {jstr(state_part)})'
+                    conds.append(f'!({c})' if neg else c)
+                    i = skip_after(nn, i, "block")
+                    continue
+                if base.startswith("#"):
+                    tagid = base[1:]
+                    if ":" not in tagid:
+                        tagid = "minecraft:" + tagid
+                    # 항상 런타임 태그 멤버십 검사. 변환 시점 전개(BLOCK_TAGS)는 데이터팩 내부
+                    # 태그만 재귀 해소할 수 있어 `#minecraft:fences` 같은 바닐라 중첩 태그 멤버를
+                    # 조용히 누락한다(벽 판정 오류의 원인). 태그 JSON 은 모드 리소스로 복사돼
+                    # 런타임에 레지스트리로 로드되므로 게임이 중첩까지 정확히 해소한다.
+                    c = f'KfcGen.blockInTag(ctx.world, {pe}, {jstr(tagid)})'
+                else:
+                    ids = [base if ":" in base else "minecraft:" + base]
+                    arr = "new String[]{" + ", ".join(jstr(x) for x in ids) + "}"
+                    c = f'KfcGen.blockMatches(ctx.world, {pe}, {arr})'
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "block")
+                continue
+            else:
+                return ("UNS", [], f"if {sub} (미지원)", [])
+        elif tok == "as":
+            sel = next_arg("targets")
+            raw = sel["raw"] if sel else ""
+            if raw == "@s":
+                pass  # self 유지
+            else:
+                # 셀렉터 루프 - emit_as_loop 에서 처리하도록 신호
+                return ("UNS", [], f"__AS_LOOP__", [])
+            i += 1
+            continue
+        elif tok == "at":
+            sel = next_arg("targets")
+            raw_at = sel["raw"] if sel else ""
+            if raw_at == "@s":
+                # at @s = positioned as @s + rotated as @s.
+                # no-op 이 아니다: on/as 재바인딩 후엔 소스 회전이 부모에서 상속돼 executor(@s)
+                # 자기 회전과 다를 수 있다(예: on passengers 후 source 는 카트 회전, executor 는 모델).
+                # executor 의 위치+회전으로 재바인딩해야 이후 `rotate @s ~` 의 '~' 가 @s 자기
+                # 회전을 쓴다. (이전 no-op 은 모델이 카트(초기)방향으로 스냅하는 버그를 유발했음.)
+                nv = f"kfcSrc{_uid()}"
+                rebinds.append(
+                    f'ServerCommandSource {nv} = (executor != null ? {cur_src}.withPosition(executor.getPos())'
+                    f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) : {cur_src});')
+                cur_src = nv
+                i += 1
+                continue
+            # at <단일 셀렉터> - 그 엔티티의 위치+회전으로 소스 재바인딩 (executor 는 불변)
+            psel = parse_selector(raw_at)
+            # @s[...] (필터 포함)은 항상 단일(실행자). 가드 통과 시 executor 위치/회전, 아니면 null.
+            if psel is not None and psel.base == "s":
+                g = selector_cond(psel, cur_src)
+                if g is None:
+                    return ("UNS", [], f"at @s[{raw_at[:20]}] 가드 미해소", [])
+                nv = f"kfcSrc{_uid()}"
+                guard = "executor != null" if g == "(executor != null)" else g
+                rebinds.append(
+                    f'ServerCommandSource {nv} = (({guard}) ? {cur_src}.withPosition(executor.getPos())'
+                    f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) : null);')
+                cur_src = nv
+                src_nullable = True
+                i += 1
+                continue
+            single = psel and ((psel.base in ("n", "p", "r")) or psel.limit == 1)
+            if not single:
+                return ("UNS", [], f"at {raw_at[:25]} (비단일 위치 재바인딩 1차 미지원)", [])
+            ent = single_entity_expr(raw_at)
+            if ent is None:
+                return ("UNS", [], f"at {raw_at[:25]} (단일 엔티티 해소 불가)", [])
+            ev = f"_atE{len(rebinds)+1}"
+            nv = f"kfcSrc{_uid()}"
+            rebinds.append(f'net.minecraft.entity.Entity {ev} = {ent};')
+            rebinds.append(
+                f'ServerCommandSource {nv} = ({ev} != null ? {cur_src}.withPosition({ev}.getPos())'
+                f'.withRotation(new net.minecraft.util.math.Vec2f({ev}.getPitch(), {ev}.getYaw())) : null);')
+            cur_src = nv
+            src_nullable = True
+            i += 1
+            continue
+        elif tok == "positioned":
+            # positioned as @s | positioned <pos>
+            nxt = nn[i + 1] if i + 1 < len(nn) else None
+            if nxt == "as":
+                tsel = next_arg("targets")
+                traw = tsel["raw"] if tsel else ""
+                if traw == "@s":
+                    nv = f"kfcSrc{_uid()}"
+                    rebinds.append(f'ServerCommandSource {nv} = (executor != null ? '
+                                   f'{cur_src}.withPosition(executor.getPos()) : null);')
+                    cur_src = nv
+                    src_nullable = True
+                    i += 2
+                    continue
+                # positioned as <단일 셀렉터> - 그 엔티티의 위치로
+                ent = single_entity_expr(traw)
+                if ent is None:
+                    return ("UNS", [], f"positioned as {traw[:20]} (단일 해소 불가)", [])
+                ev = f"_posE{len(rebinds)+1}"
+                nv = f"kfcSrc{_uid()}"
+                rebinds.append(f'net.minecraft.entity.Entity {ev} = {ent};')
+                rebinds.append(f'ServerCommandSource {nv} = ({ev} != null ? '
+                               f'{cur_src}.withPosition({ev}.getPos()) : null);')
+                cur_src = nv
+                src_nullable = True
+                i += 2
+                continue
+            praw = next_arg("pos")
+            expr = pos_rebind_expr(praw["raw"], cur_src) if praw else None
+            if expr is None:
+                return ("UNS", [], f"positioned {praw and praw['raw']} (좌표 미지원)", [])
+            nv = f"kfcSrc{_uid()}"
+            if src_nullable:
+                expr = f'({cur_src} == null ? null : {expr})'
+            rebinds.append(f'ServerCommandSource {nv} = {expr};')
+            cur_src = nv
+            i += 2
+            continue
+        elif tok == "rotated":
+            nxt = nn[i + 1] if i + 1 < len(nn) else None
+            if nxt == "as":
+                tsel = next_arg("targets")
+                traw = tsel["raw"] if tsel else ""
+                if traw == "@s":
+                    nv = f"kfcSrc{_uid()}"
+                    rebinds.append(
+                        f'ServerCommandSource {nv} = (executor != null ? {cur_src}.withRotation('
+                        f'new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) : null);')
+                    cur_src = nv
+                    src_nullable = True
+                    i += 2
+                    continue
+                # rotated as <단일 셀렉터> - 그 엔티티의 회전을 복사
+                ent = single_entity_expr(traw)
+                if ent is None:
+                    return ("UNS", [], f"rotated as {traw[:25]} (단일 엔티티 해소 불가)", [])
+                nv = f"kfcSrc{_uid()}"
+                ev = f"_rotE{len(rebinds)+1}"
+                rebinds.append(f'net.minecraft.entity.Entity {ev} = {ent};')
+                rebinds.append(
+                    f'ServerCommandSource {nv} = ({ev} != null ? {cur_src}.withRotation('
+                    f'new net.minecraft.util.math.Vec2f({ev}.getPitch(), {ev}.getYaw())) : null);')
+                cur_src = nv
+                src_nullable = True
+                i += 2
+                continue
+            rraw = next_arg("rot") or next_arg("rotation")
+            expr = rot_rebind_expr(rraw["raw"], cur_src) if rraw else None
+            if expr is None:
+                return ("UNS", [], f"rotated {rraw and rraw['raw']} (회전 미지원)", [])
+            nv = f"kfcSrc{_uid()}"
+            if src_nullable:
+                expr = f'({cur_src} == null ? null : {expr})'
+            rebinds.append(f'ServerCommandSource {nv} = {expr};')
+            cur_src = nv
+            i += 2
+            continue
+        elif tok == "align":
+            araw = next_arg("axes")
+            if not araw:
+                return ("UNS", [], "align 축 없음", [])
+            axes = araw["raw"]
+            comps = []
+            for ax in ("x", "y", "z"):
+                p = f"{cur_src}.getPosition().{ax}"
+                comps.append(f"Math.floor({p})" if ax in axes else p)
+            nv = f"kfcSrc{_uid()}"
+            _al = (f'{cur_src}.withPosition(new net.minecraft.util.math.Vec3d({", ".join(comps)}))')
+            if src_nullable:
+                _al = f'({cur_src} == null ? null : {_al})'
+            rebinds.append(f'ServerCommandSource {nv} = {_al};')
+            cur_src = nv
+            i += 2
+            continue
+        elif tok == "facing":
+            nxt = nn[i + 1] if i + 1 < len(nn) else None
+            if nxt == "entity":
+                tsel = next_arg("targets")
+                anchor = next_arg("anchor")
+                traw = tsel["raw"] if tsel else ""
+                eyes = "true" if (anchor and anchor["raw"] == "eyes") else "false"
+                ent = single_entity_expr(traw)
+                if ent is None:
+                    return ("UNS", [], f"facing entity {traw[:20]} (단일 해소 불가)", [])
+                ev = f"_faceE{_uid()}"
+                nv = f"kfcSrc{_uid()}"
+                rebinds.append(f'net.minecraft.entity.Entity {ev} = {ent};')
+                rebinds.append(f'ServerCommandSource {nv} = KfcGen.facingEntity({cur_src}, {ev}, {eyes});')
+                cur_src = nv
+                src_nullable = True   # facingEntity 매치실패 -> null(fork 사망)
+                i = skip_after(nn, i, "anchor") if anchor else (i + 2)
+                continue
+            praw = next_arg("pos")
+            pe = cond_pos_expr(praw["raw"], cur_src) if praw else None
+            if pe is None:
+                return ("UNS", [], f"facing {praw and praw['raw']} (좌표 미지원)", [])
+            nv = f"kfcSrc{_uid()}"
+            _fc = f'KfcGen.facing({cur_src}, {pe}.x, {pe}.y, {pe}.z)'
+            if src_nullable:
+                _fc = f'({cur_src} == null ? null : {_fc})'
+            rebinds.append(f'ServerCommandSource {nv} = {_fc};')
+            cur_src = nv
+            i += 2
+            continue
+        elif tok == "anchored":
+            anchor = next_arg("anchor")
+            araw = anchor["raw"] if anchor else "feet"
+            nv = f"kfcSrc{_uid()}"
+            fn = "anchorEyes" if araw == "eyes" else "anchorFeet"
+            _an = f'KfcGen.{fn}({cur_src})'
+            if src_nullable:
+                _an = f'({cur_src} == null ? null : {_an})'
+            rebinds.append(f'ServerCommandSource {nv} = {_an};')
+            cur_src = nv
+            i = skip_after(nn, i, "anchor") if anchor else (i + 2)
+            continue
+        elif tok in ("on", "in"):
+            return ("UNS", [], f"{tok} (컨텍스트 수정자 - 1차 미지원)", [])
+        elif tok == "store":
+            return (conds, [], "__STORE__", _nullprop_rebinds(rebinds))
+        else:
+            i += 1
+    return (conds, loops, None, _nullprop_rebinds(rebinds))
+
+
+def parse_clear_item(pred: str):
+    """clear 아이템 술어 -> (item_id_or_#tag, custom_data_snbt|None). 미지원이면 None.
+       지원: '*', '<id>', '#<tag>', '<id>[custom_data(=|~){...}]'."""
+    pred = (pred or "*").strip()
+    if pred.startswith("#"):
+        return (pred, None)
+    m = re.match(r'^(\*|[a-z0-9_.:-]+)(?:\[(.*)\])?$', pred)
+    if not m:
+        return None
+    item_id, comp = m.group(1), m.group(2)
+    if not comp:
+        return (item_id, None)
+    cm = re.match(r'^(?:minecraft:)?custom_data[=~](\{.*\})$', comp.strip())
+    if not cm:
+        return None
+    return (item_id, cm.group(1))
+
+
+def parse_item_predicate(pred: str):
+    """아이템 술어 -> (item_id, custom_data_snbt|None). 미지원 형태면 None.
+       지원: `*`, `<id>`, `<id>[<ns:>custom_data~{...}]`, `*[<ns:>custom_data~{...}]`"""
+    m = re.match(r'^(\*|[a-z0-9_.:-]+)(?:\[(.*)\])?$', pred.strip())
+    if not m:
+        return None
+    item_id, comp = m.group(1), m.group(2)
+    if comp is None or comp == "":
+        return (item_id, None)
+    cm = re.match(r'^(?:minecraft:)?custom_data~(\{.*\})$', comp.strip())
+    if not cm:
+        return None  # custom_data~ 외 컴포넌트 술어는 1차 미지원
+    return (item_id, cm.group(1))
+
+
+def skip_after(nn, i, token):
+    """nn[i:] 에서 token 다음 인덱스로."""
+    for j in range(i, len(nn)):
+        if nn[j] == token:
+            return j + 1
+    return len(nn)
+
+
+def _emit_as_loop_recursive(line, head, tail, em, sel):
+    """as <셀렉터> <컨텍스트 수정자...> run <타겟> 을, 셀렉터 루프 + 본문 재귀 emit 으로 변환.
+       각 엔티티 e 에 대해 그 커맨드 소스(es)를 만들고, as 이후 chain 을 es 기준으로 재귀."""
+    _asE = _fresh_var("_asE")
+    _asSrc = _fresh_var("_asSrc")
+    loop_open = entity_loop_open(sel, _asE)
+    if loop_open is None:
+        if _sel_has_extra(sel):
+            em.reason = "as 셀렉터 추가필드(nbt/team/level/name/adv) 폴백경로 미지원"
+            return False
+        # 타입 미지정 @e[limit=N] 등 - anyType 순회로
+        if sel.base in ("e", "n") and not sel.type_id:
+            tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
+            lo, hi = sel.distance if sel.distance else (None, None)
+            dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+            loop_open = [f'for (net.minecraft.entity.Entity {_asE} : KfcGen.allEntitiesAnyType('
+                         f'ctx, executor, {tp}, {tn}, {dmin}, {dmax})) {{']
+        else:
+            if sel.base == "s":
+                # as @s: 실행자 자신에 대한 1회 실행. 태그/타입/predicate/scores 가드 통과 시에만.
+                guards = ["executor != null"]
+                if sel.type_id:
+                    jt = resolve_entity_types(sel) if sel.type_is_tag else [entity_type_java(sel.type_id)]
+                    if not jt or None in jt:
+                        em.reason = "as @s 타입 미해소"; return False
+                    inner_t = " || ".join(f"executor.getType() == {t}" for t in jt)
+                    guards.append(f"!({inner_t})" if sel.type_neg
+                                  else (f"({inner_t})" if len(jt) > 1 else inner_t))
+                for t in sel.tags_pos:
+                    guards.append(f'executor.getCommandTags().contains({jstr(t)})')
+                for t in sel.tags_neg:
+                    guards.append(f'!executor.getCommandTags().contains({jstr(t)})')
+                if sel.predicates:
+                    pg = predicate_guards(sel.predicates, "executor", player=False)
+                    if pg is None:
+                        em.reason = "as @s predicate 미해소"; return False
+                    guards += pg
+                for o2, (slo, shi) in sel.scores.items():
+                    slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
+                    shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                    guards.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
+                                  f'{jstr(o2)}, {slo_j}, {shi_j})')
+                # @s 의 distance 는 자기 자신(거리 0) -> 무시(항상 통과)
+                loop_open = [f'if ({" && ".join(guards)}) {{ net.minecraft.entity.Entity {_asE} = executor;']
+            else:
+                em.reason = f"as 루프(재귀) 셀렉터 미해소: {sel.base}"
+                return False
+
+    # as 이후 chain 재구성: execute + (as/targets 제거한 head 나머지) + run + tail
+    as_idx = next(i for i, s in enumerate(head) if s.get("node") == "as")
+    rest = []
+    rm_tn = rm_ta = False
+    for item in head[as_idx + 1:]:
+        if not rm_tn and item.get("node") == "targets":
+            rm_tn = True; continue
+        if not rm_ta and item.get("arg") == "targets":
+            rm_ta = True; continue
+        rest.append(item)
+    rebuilt = [{"node": "execute", "type": "LiteralCommandNode"}] + rest
+    if tail:
+        rebuilt += [{"node": "run", "type": "LiteralCommandNode"}] + tail
+
+    inner = Emitted(line=line)
+    if not emit_execute_with_src(line, rebuilt, inner, _asSrc):
+        em.reason = inner.reason or "as 루프(재귀) 본문 미지원"
+        return False
+
+    # 루프 본문: 각 엔티티의 소스 생성 후 본문. executor/source 참조를 루프 변수로 치환.
+    body = inner.java
+    # 본문 내 'executor' 는 as 의 self(_asE), 'source' 는 그 소스(_asSrc)
+    body = [re.sub(r'\bexecutor\b', _asE, b) for b in body]
+
+    out = list(loop_open)
+    # 바닐라 as <셀렉터> 는 executor 만 교체하고 위치/회전/앵커/차원은 부모 소스에서 상속한다
+    # (엔티티의 getCommandSource 로 새로 만들면 위치/회전이 엔티티 기본값으로 리셋돼 잘못됨).
+    # source 는 호출 컨텍스트(on/at 등)에서 적절한 부모 소스로 치환된다.
+    out.append(f'    ServerCommandSource {_asSrc} = source.withEntity({_asE});')
+    for b in body:
+        out.append("    " + b)
+    out.append("}")
+    em.java.extend(out)
+    em.kind = "native"
+    return True
+
+
+def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bool:
+    """
+    execute as <selector> [at @s] [if ...] run <target>  ->  네이티브 엔티티/플레이어 루프.
+    레퍼런스 src/ 패턴:
+      for (Entity e : world.getEntitiesByType(TYPE, e -> e.getCommandTags().containsAll(...))) {
+          ServerCommandSource s = e.getCommandSource(world).withSilent().withLevel(2);
+          Target.execute(s);
+      }
+    1차 지원: as 다음에 (at @s)? 와 단순 run 타겟. 중간에 if/positioned 등 복합 수정자 있으면 브릿지.
+    """
+    nodes, args = split_chain(head)
+    nn = [n["node"] for n in nodes]
+
+    # ── 진짜 '실행자 전환 as' 찾기 ──
+    # `positioned as <sel>` / `rotated as <sel>` 의 'as' 는 실행자 전환이 아니다.
+    # head 를 직접 순회해, 직전 node 가 positioned/rotated 가 아닌 첫 as 를 찾는다.
+    as_i = None
+    prev_node = None
+    for idx, item in enumerate(head):
+        nd = item.get("node")
+        if nd == "as" and prev_node not in ("positioned", "rotated"):
+            as_i = idx
+            break
+        if nd is not None:
+            prev_node = nd
+    if as_i is None:
+        em.reason = "as 루프: 실행자 전환 as 없음"
+        return False
+    # as 구간(as + targets 노드/인자) 끝 인덱스와 셀렉터 raw
+    j = as_i + 1
+    sel_raw = ""
+    while j < len(head) and (head[j].get("node") == "targets" or head[j].get("arg") == "targets"):
+        if head[j].get("arg") == "targets":
+            sel_raw = head[j]["value"]["raw"]
+        j += 1
+    sel = parse_selector(sel_raw)
+    if sel is None:
+        em.reason = f"as 셀렉터 파싱 실패: {sel_raw}"
+        return False
+
+    # ── as 앞/뒤 수정자 분리 ──
+    # 바닐라 의미: as 앞 수정자(positioned as @s 등)는 '바깥 실행자/소스' 기준으로 평가돼
+    # 루프 밖에 위치해야 하고, as 뒤 수정자는 루프 변수(각 대상) 기준이다.
+    pre_head = head[:as_i]
+    sub_head = head[j:]
+
+    pre_src = "source"
+    pre_conds, pre_rebinds = [], []
+    if pre_head:
+        pre_mods = parse_modifiers(pre_head)
+        pconds, ploops, puns, prebinds = pre_mods
+        if puns is not None or ploops:
+            # as 앞 미지원/루프 수정자 - 재귀 경로 시도, 아니면 거부
+            recursive_mods = ("on ", "at ", "facing", "rotated as", "positioned as", "anchored")
+            if puns and any(puns.startswith(m) or m in puns for m in recursive_mods):
+                return _emit_as_loop_recursive(line, head, tail, em, sel)
+            em.reason = f"as 루프 앞 수정자 미지원: {puns or 'loops'}"
+            return False
+        pre_conds, pre_rebinds = pconds, prebinds
+        if pre_rebinds:
+            m = re.match(r'.*ServerCommandSource (kfcSrc\d+)', pre_rebinds[-1])
+            if m:
+                pre_src = m.group(1)
+            # 루프 본문/post 의 kfcSrcN 과 충돌 방지 - pre 네임스페이스
+            def _pns(s):
+                return re.sub(r'\bkfcSrc(\d+)\b', r'kfcSrcPre\1', s)
+            pre_rebinds = [_pns(b) for b in pre_rebinds]
+            pre_conds = [_pns(c) for c in pre_conds]
+            pre_src = _pns(pre_src)
+
+    mconds, mloops, muns, mrebinds = parse_modifiers(sub_head)
+    if muns is not None:
+        if muns == "__AS_LOOP__":
+            em.reason = "as 루프 중첩(as ... as ...) - 1차 미지원"
+            return False
+        if muns == "__STORE__":
+            em.reason = "as 루프 + store - 1차 미지원"
+            return False
+        # as 이후에 on/at/facing 등 재바인딩 수정자가 있으면, 그 부분을 루프 변수 소스(es)로
+        # 재귀 emit 한다. (parse_modifiers 가 단독으론 처리 못하는 컨텍스트 수정자)
+        recursive_mods = ("on ", "at ", "facing", "rotated as", "positioned as", "anchored")
+        if any(muns.startswith(m) or m in muns for m in recursive_mods):
+            return _emit_as_loop_recursive(line, head, tail, em, sel)
+        em.reason = f"as 루프 + {muns}"
+        return False
+    # 수정자 조건을 루프 변수 기준으로 치환 (대상별 평가)
+    mod_conds = [re.sub(r'\bsource\b', 'es', re.sub(r'\bexecutor\b', 'e', c)) for c in mconds]
+    # 수정자 rebind 문장도 루프 변수(e/es) 기준으로 치환 - 조건이 이를 참조하므로 본문 선두에 배치
+    mod_rebinds = []
+    for stmt in mrebinds:
+        s = re.sub(r'\bexecutor\b', 'e', stmt)
+        s = re.sub(r'\bsource\b', 'es', s)
+        mod_rebinds.append(s)
+
+    # 타겟 emit (루프 본문) - 셀렉터 컨텍스트에서 self = 루프 변수 e
+    inner = Emitted(line=line)
+    if not tail:
+        return False
+    tail_command = next((s["node"] for s in tail if "node" in s), None)
+    if not emit_target(line, tail_command, tail, inner):
+        em.reason = f"as 루프 본문({tail_command}) 네이티브화 불가"
+        return False
+
+    # 본문에서 executor/source 를 루프 변수로 치환
+    body = []
+    for stmt in inner.java:
+        s = re.sub(r'\bexecutor\b', 'e', stmt)
+        s = re.sub(r'\bsource\b', 'es', s)
+        body.append(s)
+    # as 이후 수정자 리바인딩(positioned/rotated/at 등)의 최종 소스를 본문이 써야 한다.
+    # (이전엔 리바인드 문장만 만들고 본문은 es 를 그대로 써서, `as @e ... positioned as @s
+    #  rotated ~-90 run function X` 의 위치/회전이 X 에 전달되지 않았음 - 버텍스 배치 오작동.)
+    if mod_rebinds:
+        _bfinal = _v2_final_src(mod_rebinds, "es")
+        if _bfinal != "es":
+            body = [re.sub(r'\bes\b', _bfinal, b) for b in body]
+
+    # 엔티티 타입 결정
+    if sel.base in ("a", "p", "r"):
+        # 플레이어 루프
+        head_line = "for (ServerPlayerEntity e : ctx.allPlayers) {"
+        src_line = f"ServerCommandSource es = {pre_src}.withEntity(e);"  # 바닐라 as: 부모(as 앞 수정자 적용) 컨텍스트 상속
+        type_filter = None
+    else:
+        jtypes = resolve_entity_types(sel)
+        if jtypes is None and not sel.type_id:
+            jtypes = "ANY"   # 타입 미지정 @e -> 전 엔티티 순회
+        if jtypes is None:
+            em.reason = f"as @e type={'#' if sel.type_is_tag else ''}{sel.type_id} - 엔티티타입 미해소(태그 JSON 없음/미지원 타입)"
+            return False
+        # type=!X : 양성 타입 순회는 정반대. 전 엔티티 순회 + 타입 제외 가드로 전환.
+        if sel.type_neg and jtypes != "ANY":
+            _excl = " || ".join(f"en.getType() == {t}" for t in jtypes)
+            type_exclude_cond = f"!({_excl})"
+            jtypes = "ANY"
+        else:
+            type_exclude_cond = None
+        src_line = f"ServerCommandSource es = {pre_src}.withEntity(e);"  # 바닐라 as: 부모(as 앞 수정자 적용) 컨텍스트 상속
+
+    # 태그 필터 + scores 필터 (en. 기준; 플레이어 루프는 아래서 e. 로 치환)
+    conds = []
+    for t in sel.tags_pos:
+        conds.append(f'en.getCommandTags().contains({jstr(t)})')
+    for t in sel.tags_neg:
+        conds.append(f'!en.getCommandTags().contains({jstr(t)})')
+    # 볼륨 박스 필터(x/y/z/dx/dy/dz) - 누락 시 `as @a[박스] run` 이 박스를 무시하고
+    # 태그만 맞으면 전원 실행됨(예: gameend 의 multiplayroom:play 가 대기방 밖 플레이어에게도 실행).
+    # _entity_loop_open_core 와 동일하게 posInBox 조건을 넣어 바닐라 박스 평가와 일치시킨다.
+    if sel.volume is not None:
+        _vdx, _vdy, _vdz = sel.volume
+        conds.append(f'KfcGen.posInBox({box_origin_expr(sel, pre_src)}, '
+                     f'{_vdx}, {_vdy}, {_vdz}, en.getPos())')
+    # distance= 필터 - 바닐라는 '소스 위치' 기준 (executor 위치 아님)
+    if sel.distance:
+        _dlo, _dhi = sel.distance
+        _dmin = "-1" if _dlo is None else str(_dlo)
+        _dmax = "-1" if _dhi is None else str(_dhi)
+        conds.append(f'KfcGen.inRange({pre_src}.getPosition(), en, {_dmin}, {_dmax})')
+    for obj_name, (lo, hi) in sel.scores.items():
+        lo_j = "null" if lo is None else f"Integer.valueOf({lo})"
+        hi_j = "null" if hi is None else f"Integer.valueOf({hi})"
+        conds.append(f'KfcGen.scoreMatches(sb, en.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
+    for pid in sel.predicates:
+        expr = PREDICATES.get(pid)
+        if expr is None:
+            em.reason = f"as 루프 predicate({pid}) 컴파일 불가"
+            return False
+        conds.append(expr.replace("{E}", "en"))
+    conds += _selector_extra_conds(sel, "en")
+    filt = " && ".join(conds) if conds else "true"
+
+    out = []
+    # as 앞 수정자(pre)를 루프 밖에 배치하는 공통 래퍼
+    def _wrap_pre(w):
+        if pre_rebinds and (_rebinds_nullable(pre_rebinds)
+                            or any('executor != null ?' in s for s in pre_rebinds)):
+            w = [f'if ({pre_src} != null) {{'] + ["    " + b for b in w] + ["}"]
+        for c in reversed(pre_conds):
+            w = [f'if ({c}) {{'] + ["    " + b for b in w] + ["}"]
+        if pre_rebinds:
+            w = ["{"] + ["    " + b for b in (list(pre_rebinds) + w)] + ["}"]
+        return w
+    if _rebinds_nullable(mod_rebinds):
+        _msrc = _v2_final_src(mod_rebinds, "es")
+        mod_conds = [f'{_msrc} != null'] + mod_conds   # 매치실패 fork 사망 -> continue
+    # ── 단일 셀렉터(@n/@p/@r/limit=1): 루프가 아니라 '소스 위치 기준 최근접 1개' 선택 ──
+    # (@n 을 전체 루프로 풀면 바닐라와 의미가 달라진다 - 최근접 하나만 실행 대상.)
+    if sel.base in ("n", "p", "r") or sel.limit == 1:
+        ent = single_entity_expr(sel_raw)
+        if ent is None:
+            em.reason = f"as 단일 셀렉터({sel_raw[:30]}) 해소 불가"
+            return False
+        ent = re.sub(r'\bsource\b', pre_src, ent)  # 셀렉터 평가 origin = as 앞 수정자 적용 소스
+        out.append(f'{{ net.minecraft.entity.Entity e = {ent};')
+        out.append('  if (e != null) {')
+        out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+        for s in mod_rebinds:
+            out.append("    " + s)
+        if mod_conds:
+            out.append(f'    if (({" && ".join(mod_conds)})) {{')
+            for b in body:
+                out.append("        " + b)
+            out.append("    }")
+        else:
+            for b in body:
+                out.append("    " + b)
+        out.append("} }")
+        em.java.extend(_wrap_pre(out))
+        em.kind = "native"
+        return True
+    mod_guard = f'    if (!({" && ".join(mod_conds)})) continue;' if mod_conds else None
+    mr1 = ["    " + s for s in mod_rebinds]    # 1단 들여쓰기(es 정의 뒤)
+    mr2 = ["        " + s for s in mod_rebinds] # 2단(다중타입 루프)
+    lim = sel.limit
+    if sel.base in ("a", "p", "r"):
+        out.append("for (ServerPlayerEntity e : ctx.allPlayers) {")
+        pconds = [re.sub(r'\ben\b', 'e', c) for c in conds]
+        if pconds:
+            out.append(f'    if (!({" && ".join(pconds)})) continue;')
+        out.append("    " + src_line)
+        out.extend(mr1)
+        if mod_guard:
+            out.append(mod_guard)
+        for b in body:
+            out.append("    " + b)
+        out.append("}")
+    elif jtypes == "ANY":
+        # 타입 미지정 @e -> 전 엔티티 순회 (+ limit). sort=nearest 면 거리순 정렬+제한.
+        if sel.sort == "nearest" and lim:
+            _lo, _hi = sel.distance if sel.distance else (None, None)
+            _dmn = "-1" if _lo is None else str(_lo)
+            _dmx = "-1" if _hi is None else str(_hi)
+            out.append(f"for (Entity e : KfcGen.nearestNAnyType(ctx, source.getPosition(), "
+                       f"{jarr_tags(sel.tags_pos)}, {jarr_tags(sel.tags_neg)}, "
+                       f"{_dmn}, {_dmx}, {lim})) {{")
+            out.append(f"    Entity en = e; if (!({filt})) continue;")
+            out.append("    " + src_line)
+            out.extend(mr1)
+            if mod_guard:
+                out.append(mod_guard)
+            for b in body:
+                out.append("    " + b)
+            out.append("}")
+        else:
+            if lim:
+                out.append("{ int _lim = 0;")
+            out.append("for (Entity e : ctx.world.iterateEntities()) {")
+            out.append(f"    Entity en = e; if (!({filt})) continue;")
+            out.append("    " + src_line)
+            out.extend(mr1)
+            if mod_guard:
+                out.append(mod_guard)
+            for b in body:
+                out.append("    " + b)
+            if lim:
+                out.append(f"    if (++_lim >= {lim}) break;")
+            out.append("}")
+            if lim:
+                out.append("}")
+    elif len(jtypes) == 1:
+        if lim:
+            out.append("{ int _lim = 0;")
+        out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]},")
+        out.append(f"        en -> {filt})) {{")
+        out.append("    " + src_line)
+        out.extend(mr1)
+        if mod_guard:
+            out.append(mod_guard)
+        for b in body:
+            out.append("    " + b)
+        if lim:
+            out.append(f"    if (++_lim >= {lim}) break;")
+        out.append("}")
+        if lim:
+            out.append("}")
+    else:
+        # 다중 타입(예: #kartmodels) -> 레퍼런스 src/ 처럼 타입 Set 순회
+        typeset = ", ".join(jtypes)
+        if lim:
+            out.append("{ int _lim = 0;")
+        out.append(f"for (EntityType<?> kfcType : java.util.Set.of({typeset})) {{")
+        out.append(f"    for (Entity e : ctx.world.getEntitiesByType(kfcType,")
+        out.append(f"            en -> {filt})) {{")
+        out.append("        " + src_line)
+        out.extend(mr2)
+        if mod_guard:
+            out.append("    " + mod_guard)
+        for b in body:
+            out.append("        " + b)
+        if lim:
+            out.append(f"        if (++_lim >= {lim}) break;")
+        out.append("    }")
+        if lim:
+            out.append("    if (_lim >= {0}) break;".format(lim))
+        out.append("}")
+        if lim:
+            out.append("}")
+
+    em.java.extend(_wrap_pre(out))
+    em.kind = "native"
+    return True
+
+
+def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bool:
+    """
+    execute [as @s] store result score|storage <대상> [<type> <scale>] run <소스>
+    ->  소스 값을 계산해서 대상(스코어/NBT)에 저장.
+
+    지원 소스:
+      - data get <entity|storage> <path>     -> NBT 읽기
+      - scoreboard players get <holder> <obj> -> 스코어 읽기
+      - function ns:path                       -> 함수 반환값 (1차 미지원: return값 캡처 복잡)
+    저장 대상:
+      - score <holder> <obj>                  -> 스코어에
+      - storage <id> <path> <type> <scale>    -> NBT에 (스케일 곱)
+    head 에 as @s 외 다른 수정자 있으면 1차 브릿지.
+    """
+    nodes, args = split_chain(head)
+    nn = [n["node"] for n in nodes]
+
+    # store 위치
+    if "store" not in nn:
+        return False
+    si = nn.index("store")
+    # store 앞 수정자: as/at + 조건(if/unless ...) 노드는 허용
+    #  (조건은 emit_execute 가 conds 로 따로 감싸므로 여기선 무시).
+    #  하드 컨텍스트 수정자(positioned/on/rotated/...)가 섞이면 1차 브릿지.
+    ALLOWED_PRE = {
+        "as", "targets", "at", "if", "unless", "score", "entity", "entities",
+        "matches", "range", "target", "targetObjective", "source",
+        "sourceObjective", "<", "<=", "=", ">=", ">",
+        # if-조건의 인자 노드들(조건 자체는 emit_execute 가 conds 로 따로 감쌈)
+        "data", "path", "block", "pos", "loaded", "predicate",
+        "items", "slots", "item_predicate", "biome", "dimension",
+        "function", "name",
+        # 위치/회전 재바인딩 수정자 - parse_modifiers 가 rebind 문장으로 환원하고
+        # emit_execute 가 store 결과를 그 rebind 로 감싼다. 여기선 통과만.
+        "positioned", "rotated", "facing", "align", "anchored",
+        "rotation", "rot", "axes", "anchor",
+    }
+    pre = nn[:si]
+    bad = [t for t in pre if t not in ALLOWED_PRE]
+    if bad:
+        em.reason = f"store 앞 수정자({bad}) - 1차 미지원"
+        return False
+
+    # store result score|storage ...
+    if nn[si + 1] != "result":
+        em.reason = "store success (1차 미지원)"
+        return False
+    dst_kind = nn[si + 2]   # score | storage
+
+    # 저장 대상 파싱
+    if dst_kind == "score":
+        # targets, objective (store 뒤쪽 것)
+        holder, obj = store_score_dst(args)
+        h = holder_expr(holder)
+        if h is not None:
+            dst_writer = lambda valexpr: f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {valexpr});'
+        else:
+            ent = single_entity_expr(holder)
+            if ent is None:
+                em.reason = f"store score 대상이 셀렉터({holder})"
+                return False
+            dst_writer = lambda valexpr: (
+                f'{{ net.minecraft.entity.Entity _se = {ent};'
+                f' if (_se != null) KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, {valexpr}); }}')
+    elif dst_kind == "storage":
+        sid = last_arg(args, "target")
+        spath = last_arg(args, "path")
+        ntype = nbt_store_type(nn, si)
+        scale = first_arg(args, "scale") or "1"
+        dst_writer = lambda valexpr: (
+            f'KfcGen.storagePutNumber(server, {jstr(sid)}, {jstr(spath)}, '
+            f'{scaled(valexpr, scale)}, {jstr(ntype)});')
+    elif dst_kind == "entity":
+        esel = last_arg(args, "target")
+        epath = last_arg(args, "path")
+        etype = nbt_store_type(nn, si)
+        escale = first_arg(args, "scale") or "1"
+        if not epath:
+            em.reason = "store entity 경로 없음"
+            return False
+        if esel == "@s":
+            ent = "executor"
+        else:
+            ent = single_entity_expr(esel)
+            if ent is None:
+                em.reason = f"store entity 대상 셀렉터({esel}) 미지원"
+                return False
+        dst_writer = lambda valexpr: (
+            f'{{ net.minecraft.entity.Entity _se = {ent};'
+            f' if (_se != null) KfcGen.entityPutNumberPath(_se, {jstr(epath)}, {jstr(etype)}, '
+            f'{scaled(valexpr, escale)}); }}')
+    elif dst_kind == "bossbar":
+        # store result bossbar <id> value|max run <소스>  -> 보스바 값/최대값 설정
+        bid = first_arg(args, "id")
+        field = nn[si + 4] if len(nn) > si + 4 else "value"
+        if not bid or field not in ("value", "max"):
+            em.reason = f"store bossbar {field} 미지원"
+            return False
+        fn = "bossbarSetValue" if field == "value" else "bossbarSetMaxValue"
+        dst_writer = lambda valexpr: f'KfcGen.{fn}(source, {jstr(bid)}, {valexpr});'
+    else:
+        em.reason = f"store {dst_kind} (미지원)"
+        return False
+
+    # store dst 뒤 `on vehicle (on vehicle)*` 재바인딩 체인 감지.
+    #  store 는 그 재바인딩 컨텍스트에서 평가된 소스 값을 캡처한다(/execute 시맨틱).
+    on_chain = 0
+    if "on" in nn[si:]:
+        oi = nn.index("on", si)
+        rest = nn[oi:]
+        if len(rest) % 2 == 0 and all(
+                rest[k] == "on" and rest[k + 1] == "vehicle" for k in range(0, len(rest), 2)):
+            on_chain = len(rest) // 2
+        else:
+            em.reason = "store on <비-vehicle 체인> 미지원"
+            return False
+
+    # 소스 커맨드 (run 뒤) -> 값 식
+    src_em = Emitted(line=line)
+    if on_chain:
+        # 재바인딩된 소스(_stSrc)/실행자(_stSelf) 기준으로 소스 평가
+        valexpr = source_value_expr(tail, src_em, self_expr="_stSelf", src_expr="_stSrc")
+        if valexpr is None:
+            em.reason = src_em.reason
+            return False
+        rebound = "source"
+        for _ in range(on_chain):
+            rebound = f"KfcGen.onVehicle({rebound})"
+        em.java.append(f"{{ net.minecraft.server.command.ServerCommandSource _stSrc = {rebound};")
+        em.java.append("  if (_stSrc != null) {")
+        em.java.append("    net.minecraft.entity.Entity _stSelf = _stSrc.getEntity();")
+        for s in src_em.side_effects:
+            em.java.append("    " + s)
+        em.java.append("    " + dst_writer(valexpr))
+        em.java.append("  } }")
+        em.kind = "native"
+        return True
+
+    valexpr = source_value_expr(tail, src_em)
+    if valexpr is None:
+        em.reason = src_em.reason
+        return False
+
+    # 소스가 부수효과(scoreboard operation 등)를 동반하면 값 쓰기 전에 먼저 실행
+    if src_em.side_effects:
+        em.java.extend(src_em.side_effects)
+    em.java.append(dst_writer(valexpr))
+    em.kind = "native"   # NBT/함수 호출 동반 -> gated
+    return True
+
+
+def store_score_dst(args: dict):
+    """store result score 의 대상 holder/obj.
+       as/at @s 가 앞서면 targets 리스트에 그 셀렉터가 먼저 들어오므로 store 대상은 마지막."""
+    tlist = args.get("targets", [{}])
+    olist = args.get("objective", [{}])
+    holder = tlist[-1].get("raw") if tlist else None
+    obj = olist[-1].get("raw") if olist else None
+    return holder, obj
+
+
+def nbt_store_type(nn: list[str], si: int) -> str:
+    for t in ("byte", "short", "int", "long", "float", "double"):
+        if t in nn[si:]:
+            return t
+    return "int"
+
+
+def scaled(valexpr: str, scale: str) -> str:
+    if "MACROVAR_" in str(scale):
+        return f"({valexpr}) * {jdouble(scale)}"
+    try:
+        if float(scale) == 1.0:
+            return valexpr
+    except ValueError:
+        pass
+    return f"({valexpr}) * {scale}"
+
+
+def source_value_expr(tail: list[dict], em: Emitted,
+                      self_expr: str = "executor", src_expr: str = "source") -> str | None:
+    """run 뒤 소스 -> int 값 식. self_expr/src_expr 로 @s(executor)-source 재바인딩 가능
+       (store ... on vehicle ... run 처럼 컨텍스트가 바뀐 경우). 반환식과 side_effects 둘 다 치환."""
+    r = _source_value_expr_raw(tail, em)
+    if r is None:
+        return None
+    if self_expr != "executor" or src_expr != "source":
+        def sub(s):
+            s = re.sub(r'\bexecutor\b', self_expr, s)
+            s = re.sub(r'\bsource\b', src_expr, s)
+            return s
+        r = sub(r)
+        if em.side_effects:
+            em.side_effects = [sub(s) for s in em.side_effects]
+    return r
+
+
+def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
+    """run 뒤 소스 커맨드 -> int 값을 내는 자바 식."""
+    if not tail:
+        em.reason = "store 소스 없음"
+        return None
+    nodes, args = split_chain(tail)
+    nn = [n["node"] for n in nodes]
+    cmd = nn[0]
+
+    if cmd == "data" and "get" in nn:
+        tgtkind = nn[2]  # entity | storage
+        path = first_arg(args, "path")
+        scale_arg = first_arg(args, "scale") or "1"
+        # data get 의 결과 = floor(value * scale). getAtPath(NbtPath) 라 리스트 인덱스도 지원.
+        def _scaled_get(g):
+            try:
+                if float(scale_arg) == 1.0:
+                    return f"(int)({g})"
+            except ValueError:
+                pass
+            return f"(int)(({g}) * {scale_arg})"
+        if tgtkind == "entity":
+            sel = first_arg(args, "target")
+            if sel == "@s":
+                return _scaled_get(f'KfcGen.entityGetDouble(executor, {jstr(path)})')
+            ent = single_entity_expr(sel)
+            if ent is None:
+                em.reason = f"store←data get entity 셀렉터({sel}) 미지원"
+                return None
+            return _scaled_get(f'KfcGen.entityGetDouble({ent}, {jstr(path)})')
+        elif tgtkind == "storage":
+            sid = first_arg(args, "target")
+            return _scaled_get(f'KfcGen.storageGetDouble(server, {jstr(sid)}, {jstr(path)})')
+    elif cmd == "data" and ("modify" in nn) and ("from" in nn):
+        # store result|success ... run data modify <dst> set from <src>
+        #  -> 소스 NBT 를 읽어 대상에 쓰고, 소스가 존재하면 1(변경 1건) else 0.
+        mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
+        if mode != "set":
+            em.reason = f"store←data modify {mode} from 미지원"
+            return None
+        fi = nn.index("from")
+        skind = nn[fi + 1] if fi + 1 < len(nn) else None
+        tgtkind = nn[2]
+        vsrc = _fresh_var("vsrc"); dres = _fresh_var("dres")
+        read = _data_source_read_expr(skind, args)
+        write = _data_target_write(tgtkind, args, vsrc)
+        if read is None or write is None:
+            em.reason = "store←data modify from 소스/타겟 미지원"
+            return None
+        em.side_effects = [
+            f"int {dres} = 0;",
+            f"{{ net.minecraft.nbt.NbtElement {vsrc} = {read};",
+            f"  if ({vsrc} != null) {{ {write}; {dres} = 1; }} }}",
+        ]
+        return dres
+    elif cmd == "scoreboard" and "get" in nn:
+        holder = first_arg(args, "target")
+        obj = first_arg(args, "objective")
+        h = holder_expr(holder)
+        if h is not None:
+            return f'KfcGen.getScore(sb, {h}, {jstr(obj)})'
+        # 단일 셀렉터 홀더(@n/@p/@e[limit=1]) -> 그 엔티티의 스코어보드 이름으로 조회
+        ent = single_entity_expr(holder)
+        if ent is None:
+            em.reason = f"store←scoreboard get 셀렉터({holder})"
+            return None
+        return f'KfcGen.getScoreOfEntity(sb, {ent}, {jstr(obj)})'
+    elif cmd == "scoreboard" and "players" in nn and any(
+            op in nn for op in ("operation", "add", "remove", "set")):
+        # store result storage ... run scoreboard players operation <대상> ...
+        #  -> operation 을 실행(부수효과)한 뒤, 그 대상의 최종 점수를 읽어 저장.
+        sub = next(op for op in ("operation", "add", "remove", "set") if op in nn)
+        dst_holder = first_arg(args, "targets")
+        dst_obj = first_arg(args, "objective") or first_arg(args, "targetObjective")
+        dh = holder_expr(dst_holder)
+        if dh is None:
+            em.reason = f"store←scoreboard {sub} 대상 셀렉터({dst_holder}) 미지원"
+            return None
+        # 소스 명령을 먼저 실행
+        inner = Emitted(line="")
+        if not emit_scoreboard(sub, args, inner):
+            em.reason = inner.reason or f"store←scoreboard {sub} 실행 미지원"
+            return None
+        em.side_effects = list(inner.java)  # 값 읽기 전에 실행할 문장들
+        return f'KfcGen.getScore(sb, {dh}, {jstr(dst_obj)})'
+    elif cmd == "function":
+        fid_called = first_arg(args, "name")
+        if not fid_called:
+            em.reason = "store←function 이름 없음"
+            return None
+        if ":" not in fid_called:
+            fid_called = "minecraft:" + fid_called
+        if fid_called in MACRO_FNS:
+            em.reason = f"store←function(매크로 {fid_called[:20]}) 1차 미지원"
+            return None
+        # 함수의 executeReturn 결과(마지막 return 값)를 저장
+        if ALL_FIDS and fid_called not in ALL_FIDS:
+            _ns, _p = fid_called.split(":", 1)
+            return (f'KfcGen.instantExecuteFunctionReturn(source, '
+                    f'net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)}))')
+        return f'{fqcn(fid_called)}.executeReturn(source)'
+    elif cmd == "random" and "value" in nn:
+        rng = first_arg(args, "range")
+        lo, hi = parse_range(rng) if rng else (None, None)
+        if lo is None or hi is None:
+            em.reason = f"store←random value 범위({rng}) 미지원"
+            return None
+        try:
+            int(lo); int(hi)
+        except (ValueError, TypeError):
+            em.reason = f"store←random value 정수범위 아님({rng})"
+            return None
+        return f'ctx.world.getRandom().nextBetween({lo}, {hi})'
+    elif cmd == "attribute" and "value" in nn and "get" in nn:
+        tsel = first_arg(args, "target")
+        attr = first_arg(args, "attribute")
+        mid = first_arg(args, "id")
+        if not attr or not mid:
+            em.reason = "store←attribute 인자 부족"
+            return None
+        if tsel == "@s":
+            ent = "executor"
+        else:
+            ent = single_entity_expr(tsel) if tsel else None
+            if ent is None:
+                em.reason = f"store←attribute 대상({tsel}) 미지원"
+                return None
+        # store result score 는 int - 바닐라 attribute get 의 result 는 value (스케일 미지정=1)
+        return f'(int) KfcGen.attrModifierValue({ent}, {jstr(attr)}, {jstr(mid)})'
+    elif cmd == "clear":
+        tgt = first_arg(args, "targets") or "@s"
+        item = first_arg(args, "item")
+        maxc = first_arg(args, "maxCount")
+        parsed = parse_clear_item(item) if item is not None else ("*", None)
+        if parsed is None:
+            em.reason = f"store←clear 술어({str(item)[:20]}) 미지원"
+            return None
+        iid, cdata = parsed
+        cd = "null" if cdata is None else jstr(cdata)
+        mc = "-1" if maxc is None else jint(maxc)
+        iid_j = "null" if iid == "*" else jstr(iid)
+        if tgt == "@s":
+            return f'KfcGen.clearItems(executor, {iid_j}, {cd}, {mc})'
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"store←clear 대상({tgt[:20]}) 미지원"
+            return None
+        return f'KfcGen.clearItems({ent}, {iid_j}, {cd}, {mc})'
+    em.reason = f"store 소스 {cmd} 미지원"
+    return None
+
+
+def _particle_viewers_expr(raw: str) -> str | None:
+    """particle viewers 셀렉터 -> List<ServerPlayerEntity> 식. @a[tag,distance] 등 지원.
+       @a(전체)면 위치/태그 필터를 적용한 리스트. 미지원 셀렉터면 None(전역 표시로 폴백)."""
+    sel = parse_selector(raw)
+    if sel is None:
+        return None
+    if sel.base not in ("a", "p", "s", "r"):
+        return None
+    if _sel_has_extra(sel) or sel.scores or sel.predicates:
+        return None
+    conds = []
+    for t in sel.tags_pos:
+        conds.append(f'_pv.getCommandTags().contains({jstr(t)})')
+    for t in sel.tags_neg:
+        conds.append(f'!_pv.getCommandTags().contains({jstr(t)})')
+    if sel.distance is not None:
+        lo, hi = sel.distance
+        conds.append(f'KfcGen.posInRange(source.getPosition(), _pv.getPos(), '
+                     f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+    if sel.gamemode is not None:
+        ge = f'KfcGen.gamemodeIs(_pv, {jstr(sel.gamemode)})'
+        conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+    body = " && ".join(conds) if conds else "true"
+    return f'KfcGen.filterPlayers(ctx, _pv -> ({body}))'
+
+
+def first_arg(args: dict, name: str):
+    v = args.get(name)
+    return v[0].get("raw") if v else None
+
+
+def last_arg(args: dict, name: str):
+    """같은 이름 인자가 여러 번이면 마지막 값. store dst 의 target/id 는 조건(if/unless score)의
+       target 뒤에 오므로(head 내 마지막), 전역 first_arg 대신 이걸 써야 정확하다."""
+    v = args.get(name)
+    return v[-1].get("raw") if v else None
+
+
+def single_entity_expr(raw: str) -> str | None:
+    """셀렉터 raw -> '단일 엔티티'를 내는 자바 식(Entity 또는 null). 지원 못하면 None.
+       @s[tag,type] -> executor (태그/타입 가드를 삼항으로)
+       @n / @e[limit=1] -> KfcGen.nearestEntity(...)
+       @p[...] -> KfcGen.nearestPlayer(...)
+    """
+    sel = parse_selector(raw)
+    if sel is None:
+        return None
+    if _sel_has_extra(sel):
+        return None  # nbt/advancements/team/level/name: 최근접 탐색 미수용 -> 폴백(정확성)
+
+    if sel.base == "s":
+        # 실행자 자신 + 태그/타입 가드. 조건 불만족이면 null 이 되도록 삼항.
+        guards = []
+        pg = predicate_guards(sel.predicates, "executor", player=False) if sel.predicates else []
+        if pg is None:
+            return None
+        guards += pg
+        for t in sel.tags_pos:
+            guards.append(f'executor.getCommandTags().contains({jstr(t)})')
+        for t in sel.tags_neg:
+            guards.append(f'!executor.getCommandTags().contains({jstr(t)})')
+        if sel.type_id and not sel.type_is_tag:
+            jt = entity_type_java(sel.type_id)
+            if not jt:
+                # 모드/커스텀 단일 타입 -> 런타임 레지스트리 비교
+                tid = sel.type_id if ":" in sel.type_id else "minecraft:" + sel.type_id
+                guards.append(f'KfcGen.entityTypeIs(executor, {jstr(tid)})')
+            else:
+                guards.append(f'executor.getType() == {jt}')
+        elif sel.type_is_tag:
+            jts = resolve_entity_types(sel)
+            if not jts:
+                # 컴파일타임 타입태그 부재 -> 런타임 EntityType.isIn(#tag)
+                guards.append(f'KfcGen.entityInTypeTag(executor, {jstr(sel.type_id)})')
+            else:
+                guards.append("(" + " || ".join(f'executor.getType() == {t}' for t in jts) + ")")
+        rc2 = rotation_conds(sel, "executor")
+        if rc2 is None:
+            return None
+        guards.extend(rc2)
+        if sel.distance is not None:
+            return None  # @s 에 distance 는 무의미/특이 - 미지원
+        if not guards:
+            return "executor"
+        return f'(({" && ".join(guards)}) ? executor : null)'
+
+    # 단일 엔티티/플레이어 탐색
+    tp = jarr_tags(sel.tags_pos)
+    tn = jarr_tags(sel.tags_neg)
+    lo, hi = sel.distance if sel.distance else (None, None)
+    dmin = "-1" if lo is None else str(lo)
+    dmax = "-1" if hi is None else str(hi)
+
+    if sel.base in ("p", "r") or (sel.base == "a" and sel.limit == 1):
+        # @a[limit=1] 은 sort=arbitrary(위치 무관, 첫 매치) — @p(nearest)와 다르다.
+        # 순위 판정처럼 '고정 기준점' 이 필요한 알고리즘에서 nearest 로 바꾸면 기준이 흔들린다.
+        _is_arbitrary = (sel.base == "a")
+        if sel.gamemode is not None or sel.scores or sel.predicates or sel.x_rotation or sel.y_rotation:
+            pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+            pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            if sel.gamemode is not None:
+                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
+                pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+            for o5, (sl5, sh5) in sel.scores.items():
+                sl_j = "null" if sl5 is None else f"Integer.valueOf({sl5})"
+                sh_j = "null" if sh5 is None else f"Integer.valueOf({sh5})"
+                pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), {jstr(o5)}, {sl_j}, {sh_j})')
+            rcp = rotation_conds(sel, "_pe")
+            if rcp is None:
+                return None
+            pc += rcp
+            if sel.predicates:
+                pgp = predicate_guards(sel.predicates, "_pe", player=True)
+                if pgp is None:
+                    return None
+                pc += pgp
+            if sel.distance is not None:
+                dl5, dh5 = sel.distance
+                pc.append(f'KfcGen.posInRange(source.getPosition(), _pe.getPos(), '
+                          f'{dl5 if dl5 is not None else -1}, {dh5 if dh5 is not None else -1})')
+            body5 = " && ".join(pc) if pc else "true"
+            if _is_arbitrary:
+                return f'KfcGen.firstPlayerWhere(ctx, _pe -> ({body5}))'
+            return f'KfcGen.nearestPlayerWhere(ctx, source.getPosition(), _pe -> ({body5}))'
+        if _is_arbitrary:
+            return f'KfcGen.firstPlayer(ctx, {tp}, {tn}, {dmin}, {dmax}, source.getPosition())'
+        return f'KfcGen.nearestPlayer(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
+    if sel.base in ("n", "e"):
+        types = resolve_entity_types(sel)
+        if sel.type_id and not sel.type_is_tag:
+            jt = entity_type_java(sel.type_id)
+            types = [jt] if jt else None
+        # 단일후보(@n/@e[limit=1])에서만 nearest* 사용. @e 무제한은 루프 경로.
+        if not (sel.base == "n" or sel.limit == 1):
+            if not types or sel.type_neg:
+                return None
+        # 타입 미해소(커스텀 타입태그/모드 타입/type=!X) -> 전 엔티티 순회 + 런타임 가드.
+        if not types or sel.type_neg:
+            extra = []
+            if sel.type_is_tag:
+                e = f'KfcGen.entityInTypeTag(_ee, {jstr(sel.type_id)})'
+                extra.append(f'!({e})' if sel.type_neg else e)
+            elif sel.type_id:
+                tid = sel.type_id if ":" in sel.type_id else "minecraft:" + sel.type_id
+                e = f'KfcGen.entityTypeIs(_ee, {jstr(tid)})'
+                extra.append(f'!({e})' if sel.type_neg else e)
+            for o6, (sl6, sh6) in (sel.scores or {}).items():
+                sl_j = "null" if sl6 is None else f"Integer.valueOf({sl6})"
+                sh_j = "null" if sh6 is None else f"Integer.valueOf({sh6})"
+                extra.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
+            rce = rotation_conds(sel, "_ee")
+            if rce is None:
+                return None
+            extra += rce
+            if sel.predicates:
+                pge = predicate_guards(sel.predicates, "_ee", player=False)
+                if pge is None:
+                    return None
+                extra += pge
+            body6 = " && ".join(extra) if extra else "true"
+            return (f'KfcGen.nearestEntityAnyTypeWhere(ctx, source.getPosition(), {tp}, {tn}, '
+                    f'{dmin}, {dmax}, _ee -> ({body6}))')
+        arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+        if sel.gamemode is not None:
+            return None  # @e/@n 의 gamemode 는 미지원 - 무시 대신 거부(정확성)
+        ec = []
+        for o6, (sl6, sh6) in (sel.scores or {}).items():
+            sl_j = "null" if sl6 is None else f"Integer.valueOf({sl6})"
+            sh_j = "null" if sh6 is None else f"Integer.valueOf({sh6})"
+            ec.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
+        rce = rotation_conds(sel, "_ee")
+        if rce is None:
+            return None
+        ec += rce
+        if sel.predicates:
+            pge = predicate_guards(sel.predicates, "_ee", player=False)
+            if pge is None:
+                return None
+            ec += pge
+        if ec:
+            return (f'KfcGen.nearestEntityWhere(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
+                    f'{dmin}, {dmax}, _ee -> ({" && ".join(ec)}))')
+        return f'KfcGen.nearestEntity(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})'
+    return None
+
+
+
+def rotation_conds(sel, evar: str):
+    """x_rotation/y_rotation -> 자바 조건식 리스트. yaw 래핑(min>max)도 OR 로 지원."""
+    out = []
+    if sel.x_rotation is not None:
+        lo, hi = sel.x_rotation
+        if lo is not None:
+            out.append(f'{evar}.getPitch() >= {lo}')
+        if hi is not None:
+            out.append(f'{evar}.getPitch() <= {hi}')
+    if sel.y_rotation is not None:
+        lo, hi = sel.y_rotation
+        if lo is not None and hi is not None and float(lo) > float(hi):
+            # 래핑 범위: yaw>=lo OR yaw<=hi (예: y_rotation=170..-170 -> 정면 뒤쪽)
+            out.append(f'({evar}.getYaw() >= {lo} || {evar}.getYaw() <= {hi})')
+        else:
+            if lo is not None:
+                out.append(f'{evar}.getYaw() >= {lo}')
+            if hi is not None:
+                out.append(f'{evar}.getYaw() <= {hi}')
+    return out
+
+def jarr_tags(tags: list) -> str:
+    """태그 리스트 -> 자바 String[] 리터럴."""
+    if not tags:
+        return "new String[0]"
+    return "new String[]{" + ", ".join(jstr(t) for t in tags) + "}"
+
+
+def ent_expr_to_name(expr): return expr   # placeholder (비교형 셀렉터는 1차 미지원이라 미사용)
+def ent_expr_var(expr): return expr
+
+
+# ───────────────────────── 식별자 -> 자바 FQCN ─────────────────────────
+def fqcn(fid: str) -> str:
+    """'kartmobil:move/movetp/tp' -> '<GROUP>.kartmobil.move.movetp.Tp'"""
+    ns, path = fid.split(":", 1)
+    segs = path.split("/")
+    pkg = ".".join([sanitize(ns)] + [sanitize(s) for s in segs[:-1]])
+    cls = pascal(segs[-1])
+    base = GROUP
+    return f'{base}.{pkg}.{cls}' if pkg else f'{base}.{cls}'
+
+JAVA_KEYWORDS = {
+    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char",
+    "class", "const", "continue", "default", "do", "double", "else", "enum",
+    "extends", "final", "finally", "float", "for", "goto", "if", "implements",
+    "import", "instanceof", "int", "interface", "long", "native", "new",
+    "package", "private", "protected", "public", "return", "short", "static",
+    "strictfp", "super", "switch", "synchronized", "this", "throw", "throws",
+    "transient", "try", "void", "volatile", "while", "true", "false", "null",
+    "var", "record", "yield", "sealed", "permits", "non-sealed",
+    "_",   # Java 9+ 예약어: 단독 밑줄은 식별자/패키지명으로 불가
+}
+
+def sanitize(s):
+    s = re.sub(r'[^A-Za-z0-9_]', '_', s) or "_"
+    if s[0].isdigit():
+        s = "_" + s
+    if s in JAVA_KEYWORDS:
+        s = s + "_"
+    return s
+
+def pascal(s):
+    parts = re.split(r'[^A-Za-z0-9]+', s)
+    n = "".join(p[:1].upper() + p[1:] for p in parts if p) or "Fn"
+    return ("F" + n) if n[0].isdigit() else n
+
+
+# ───────────────────────── 한 줄 처리 ─────────────────────────
+# 마크 1.21.5 vanilla 루트 명령 집합. 이 밖의 ok:true command 는 무효 명령으로 간주
+# (mcfunction 로드 시 함수 전체 거부). stopsound 처럼 실제 유효한 것을 빠뜨리면
+# 멀쩡한 함수를 죽이므로, 누락 없이 정의한다.
+# [!] ParseDumper 가 실제 dispatcher 루트 목록(commands.json)을 덤프하면 그걸 우선 사용.
+VANILLA_COMMANDS = {
+    "advancement", "attribute", "ban", "ban-ip", "banlist", "bossbar", "clear", "clone",
+    "damage", "data", "datapack", "debug", "defaultgamemode", "deop", "difficulty",
+    "effect", "enchant", "execute", "experience", "fill", "fillbiome", "forceload",
+    "function", "gamemode", "gamerule", "give", "help", "item", "jfr", "kick", "kill",
+    "list", "locate", "loot", "me", "msg", "op", "pardon", "pardon-ip", "particle",
+    "perf", "place", "playsound", "publish", "random", "recipe", "reload", "return",
+    "ride", "rotate", "save-all", "save-off", "save-on", "say", "schedule", "scoreboard",
+    "seed", "setblock", "setidletimeout", "setworldspawn", "spawnpoint", "spectate",
+    "spreadplayers", "stop", "stopsound", "summon", "tag", "team", "teammsg", "teleport",
+    "tell", "tellraw", "tp", "tick", "time", "title", "transfer", "trigger", "w",
+    "weather", "whitelist", "worldborder", "xp", "fillbiome", "dialog", "waypoint",
+    "rotate", "test",  # 1.21.x 추가분 포함
+}
+
+# 외부에서 실제 dispatcher 루트 목록을 주입하면 그것으로 교체 (정확도 우선)
+_dispatcher_roots: set | None = None
+def set_dispatcher_roots(roots):
+    global _dispatcher_roots
+    _dispatcher_roots = set(roots) if roots else None
+
+def is_valid_root_command(command) -> bool:
+    """command 가 유효한 마크 루트 명령인가. None/빈 문자열/집합 밖이면 무효."""
+    if not command:
+        return False
+    valid = _dispatcher_roots if _dispatcher_roots is not None else VANILLA_COMMANDS
+    return command in valid
+
+
+def emit_line(obj: dict) -> Emitted:
+    global _on_depth
+    _on_depth = 0
+    em = Emitted(line=obj["line"])
+
+    if obj.get("macro"):
+        return emit_macro(obj, em)
+    if not obj.get("ok"):
+        # 파싱 실패: 미해소(tag/predicate/element)는 브릿지 유지(실제론 정상),
+        # 진짜 문법오류(Unknown command/Expected/Incorrect)는 함수 거부.
+        err = obj.get("error", "") or "parse failed"
+        if is_real_syntax_error(err):
+            return em.reject(f"문법 오류로 함수 거부: {err[:60]}")
+        return em.bridge(f"파싱 실패(미해소, 브릿지): {err[:50]}")
+
+    command = obj.get("command")
+    chain = obj.get("chain", [])
+
+    # ok:true 인데 루트 command 가 무효 -> mcfunction 에서 함수 전체 거부
+    if not is_valid_root_command(command):
+        return em.reject(f"무효 루트 명령 '{command}' - 함수 거부")
+
+    if command == "execute":
+        if emit_execute(em.line, chain, em):
+            return em
+        return em.bridge(em.reason or "execute 네이티브화 불가")
+    else:
+        if emit_target(em.line, command, chain, em):
+            return em
+        return em.bridge(f"{command} 네이티브화 불가(1차)")
+
+
+
+def _inject_macro_markers(line, reparsed_line, macro_vars, chain):
+    """숫자/문자열 더미 재파싱된 chain 에 MACROVAR_<i> 를 주입.
+       원본-재파싱 줄의 공백 토큰열이 1:1 정렬될 때만 안전 적용, 아니면 None."""
+    orig = line.lstrip("$").split(" ")
+    rep = reparsed_line.split(" ")
+    if len(orig) != len(rep):
+        return None
+    # 더미 위치 -> 마커 토큰
+    diff = {}
+    for i, (a, b) in enumerate(zip(orig, rep)):
+        if a == b:
+            continue
+        if "$(" not in a:
+            return None  # 더미 외 차이 - 정렬 실패
+        mk = a
+        for name in re.findall(r'\$\(([\w\-]+)\)', a):
+            if name not in macro_vars:
+                return None
+            mk = mk.replace(f"$({name})", f"MACROVAR_{macro_vars.index(name)}")
+        diff[i] = mk
+    if not diff:
+        return None
+    # chain 사본의 raw/range 를 rep 토큰 커서 동기화로 갱신
+    import copy as _copy
+    out = _copy.deepcopy(chain)
+    pos = 0
+    def apply(span_text):
+        nonlocal pos
+        toks = span_text.split(" ")
+        # rep[pos..] 에서 toks 연속 일치 지점 전진 탐색
+        p = pos
+        while p + len(toks) <= len(rep):
+            if rep[p:p + len(toks)] == toks:
+                newt = [diff.get(p + j, t) for j, t in enumerate(toks)]
+                pos = p + len(toks)
+                return " ".join(newt)
+            p += 1
+        return None
+    for step in out:
+        if "arg" in step:
+            raw = step.get("value", {}).get("raw")
+            if isinstance(raw, str) and raw:
+                nv = apply(raw)
+                if nv is None:
+                    return None
+                step["value"]["raw"] = nv
+    # 모든 더미가 소비됐는지(리터럴 노드 자리 매크로 등은 미지원)
+    consumed_ok = True
+    # raw 갱신 후에도 diff 위치가 raw 밖(리터럴 노드)에 남았다면 chain 으론 표현 불가 -
+    # emit 이 그 노드를 노드명으로만 보므로 마커 미반영 = 잘못된 코드. 검출:
+    covered = set()
+    pos2 = 0
+    for step in out:
+        if "arg" in step:
+            toks = step["value"]["raw"].split(" ")
+            # 원 rep 기준 위치 재계산은 생략(이중 적용 방지를 위해 raw 에 MACROVAR 존재로 판정)
+    if not any("MACROVAR_" in (s.get("value", {}).get("raw") or "") for s in out if "arg" in s):
+        return None
+    return out
+
+
+def emit_macro(obj: dict, em: Emitted) -> Emitted:
+    """매크로 줄 처리.
+       ParseDumper 가 $(var)->더미 치환 후 재파싱해 chain 을 줬다면(reparsed:true),
+       일반 emit 경로로 변환한 뒤 자바 코드의 더미를 macroArgs 파라미터로 환원한다.
+       식별자 전략(MACROVAR_<i>)으로 재파싱된 경우만 안전하게 네이티브화 가능
+       (숫자 더미는 변수 위치 구분 불가 -> 인자받는 브릿지로 폴백)."""
+    macro_vars = obj.get("macroVars", [])
+    reparsed = obj.get("reparsed", False)
+    reparsed_line = obj.get("reparsedLine", "")
+
+    if not reparsed or not obj.get("ok"):
+        # 재파싱 실패 -> 인자받는 브릿지(문맥 유지). 런타임에 $(var) 치환 후 instantExecuteCommand.
+        return macro_bridge(obj, em, macro_vars)
+
+    # 식별자 전략으로 재파싱됐는지 = reparsedLine 에 MACROVAR_ 가 있는지
+    use_ident = "MACROVAR_" in reparsed_line
+    command = obj.get("command")
+    chain = obj.get("chain", [])
+    if not use_ident:
+        # 숫자 더미 재파싱: 원본↔재파싱 줄을 토큰 단위로 정렬해 더미 위치를 역추적,
+        # chain 의 raw 에 MACROVAR_<i> 마커를 주입해 식별자 경로와 합류시킨다.
+        chain = _inject_macro_markers(obj.get("line", ""), reparsed_line, macro_vars, chain)
+        if chain is None:
+            return macro_bridge(obj, em, macro_vars)
+
+    # 일반 emit 경로로 변환 (chain 에 MACROVAR_<i> 가 리터럴로 들어있음)
+    inner = Emitted(line=reparsed_line)
+    ok = (emit_execute(reparsed_line, chain, inner) if command == "execute"
+          else emit_target(reparsed_line, command, chain, inner))
+    if not ok:
+        return macro_bridge(obj, em, macro_vars)
+
+    # 자바 코드의 MACROVAR_<i> 리터럴을 macroArgs 환원.
+    # 더미가 어떻게 들어갔냐에 따라:
+    #  - 숫자 자리: 코드에 MACROVAR_0 이 식별자로 들어가면 컴파일 안 됨 -> 그 경우 brige.
+    #    하지만 식별자 전략이 파싱 통과했다는 건 그 자리가 식별자/이름 허용 자리라는 뜻.
+    #    스코어 값/NBT 숫자 자리는 식별자 전략으로는 애초에 파싱 실패했을 것.
+    #  - 따라서 여기 오는 건 이름/문자열 자리 변수. macroArgs.get("var") (String) 로 치환.
+    body = []
+    used_vars = set()
+    for stmt in inner.java:
+        s = stmt
+        for i, var in enumerate(macro_vars):
+            token = f"MACROVAR_{i}"
+            if token in s:
+                # 문자열 리터럴 안이면 "..." 안의 토큰 -> 문자열 연결로
+                s = substitute_macro_token(s, token, var)
+                used_vars.add(var)
+        body.append(s)
+
+    # 바닐라 매크로 시맨틱: 치환된 매크로 인자가 빈 문자열/비수치라서 명령이 파싱 실패하면
+    # 그 '한 줄'만 조용히 스킵된다(함수 전체는 계속). 변환 코드는 Integer/Double/Float.parseInt 로
+    # 즉시 파싱하므로 NumberFormatException 으로 서버가 죽는다. 수치 파싱을 포함한 줄은
+    # try-catch 로 감싸 파싱 실패 시 그 줄만 건너뛰어 바닐라 동작과 일치시킨다.
+    body = _wrap_macro_numeric_parse(body)
+
+    em.java = body
+    em.kind = inner.kind  # 순수 자바면 native 유지, inner 가 폴백이면 dispatch 전파
+    em.reason = f"매크로 네이티브화(변수: {', '.join(sorted(used_vars))})"
+    em.macro_params = sorted(used_vars)
+    return em
+
+
+def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
+    """수치 매크로 파싱(Integer/Double/Float.parse*(...macroArgs.get...))을 포함한 자바 문장을
+       try-catch(NumberFormatException) 로 감싸, 빈/비수치 인자일 때 그 줄만 스킵한다.
+       단, 변수 선언문(`Type var = expr;`)은 그 변수가 이후 줄에서 참조될 수 있으므로
+       선언을 try 밖으로 빼고 할당만 try 안에서 한다(스코프 보존)."""
+    out = []
+    for s in stmts:
+        st = s.strip()
+        has_parse = bool(re.search(r'(Integer\.parseInt|Double\.parseDouble|Float\.parseFloat)\s*\(', st))
+        if not (has_parse and "macroArgs.get(" in st) or st.startswith("//"):
+            out.append(s)
+            continue
+        # 블록을 열거나(`... {`) 닫는(`}` 포함) 줄은 통째 try 로 감싸면 중괄호 짝이 깨진다.
+        if st.endswith("{") or "}" in st:
+            # 특수 케이스: `if (<파싱 포함 조건>) {` — 조건 평가에서 파싱이 터진다.
+            mif = re.match(r'^if\s*\((.+)\)\s*\{$', st)
+            if mif and "macroArgs.get(" in mif.group(1):
+                indent = s[:len(s) - len(s.lstrip())]
+                cvar = f"_mcond{_uid()}"
+                out.append(f'{indent}boolean {cvar} = false;'
+                           f' try {{ {cvar} = ({mif.group(1)}); }} catch (NumberFormatException _nfe) {{}}')
+                out.append(f'{indent}if ({cvar}) {{')
+                continue
+            # 한 줄에서 완결된 블록(`{ ...; }` — 여는/닫는 중괄호 수 균형)은 통째로 감싸도
+            # 중괄호 짝이 유지된다. 균형이 안 맞으면(블록이 다음 줄로 이어짐) 감싸지 않는다.
+            if st.count("{") == st.count("}") and st.endswith("}"):
+                indent = s[:len(s) - len(s.lstrip())]
+                out.append(f'{indent}try {{ {st} }} catch (NumberFormatException _nfe) {{}}')
+                continue
+            out.append(s)
+            continue
+        indent = s[:len(s) - len(s.lstrip())]
+        # 선언문 패턴: `<type> <name> = <expr>;`  (type 은 패키지/제네릭 포함 가능)
+        m = re.match(r'^([\w.$]+(?:<[^=;]*>)?)\s+(\w+)\s*=\s*(.+);\s*$', st)
+        if m:
+            jtype, name, expr = m.group(1), m.group(2), m.group(3)
+            if jtype not in ("return", "if", "for", "while", "else", "try", "catch"):
+                default = "0" if jtype in ("int", "long", "short", "byte") else (
+                    "0.0" if jtype in ("double", "float") else "null")
+                out.append(f'{indent}{jtype} {name} = {default};'
+                           f' try {{ {name} = {expr}; }} catch (NumberFormatException _nfe) {{}}')
+                continue
+        # 단순 문장(세미콜론 종료, 중괄호 없음)만 통째로 감싼다.
+        if st.endswith(";"):
+            out.append(f'{indent}try {{ {st} }} catch (NumberFormatException _nfe) {{}}')
+        else:
+            out.append(s)
+    return out
+
+
+def substitute_macro_token(stmt: str, token: str, var: str) -> str:
+    """자바 문장에서 더미 토큰을 macroArgs.get(var) 로 치환.
+       문장을 따옴표 기준 세그먼트(리터럴/코드)로 정확히 분할해,
+       리터럴 안 토큰은 문자열 연결로, 코드 자리 토큰은 식별자 치환으로 처리한다.
+       (이전 정규식 `"[^"]*TOKEN[^"]*"` 은 닫는따옴표~여는따옴표 구간을
+        가짜 리터럴로 오인해 이웃 리터럴을 삼키는 버그가 있었음.)"""
+    repl = f'macroArgs.get({jstr(var)})'
+    segs = []           # (kind 'S'|'C', text) - S 는 따옴표 포함 리터럴
+    cur, in_s, esc = '', False, False
+    for ch in stmt:
+        if in_s:
+            cur += ch
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                segs.append(('S', cur)); cur = ''; in_s = False
+        else:
+            if ch == '"':
+                if cur:
+                    segs.append(('C', cur)); cur = ''
+                cur = '"'; in_s = True
+            else:
+                cur += ch
+    if cur:
+        segs.append(('S' if in_s else 'C', cur))
+    out = []
+    for kind, seg in segs:
+        if token not in seg:
+            out.append(seg); continue
+        if kind == 'S':
+            inner_s = seg[1:-1]
+            parts = inner_s.split(token)
+            pieces = []
+            for k, p in enumerate(parts):
+                if k > 0:
+                    pieces.append(repl)
+                if p:
+                    pieces.append('"' + p + '"')
+            out.append(" + ".join(pieces) if pieces else jstr(""))
+        else:
+            out.append(re.sub(r'\b' + re.escape(token) + r'\b', repl, seg))
+    return "".join(out)
+
+
+def macro_bridge(obj: dict, em: Emitted, macro_vars: list) -> Emitted:
+    """네이티브화 못한 매크로 줄 - 함수 단위 폴백 신호(dispatch).
+       assemble 이 instantExecuteFunction(source, id, macroArgs) 로 원본 mcfunction 을
+       실행하므로 $(var) 런타임 치환은 함수 매니저가 처리한다."""
+    em.kind = "dispatch"
+    em.reason = "매크로 줄 네이티브화 불가 - 함수 폴백"
+    em.macro_params = list(dict.fromkeys(macro_vars))
+    em.java = ['// ⛔ 매크로 자바 변환 불가(함수 폴백)']
+    return em
+
+
+def is_real_syntax_error(err: str) -> bool:
+    """파싱 실패 사유가 '진짜 문법오류'(->함수 거부)인지 '미해소'(->정상, 브릿지)인지 판정.
+       태그/predicate/element 미해소는 런타임엔 정상이므로 브릿지 유지."""
+    el = err.lower()
+    # 미해소 - 실제론 정상 (False)
+    if any(s in el for s in (
+        "block tag", "item tag", "entity tag", "fluid tag", "game event tag",
+        "predicate", "failed to get element", "failed to parse structure",
+        "unknown loot", "advancement", "recipe", "function tag", "biome", "structure",
+        "dimension", "enchantment", "attribute modifier")):
+        return False
+    # 진짜 문법오류 (True)
+    if any(s in el for s in (
+        "unknown command", "incomplete command", "expected", "incorrect argument",
+        "unknown or incomplete", "whitespace", "trailing data", "invalid")):
+        return True
+    return False
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else \
+        str(Path(__file__).parent / "fixtures" / "trees_sample.json")
+    # 데이터팩 태그 로드 (엔티티 타입 해소용). 2번째 인자로 데이터팩 루트.
+    dp = sys.argv[2] if len(sys.argv) > 2 else "/home/claude/project/kartriderpack"
+    if Path(dp).exists():
+        load_entity_type_tags(dp)
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+
+    native = gated = bridge = 0
+    print("=" * 70)
+    for obj in data:
+        em = emit_line(obj)
+        tag = {"native": "✅NATIVE", "gated": "🔶GATED", "bridge": "🌉BRIDGE"}[em.kind]
+        print(f"\n[{tag}] {em.line[:78]}")
+        if em.kind == "bridge":
+            print(f"        reason: {em.reason}")
+        for j in em.java:
+            print(f"        {j}")
+        native += em.kind == "native"
+        gated += em.kind == "gated"
+        bridge += em.kind == "bridge"
+    print("\n" + "=" * 70)
+    tot = len(data)
+    print(f"total: {tot} lines | native {native} | gated {gated} | bridge {bridge} "
+          f"| native-rate {100*(native+gated)//tot}%")
+
+
+if __name__ == "__main__":
+    main()

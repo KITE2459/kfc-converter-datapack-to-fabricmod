@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "kfc_parser",
+  "version": "1.0.0",
+  "name": "KFC Datapack Parser",
+  "description": "Datapack converter command parser (build tool, not a runtime mod).",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "datapackconvert.parsedumper.ParseDumper"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "*"
+  }
+}

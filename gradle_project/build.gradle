@@ -1,0 +1,182 @@
+plugins {
+    id 'fabric-loom' version '1.10-SNAPSHOT'   // MC 1.21.5 대응 Loom
+    id 'java'
+}
+
+java {
+    // 마인크래프트 1.21.5 는 Java 21 필요.
+    toolchain { languageVersion = JavaLanguageVersion.of(21) }
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    maven { url = "https://maven.fabricmc.net/" }
+    mavenCentral()
+}
+
+sourceSets {
+    main { java { srcDirs = ['src/main/java'] } }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+    implementation "com.google.code.gson:gson:2.11.0"
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  파서 소스 준비 — 상위(변환기) 폴더의 .java 를 src 트리로 복사
+// ════════════════════════════════════════════════════════════════════
+tasks.register('setupParserSource', Copy) {
+    from rootProject.file('../ParseDumper.java')
+    into rootProject.file('src/main/java/datapackconvert/parsedumper')
+}
+tasks.named('compileJava') { dependsOn 'setupParserSource' }
+
+// ════════════════════════════════════════════════════════════════════
+//  통합 변환: extract(py) → parse(runServer, Fabric 런타임) → generate(py)
+//  사용:  ./gradlew convert "-Pdatapack=..\mypack.zip" "-Pout=..\generated_src"
+// ════════════════════════════════════════════════════════════════════
+
+// 임시 파일 경로 (build 디렉터리 안)
+def kfcWork    = layout.buildDirectory.dir("kfc").get().asFile
+def kfcLines   = new File(kfcWork, "lines.json")
+def kfcTrees   = new File(kfcWork, "trees.json")
+def converterDir = rootProject.file('..').absolutePath
+// Python 실행기 결정 (우선순위):
+//   1) -Ppython=<경로> 로 명시하면 그것
+//   2) PATH 에 PyPy(pypy3/pypy)가 있으면 자동 사용 (JIT 가속)
+//   3) 없으면 일반 python
+// → PyPy 가 깔려 있으면 자동으로 빨라지고, 없어도 멀쩡히 동작(폴백).
+def _detectPython = {
+    def explicit = project.findProperty('python')
+    if (explicit) return explicit.toString()
+    def isWin = System.getProperty('os.name').toLowerCase().contains('win')
+    for (cand in ['pypy3', 'pypy']) {
+        try {
+            def exe = isWin ? "${cand}.exe" : cand
+            def p = "${exe} --version".execute()
+            p.waitFor()
+            if (p.exitValue() == 0) {
+                println "[kfc] using PyPy for Python stages: ${exe}"
+                return exe
+            }
+        } catch (ignored) { /* not found, try next */ }
+    }
+    return 'python'
+}
+def pythonExe = _detectPython()
+
+// [1] extract — 데이터팩 → lines.json (Python)
+tasks.register('kfcExtract', Exec) {
+    group = 'kfc'
+    doFirst {
+        def datapack = project.findProperty('datapack')
+        if (!datapack) throw new GradleException(
+            "usage: ./gradlew convert \"-Pdatapack=<datapack.zip|dir>\" \"-Pout=<output_dir>\"")
+        kfcWork.mkdirs()
+        // Python 출력을 UTF-8 로 강제 — Windows(cp949) 콘솔에서 한글 깨짐 방지.
+        environment 'PYTHONUTF8', '1'
+        environment 'PYTHONIOENCODING', 'utf-8'
+        workingDir converterDir
+        commandLine pythonExe, "${converterDir}/convert.py", 'extract',
+                project.file(datapack).absolutePath, kfcLines.absolutePath
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Loom run 설정 — parse 전용 서버 run.
+//  runs { } 블록의 property() 는 Loom 의 dev 런처(devlaunchinjector) 설정을 보존하면서
+//  JVM 프로퍼티만 '추가'한다. (jvmArgs 를 '=' 로 덮어쓰면 런처가 사라져 ClassNotFound)
+//  경로는 configuration 시점에 확정되므로 여기서 직접 지정.
+// ════════════════════════════════════════════════════════════════════
+loom {
+    runs {
+        // 기존 server run 에 우리 파싱 프로퍼티를 추가.
+        server {
+            property("parsedumper.in",  kfcLines.absolutePath)
+            property("parsedumper.out", kfcTrees.absolutePath)
+            runDir = "run"
+            // ── JVM 튜닝 (대용량 파싱 메모리·속도 안정화) ──
+            // G1GC: 큰 힙에서 정지시간 짧고 회수 효율 좋음.
+            // 힙 상한은 gradle.properties 의 -Pheap 또는 기본 4G. 파싱은 일시적이라 4G면 충분.
+            vmArgs "-XX:+UseG1GC"
+            vmArgs "-XX:MaxGCPauseMillis=100"
+            // 데이터팩 파싱만 하므로 불필요한 기능 끔(서버 워치독 비활성: 긴 파싱이 죽지 않게).
+            vmArgs "-Ddisable.watchdog=true"
+            // 힙: -Pheap=6G 처럼 넘기면 반영, 없으면 4G.
+            vmArgs "-Xmx" + (project.findProperty('heap') ?: '4G')
+        }
+    }
+}
+
+// [2] parse — lines.json → trees.json (Fabric runServer 위에서 ParseDumper)
+//     runServer 는 Loom 제공 task. Knot 클래스로더 위에서 돌아 access widener 적용됨.
+//     ParseDumper 가 SERVER_STARTED 에서 파싱 후 server.stop() → 게임루프 없이 즉시 종료.
+tasks.named('runServer') {
+    // ⚠️ 'classes'(= compileJava + processResources) 의존 필수.
+    //    processResources 가 fabric.mod.json 을 build/resources/main 에 복사해야
+    //    Fabric 이 모드(ParseDumper)를 인식한다. 빠지면 빈 서버로 떠서 ParseDumper 가 안 걸린다.
+    dependsOn 'classes', 'processResources', 'kfcExtract'
+    doFirst {
+        def runDir = file("run")
+        runDir.mkdirs()
+        new File(runDir, "eula.txt").text = "eula=true\n"
+        new File(runDir, "server.properties").text =
+            "online-mode=false\nlevel-type=minecraft\\:flat\nmax-players=1\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nsync-chunk-writes=false\n"
+
+        // ★ 데이터팩을 서버 월드의 datapacks/ 에 넣어, 서버 시작 시 커스텀 태그/predicate
+        //   (예: kartmobil:ignoreblock 같은 block tag)를 레지스트리에 로드시킨다.
+        //   이게 없으면 ParseDumper 파서가 커스텀 태그를 'Unknown' 으로 보고 파싱 실패→폴백
+        //   처리하여 변환률이 떨어진다.
+        def datapack = project.findProperty('datapack')
+        if (datapack) {
+            def dpFile = project.file(datapack)
+            def dpDir = new File(runDir, "world/datapacks")
+            dpDir.mkdirs()
+            // 기존 복사본 제거(최신 보장)
+            delete fileTree(dir: dpDir, includes: ['kfc_input/**', 'kfc_input.zip'])
+            if (dpFile.name.toLowerCase().endsWith(".zip")) {
+                // zip 은 그대로 datapacks 에 두면 서버가 읽는다.
+                copy { from dpFile; into dpDir; rename { "kfc_input.zip" } }
+            } else {
+                // 디렉터리는 폴더째 복사.
+                copy { from dpFile; into new File(dpDir, "kfc_input") }
+            }
+            println "[runServer] datapack staged into world/datapacks for tag/predicate loading"
+        }
+    }
+}
+
+// [3] generate — trees.json → 자바 소스 (Python)
+tasks.register('kfcGenerate', Exec) {
+    group = 'kfc'
+    dependsOn 'runServer'
+    doFirst {
+        def datapack = project.findProperty('datapack')
+        def outDir   = project.findProperty('out')
+        if (!outDir) throw new GradleException("-Pout=<output_dir> is required.")
+        // Python 출력을 UTF-8 로 강제 — Windows(cp949) 콘솔에서 한글 깨짐 방지.
+        environment 'PYTHONUTF8', '1'
+        environment 'PYTHONIOENCODING', 'utf-8'
+        // 멀티프로세싱 워커 수: -Pjobs 로 지정하거나(미지정 시 convert.py 가 CPU 수 자동).
+        //   예) -Pjobs=8  (8코어 머신에서 generate 변환을 8배 병렬)
+        def jobs = project.findProperty('jobs')
+        if (jobs) environment 'KFC_JOBS', jobs.toString()
+        workingDir converterDir
+        commandLine pythonExe, "${converterDir}/convert.py", 'generate',
+                kfcTrees.absolutePath,
+                project.file(datapack).absolutePath,
+                project.file(outDir).absolutePath
+    }
+}
+
+// [통합] convert = 위 3단계를 순서대로
+tasks.register('convert') {
+    group = 'kfc'
+    description 'datapack(.zip|dir) -> native Fabric mod java source (extract -> parse -> generate)'
+    dependsOn 'kfcGenerate'
+}

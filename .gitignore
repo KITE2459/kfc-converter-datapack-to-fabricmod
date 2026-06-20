@@ -2,13 +2,6 @@
 
 .gradle/
 build/
-out/
-classes/
-gradle.*
-*.zip
-kartriderpack*
-bin
-.claude/
 
 # eclipse
 

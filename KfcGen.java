@@ -1333,6 +1333,20 @@ public final class KfcGen {
     }
 
     /** ParticleEffect 를 force/viewers 규칙에 맞게 스폰하는 공통 경로. */
+    /** particle <복합타입> ... — block{block_state:..}/item{..}/dust_color_transition 등 파라미터 동반
+     *  파티클을 ParticleEffectArgumentType.readParameters 로 파싱해 스폰(모든 vanilla 파티클 지원). */
+    public static void spawnParticleParsed(net.minecraft.server.world.ServerWorld world, String particleStr,
+                                           double x, double y, double z,
+                                           double dx, double dy, double dz, double speed, int count,
+                                           boolean force,
+                                           java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
+        try {
+            net.minecraft.particle.ParticleEffect eff = net.minecraft.command.argument.ParticleEffectArgumentType
+                    .readParameters(new com.mojang.brigadier.StringReader(particleStr), world.getRegistryManager());
+            spawnParticleEffect(world, eff, x, y, z, dx, dy, dz, speed, count, force, viewers);
+        } catch (Exception ignored) {}
+    }
+
     public static void spawnParticleEffect(net.minecraft.server.world.ServerWorld world,
                                            net.minecraft.particle.ParticleEffect eff,
                                            double x, double y, double z,
@@ -1413,6 +1427,30 @@ public final class KfcGen {
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
             p.networkHandler.requestTeleport(e.getX(), e.getY(), e.getZ(), yaw, pitch);
         }
+    }
+
+    /** lookAt(FEET, target) 후 headYaw/플레이어 동기화 — rotate facing 공통 마무리. */
+    private static void rotateFinish(net.minecraft.entity.Entity e) {
+        e.setHeadYaw(e.getYaw());
+        if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
+            p.networkHandler.requestTeleport(e.getX(), e.getY(), e.getZ(), e.getYaw(), e.getPitch());
+        }
+    }
+
+    /** rotate <e> facing <x y z> — 좌표를 바라보는 회전으로 설정. */
+    public static void rotateToFacePos(net.minecraft.entity.Entity e, double x, double y, double z) {
+        if (e == null) return;
+        e.lookAt(net.minecraft.command.argument.EntityAnchorArgumentType.EntityAnchor.FEET,
+                new net.minecraft.util.math.Vec3d(x, y, z));
+        rotateFinish(e);
+    }
+
+    /** rotate <e> facing entity <target> [eyes|feet] — 대상 엔티티를 바라보는 회전으로 설정. */
+    public static void rotateToFaceEntity(net.minecraft.entity.Entity e, net.minecraft.entity.Entity target, boolean eyes) {
+        if (e == null || target == null) return;
+        net.minecraft.util.math.Vec3d tp = eyes ? target.getEyePos() : target.getPos();
+        e.lookAt(net.minecraft.command.argument.EntityAnchorArgumentType.EntityAnchor.FEET, tp);
+        rotateFinish(e);
     }
 
     /** tp <who> <destination-entity> — 대상 엔티티 위치+회전으로 텔레포트. */
@@ -1533,6 +1571,60 @@ public final class KfcGen {
         if (tid < 0 || sid < 0) return;
         net.minecraft.item.ItemStack src = source.getStackReference(sid).get();
         target.getStackReference(tid).set(src == null ? net.minecraft.item.ItemStack.EMPTY : src.copy());
+    }
+
+    /** 블록 컨테이너 슬롯의 ItemStack 읽기(없으면 null). */
+    private static net.minecraft.item.ItemStack blockSlotStack(net.minecraft.server.world.ServerWorld world,
+                                                               net.minecraft.util.math.BlockPos pos, String slot) {
+        if (world == null) return null;
+        net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
+        if (!(be instanceof net.minecraft.inventory.Inventory inv)) return null;
+        int idx = slotIndexOf(slot);
+        if (idx < 0 || idx >= inv.size()) return null;
+        return inv.getStack(idx);
+    }
+
+    /** 블록 컨테이너 슬롯에 ItemStack 쓰기. */
+    private static void setBlockSlotStack(net.minecraft.server.world.ServerWorld world,
+                                          net.minecraft.util.math.BlockPos pos, String slot,
+                                          net.minecraft.item.ItemStack stack) {
+        if (world == null) return;
+        net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
+        if (!(be instanceof net.minecraft.inventory.Inventory inv)) return;
+        int idx = slotIndexOf(slot);
+        if (idx < 0 || idx >= inv.size()) return;
+        inv.setStack(idx, stack);
+        be.markDirty();
+    }
+
+    /** item replace entity <e> <slot> from block <pos> <srcSlot> — 엔티티 슬롯 ← 블록 컨테이너 슬롯. */
+    public static void itemReplaceFromBlock(net.minecraft.entity.Entity target, String tgtSlot,
+                                            net.minecraft.server.world.ServerWorld world,
+                                            net.minecraft.util.math.BlockPos srcPos, String srcSlot) {
+        if (target == null) return;
+        int tid = resolveSlot(tgtSlot);
+        if (tid < 0) return;
+        net.minecraft.item.ItemStack src = blockSlotStack(world, srcPos, srcSlot);
+        target.getStackReference(tid).set(src == null ? net.minecraft.item.ItemStack.EMPTY : src.copy());
+    }
+
+    /** item replace block <pos> <slot> from entity <e> <srcSlot> — 블록 컨테이너 슬롯 ← 엔티티 슬롯. */
+    public static void itemReplaceBlockFromEntity(net.minecraft.server.world.ServerWorld world,
+                                                  net.minecraft.util.math.BlockPos pos, String slot,
+                                                  net.minecraft.entity.Entity source, String srcSlot) {
+        if (source == null) return;
+        int sid = resolveSlot(srcSlot);
+        if (sid < 0) return;
+        net.minecraft.item.ItemStack src = source.getStackReference(sid).get();
+        setBlockSlotStack(world, pos, slot, src == null ? net.minecraft.item.ItemStack.EMPTY : src.copy());
+    }
+
+    /** item replace block <pos> <slot> from block <srcPos> <srcSlot> — 블록 ← 블록. */
+    public static void itemReplaceBlockFromBlock(net.minecraft.server.world.ServerWorld world,
+                                                 net.minecraft.util.math.BlockPos pos, String slot,
+                                                 net.minecraft.util.math.BlockPos srcPos, String srcSlot) {
+        net.minecraft.item.ItemStack src = blockSlotStack(world, srcPos, srcSlot);
+        setBlockSlotStack(world, pos, slot, src == null ? net.minecraft.item.ItemStack.EMPTY : src.copy());
     }
 
     // ── loot (바닐라 LootCommand: source -> List<ItemStack> -> target) ──
@@ -1980,6 +2072,58 @@ public final class KfcGen {
         ScoreboardObjective ob = obj(sb, o);
         if (ob == null) return;
         sb.getOrCreateScore(holderOf(holder), ob).setNumberFormat(null);
+    }
+
+    /** scoreboard players display name <holder> <obj> <text> — 점수 엔트리 표시명 설정.
+     *  텍스트는 SNBT/TextArgumentType 형식이므로 parseTextResolved 로 파싱. */
+    public static void displayScoreName(net.minecraft.server.command.ServerCommandSource source,
+                                        ServerScoreboard sb, String holder, String o, String textJson) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return;
+        net.minecraft.text.Text t = parseTextResolved(source, source.getEntity(), textJson);
+        sb.getOrCreateScore(holderOf(holder), ob).setDisplayText(t);
+    }
+
+    /** scoreboard players display name <holder> <obj> (인자 없음) — 표시명 복원. */
+    public static void displayScoreNameReset(ServerScoreboard sb, String holder, String o) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return;
+        sb.getOrCreateScore(holderOf(holder), ob).setDisplayText(null);
+    }
+
+    /** scoreboard objectives setdisplay <slot> [<objective>] — 슬롯에 표시할 objective 지정(없으면 해제). */
+    public static void setObjectiveDisplaySlot(ServerScoreboard sb, String slotName, String objName) {
+        net.minecraft.scoreboard.ScoreboardDisplaySlot slot = null;
+        for (net.minecraft.scoreboard.ScoreboardDisplaySlot s : net.minecraft.scoreboard.ScoreboardDisplaySlot.values()) {
+            if (s.asString().equals(slotName)) { slot = s; break; }
+        }
+        if (slot == null) return;
+        net.minecraft.scoreboard.ScoreboardObjective ob = (objName == null) ? null : obj(sb, objName);
+        sb.setObjectiveSlot(slot, ob);
+    }
+
+    /** scoreboard objectives modify <obj> numberformat fixed <text> — objective 기본 숫자포맷 고정. */
+    public static void objectiveNumberFormatFixed(net.minecraft.server.command.ServerCommandSource source,
+                                                  ServerScoreboard sb, String objName, String textJson) {
+        ScoreboardObjective ob = obj(sb, objName);
+        if (ob == null) return;
+        net.minecraft.text.Text t = parseTextResolved(source, source.getEntity(), textJson);
+        if (t == null) return;
+        ob.setNumberFormat(new net.minecraft.scoreboard.number.FixedNumberFormat(t));
+    }
+
+    /** scoreboard objectives modify <obj> numberformat blank — 숫자 숨김. */
+    public static void objectiveNumberFormatBlank(ServerScoreboard sb, String objName) {
+        ScoreboardObjective ob = obj(sb, objName);
+        if (ob == null) return;
+        ob.setNumberFormat(net.minecraft.scoreboard.number.BlankNumberFormat.INSTANCE);
+    }
+
+    /** scoreboard objectives modify <obj> numberformat (인자 없음) — 기본 복원. */
+    public static void objectiveNumberFormatReset(ServerScoreboard sb, String objName) {
+        ScoreboardObjective ob = obj(sb, objName);
+        if (ob == null) return;
+        ob.setNumberFormat(null);
     }
 
     public static void addScore(ServerScoreboard sb, String holder, String o, int n) {
@@ -2552,6 +2696,39 @@ public final class KfcGen {
             if (stackMatches(ref.get(), itemId, customDataSnbt)) return true;
         }
         return false;
+    }
+
+    /** if items entity @a <slot> <pred> : 어떤 플레이어든 슬롯에 일치 아이템 보유.
+     *  (@a/@p/@r 셀렉터의 태그 필터까지 반영; 단일 해소 불가한 멀티 타겟의 존재검사.) */
+    public static boolean anyPlayerItemsMatch(GameContext ctx, String[] tagsPos, String[] tagsNeg,
+                                              String slot, String itemId, String customNbt) {
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            boolean ok = true;
+            for (String t : tagsPos) if (!p.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok) for (String t : tagsNeg) if (p.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok && itemsMatchSlots(p, slot, itemId, customNbt)) return true;
+        }
+        return false;
+    }
+
+    /** if items entity @e/@n <slot> <pred> : 어떤 엔티티든 슬롯에 일치 아이템 보유(태그 필터 반영). */
+    public static boolean anyEntityItemsMatch(GameContext ctx, String[] tagsPos, String[] tagsNeg,
+                                              String slot, String itemId, String customNbt) {
+        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+            boolean ok = true;
+            for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok) for (String t : tagsNeg) if (e.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok && itemsMatchSlots(e, slot, itemId, customNbt)) return true;
+        }
+        return false;
+    }
+
+    /** 엔티티가 요구 태그(tagsPos 전부)·배제 태그(tagsNeg 없음)를 만족하는지. */
+    public static boolean entityHasTags(net.minecraft.entity.Entity e, String[] tagsPos, String[] tagsNeg) {
+        if (e == null) return false;
+        for (String t : tagsPos) if (!e.getCommandTags().contains(t)) return false;
+        for (String t : tagsNeg) if (e.getCommandTags().contains(t)) return false;
+        return true;
     }
 
     public static boolean entityScoreMatches(ServerScoreboard sb, net.minecraft.entity.Entity e,

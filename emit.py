@@ -1042,6 +1042,34 @@ def _external_fn_call(fid: str, args: dict, nn: list[str], em: Emitted) -> list[
     return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
 
 
+def _macro_args_expr(args: dict, nn: list[str]) -> str | None:
+    """`function ... with <source>` 의 macroArgs(Map) 자바 식.
+       with 없음 -> 'null', storage/entity/block 소스 -> 해당 헬퍼, 해소불가 -> None."""
+    if "with" not in nn:
+        return "null"
+    wi = nn.index("with")
+    kind = nn[wi + 1] if wi + 1 < len(nn) else None
+    if kind == "storage":
+        sid = first_arg(args, "source"); path = first_arg(args, "path")
+        return (f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(path)})' if path
+                else f'KfcGen.storageMacroArgs(server, {jstr(sid)})')
+    if kind == "entity":
+        sel_raw = first_arg(args, "source"); path = first_arg(args, "path") or ""
+        ent = "executor" if sel_raw == "@s" else nearest_entity_java(parse_selector(sel_raw))
+        if ent is None:
+            return None
+        return f'KfcGen.entityMacroArgs({ent}, {jstr(path)})'
+    if kind == "block":
+        pos = (first_arg(args, "pos") or first_arg(args, "position")
+               or first_arg(args, "targetPos"))
+        path = first_arg(args, "path") or ""
+        bp = block_pos_java(pos) if pos else None
+        if bp is None:
+            return None
+        return f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(path)})'
+    return None  # with {compound} 리터럴 등 -> 해소불가
+
+
 def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list[str] | None:
     """`function <fid> [with ...|{compound}]` -> 자바 호출문 리스트.
        피호출이 매크로 함수면 Map<String,String> 인자를 만들어 넘긴다.
@@ -1335,6 +1363,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         sub = nn[nn.index("players") + 1] if "players" in nn else None
         if sub == "display" and "numberformat" in nn:
             return emit_scoreboard_numberformat(nn, args, em)
+        if sub == "display" and "name" in nn:
+            return emit_scoreboard_displayname(nn, args, em)
         return emit_scoreboard(sub, args, em)
 
     if command == "scoreboard" and "objectives" in nn:
@@ -1706,10 +1736,15 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 f'{r}f, {g}f, {b}f, {scale}f, {force_j}, {viewers_j}); }}')
             em.kind = "native"
             return True
-        # 파라미터 동반 파티클(block/item 등)은 1차 미지원
+        # 파라미터 동반 파티클(block{block_state:..}/item{..}/dust_color_transition 등):
+        # ParticleEffectArgumentType.readParameters 로 런타임 파싱해 스폰(모든 vanilla 파티클 지원).
         if "[" in name or "{" in name or " " in name:
-            em.reason = f"particle 복합 타입({name[:25]}) 1차 미지원"
-            return False
+            em.java.append(
+                f'{{ net.minecraft.util.math.Vec3d _pp = {pe};'
+                f' KfcGen.spawnParticleParsed(ctx.world, {jstr(name)}, _pp.x, _pp.y, _pp.z, '
+                f'{dparts[0]}, {dparts[1]}, {dparts[2]}, {speed}, (int)({count}), {force_j}, {viewers_j}); }}')
+            em.kind = "native"
+            return True
         em.java.append(
             f'{{ net.minecraft.util.math.Vec3d _pp = {pe};'
             f' KfcGen.spawnParticle(ctx.world, {jstr(name)}, _pp.x, _pp.y, _pp.z, '
@@ -1744,6 +1779,34 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         tgt = first_arg(args, "target") or "@s"
         rot = first_arg(args, "rotation")
         if rot is None:
+            # rotate <target> facing entity <e> [eyes|feet]  /  rotate <target> facing <pos>
+            if "facing" in nn:
+                tgt_expr = "executor" if tgt == "@s" else single_entity_expr(tgt)
+                if tgt_expr is None:
+                    em.reason = f"rotate 대상({tgt[:20]}) 미지원"
+                    return False
+                if "entity" in nn:
+                    fe = first_arg(args, "facingEntity")
+                    anchor = first_arg(args, "facingAnchor") or "feet"
+                    eyes = "true" if anchor == "eyes" else "false"
+                    fe_expr = "executor" if fe == "@s" else (single_entity_expr(fe) if fe else None)
+                    if fe_expr is None:
+                        em.reason = f"rotate facing entity 대상({(fe or '?')[:20]}) 미해소"
+                        return False
+                    em.java.append(f'{{ net.minecraft.entity.Entity _rt = {tgt_expr}, _fe = {fe_expr};'
+                                   f' if (_rt != null && _fe != null) KfcGen.rotateToFaceEntity(_rt, _fe, {eyes}); }}')
+                    em.kind = "native"
+                    return True
+                pos = first_arg(args, "facingLocation") or first_arg(args, "pos")
+                pe = cond_pos_expr(pos) if pos else None
+                if pe is None:
+                    em.reason = f"rotate facing 좌표({pos}) 미지원"
+                    return False
+                em.java.append(f'{{ net.minecraft.entity.Entity _rt = {tgt_expr};'
+                               f' if (_rt != null) {{ net.minecraft.util.math.Vec3d _fp = {pe};'
+                               f' KfcGen.rotateToFacePos(_rt, _fp.x, _fp.y, _fp.z); }} }}')
+                em.kind = "native"
+                return True
             em.reason = "rotate 회전값 없음"
             return False
         parts = rot.split()
@@ -2055,24 +2118,49 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             em.reason = f"item {verb} (1차 미지원)"; return False
         holder_kind = nn[2] if len(nn) > 2 else None
         if holder_kind == "block":
-            # item replace block <pos> <slot> with <item> [count]  (from 변형은 1차 미지원)
+            # item replace block <pos> <slot> with <item> [count] | from entity/block <src> <srcSlot>
             pos = first_arg(args, "pos")
             slot = first_arg(args, "slot")
             if not pos or not slot:
                 em.reason = "item replace block 좌표/슬롯 없음"; return False
-            if "with" not in nn:
-                em.reason = "item replace block from (1차 미지원)"; return False
             pe = cond_pos_expr(pos)
             if pe is None:
                 em.reason = f"item replace block 좌표({pos}) 미지원"; return False
-            item = first_arg(args, "item")
-            cnt = first_arg(args, "count")
-            cj = "1" if cnt is None else jint(cnt)
-            ij = "null" if item is None else jstr(item)
-            em.java.append(
-                f'KfcGen.itemReplaceBlockWith(server, source.getWorld(), '
-                f'net.minecraft.util.math.BlockPos.ofFloored({pe}), {jstr(slot)}, {ij}, {cj});')
-            em.kind = "native"; return True
+            bp = f'net.minecraft.util.math.BlockPos.ofFloored({pe})'
+            if "with" in nn:
+                item = first_arg(args, "item")
+                cnt = first_arg(args, "count")
+                cj = "1" if cnt is None else jint(cnt)
+                ij = "null" if item is None else jstr(item)
+                em.java.append(
+                    f'KfcGen.itemReplaceBlockWith(server, source.getWorld(), '
+                    f'{bp}, {jstr(slot)}, {ij}, {cj});')
+                em.kind = "native"; return True
+            if "from" in nn:
+                fi = nn.index("from")
+                src_kind = nn[fi + 1] if fi + 1 < len(nn) else None
+                srcslot = first_arg(args, "sourceSlot")
+                if not srcslot:
+                    em.reason = "item replace block from 슬롯 없음"; return False
+                if src_kind == "entity":
+                    src = first_arg(args, "source")
+                    src_expr = "executor" if src == "@s" else (single_entity_expr(src) if src else None)
+                    if src_expr is None:
+                        em.reason = f"item replace block from entity({(src or '?')[:20]}) 미해소"; return False
+                    em.java.append(f'{{ net.minecraft.entity.Entity _isrc = {src_expr};'
+                                   f' if (_isrc != null) KfcGen.itemReplaceBlockFromEntity(source.getWorld(), '
+                                   f'{bp}, {jstr(slot)}, _isrc, {jstr(srcslot)}); }}')
+                    em.kind = "native"; return True
+                if src_kind == "block":
+                    spos = first_arg(args, "source")
+                    spe = cond_pos_expr(spos) if spos else None
+                    if spe is None:
+                        em.reason = f"item replace block from block 좌표({spos}) 미지원"; return False
+                    em.java.append(f'KfcGen.itemReplaceBlockFromBlock(source.getWorld(), {bp}, {jstr(slot)}, '
+                                   f'net.minecraft.util.math.BlockPos.ofFloored({spe}), {jstr(srcslot)});')
+                    em.kind = "native"; return True
+                em.reason = f"item replace block from {src_kind} 미지원"; return False
+            em.reason = "item replace block 형식 미지원"; return False
         if holder_kind != "entity":
             em.reason = f"item replace {holder_kind} 미지원"; return False
         tgt = first_arg(args, "targets")
@@ -2087,15 +2175,28 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             ij = "null" if item is None else jstr(item)
             body = lambda e: f'KfcGen.itemReplaceWith(server, {e}, {jstr(slot)}, {ij}, {cj});'
         elif "from" in nn:
-            src = first_arg(args, "source")
+            fi = nn.index("from")
+            src_kind = nn[fi + 1] if fi + 1 < len(nn) else None
             srcslot = first_arg(args, "sourceSlot")
-            if not src or not srcslot:
-                em.reason = "item replace from 소스 없음"; return False
-            src_expr = "executor" if src == "@s" else single_entity_expr(src)
-            if src_expr is None:
-                em.reason = f"item replace from 소스({src[:20]}) 미해소"; return False
-            body = lambda e: (f'{{ net.minecraft.entity.Entity _isrc = {src_expr};'
-                              f' if (_isrc != null) KfcGen.itemReplaceFrom({e}, {jstr(slot)}, _isrc, {jstr(srcslot)}); }}')
+            if not srcslot:
+                em.reason = "item replace from 슬롯 없음"; return False
+            if src_kind == "block":
+                # item replace entity <e> <slot> from block <pos> <srcSlot>
+                spos = first_arg(args, "source")
+                spe = cond_pos_expr(spos) if spos else None
+                if spe is None:
+                    em.reason = f"item replace from block 좌표({spos}) 미지원"; return False
+                body = lambda e: (f'KfcGen.itemReplaceFromBlock({e}, {jstr(slot)}, source.getWorld(), '
+                                  f'net.minecraft.util.math.BlockPos.ofFloored({spe}), {jstr(srcslot)});')
+            else:
+                src = first_arg(args, "source")
+                if not src:
+                    em.reason = "item replace from 소스 없음"; return False
+                src_expr = "executor" if src == "@s" else single_entity_expr(src)
+                if src_expr is None:
+                    em.reason = f"item replace from 소스({src[:20]}) 미해소"; return False
+                body = lambda e: (f'{{ net.minecraft.entity.Entity _isrc = {src_expr};'
+                                  f' if (_isrc != null) KfcGen.itemReplaceFrom({e}, {jstr(slot)}, _isrc, {jstr(srcslot)}); }}')
         else:
             em.reason = "item replace 형식 미지원"; return False
         # 타겟 해소: @s / 단일 / 루프
@@ -2432,6 +2533,16 @@ def _selector_extra_conds(sel, var: str) -> list:
     return c
 
 
+def _sel_tags_only(sel) -> bool:
+    """셀렉터가 base + 태그(tags_pos/neg)만 갖는지 — 그 외 필터가 전혀 없으면 True.
+       멀티 타겟 존재검사를 태그 기준으로 안전하게 네이티브화할 수 있는 조건."""
+    return (not sel.type_id and sel.limit is None and sel.distance is None
+            and sel.volume is None and sel.origin is None and not sel.scores
+            and not sel.predicates and sel.gamemode is None and sel.team is None
+            and sel.name is None and sel.level is None and not sel.advancements
+            and not sel.nbt and sel.x_rotation is None and sel.y_rotation is None)
+
+
 def _sel_has_extra(sel) -> bool:
     """단순 빌더가 처리 못하는 추가 제약(team/level/name/nbt/advancements) 보유 여부."""
     return bool(sel.team is not None or sel.name is not None or sel.level is not None
@@ -2665,15 +2776,42 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
     """tag add/remove 의 셀렉터 홀더. @n/@e[limit=1]/@p -> 단일, @e[...]/@a -> 전체 루프.
        predicate 동반 시: 컴파일 가능한 predicate 면 본문 가드로 허용, 아니면 거부."""
     sel = parse_selector(holder)
-    if sel is None or _sel_has_extra(sel):
+    if sel is None or sel.team is not None or sel.name is not None or sel.level is not None or sel.advancements:
         em.reason = f"tag 셀렉터 홀더({holder[:25] if holder else '?'}) 미지원"
         return False
     if sel.predicates and predicate_guards(sel.predicates, "_t", player=False) is None:
         em.reason = f"tag 셀렉터 predicate 미해소({holder[:25]})"
         return False
+    # nbt 필터 → 런타임 NbtHelper.matches 가드(부분일치). 단일/루프 모두 적용.
+    _nbt_conds = [(jstr(ns), str(inv).lower()) for ns, inv in sel.nbt]
     fn = "addCommandTag" if verb == "add" else "removeCommandTag"
     single = (sel.base in ("n", "p", "r")) or (sel.limit == 1)
     if single:
+        if sel.nbt:
+            # nbt 동반 단일: single_entity_expr 미수용 → nearest*Where 로 직접 구성.
+            tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
+            lo, hi = sel.distance if sel.distance else (None, None)
+            dmin = _dist_arg(lo); dmax = _dist_arg(hi)
+            pred = " && ".join(f'KfcGen.nbtMatches(_ee, {ns}, {inv})' for ns, inv in _nbt_conds) or "true"
+            types = resolve_entity_types(sel) if sel.type_is_tag else (
+                [entity_type_java(sel.type_id)] if sel.type_id else None)
+            if sel.type_id and (not types or None in types):
+                em.reason = f"tag nbt 셀렉터 타입 미해소({holder[:25]})"
+                return False
+            if sel.scores or sel.predicates or sel.gamemode is not None:
+                em.reason = f"tag nbt 셀렉터 복합필터({holder[:25]})"
+                return False
+            if types:
+                arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
+                ent = (f'KfcGen.nearestEntityWhere(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
+                       f'{dmin}, {dmax}, _ee -> ({pred}))')
+            else:
+                ent = (f'KfcGen.nearestEntityAnyTypeWhere(ctx, source.getPosition(), {tp}, {tn}, '
+                       f'{dmin}, {dmax}, _ee -> ({pred}))')
+            em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                           f' if (_t != null) _t.{fn}({jstr(name)}); }}')
+            em.kind = "native"
+            return True
         ent = single_entity_expr(holder)
         if ent is None:
             em.reason = f"tag 단일 셀렉터({holder[:25]}) 해소 불가"
@@ -2701,6 +2839,8 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
             slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
             shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
             conds.append(f'KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        for ns, inv in _nbt_conds:
+            conds.append(f'KfcGen.nbtMatches(_t, {ns}, {inv})')
         if conds:
             em.java.append(f'    if (!({" && ".join(conds)})) continue;')
         em.java.append(f'    _t.{fn}({jstr(name)});')
@@ -2741,6 +2881,8 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
     if sel.predicates:
         for g in predicate_guards(sel.predicates, "_t", player=False):
             em.java.append(f'    if (!({g})) continue;')
+    for ns, inv in _nbt_conds:
+        em.java.append(f'    if (!KfcGen.nbtMatches(_t, {ns}, {inv})) continue;')
     em.java.append(f'    _t.{fn}({jstr(name)});')
     em.java.append("}")
     em.kind = "native"
@@ -3354,6 +3496,50 @@ def emit_bossbar(nn: list[str], args: dict, em: Emitted) -> bool:
     return False
 
 
+def emit_scoreboard_displayname(nn: list[str], args: dict, em: Emitted) -> bool:
+    """scoreboard players display name <targets> <objective> [<text>].
+       텍스트 있으면 표시명 설정, 없으면 복원. 사이드바 라벨/난이도 표기 등에 사용."""
+    holder = first_arg(args, "targets")
+    obj_n = first_arg(args, "objective")
+    if not holder or not obj_n:
+        em.reason = "display name 대상/objective 없음"
+        return False
+    text = first_arg(args, "name")
+    if text is not None:
+        text_j = jstr(text)  # MACROVAR 치환은 후처리(substitute_macro_token)
+        call = f'KfcGen.displayScoreName(source, sb, {{H}}, {jstr(obj_n)}, {text_j});'
+    else:
+        call = f'KfcGen.displayScoreNameReset(sb, {{H}}, {jstr(obj_n)});'
+
+    hg = self_holder_guard(holder)
+    if hg is not None:
+        h, guard = hg
+        stmt = call.replace("{H}", h)
+        em.java.append(f'if ({guard}) {stmt}' if guard else stmt)
+        em.kind = "native"
+        return True
+    if holder.startswith("#") or not holder.startswith("@"):
+        em.java.append(call.replace("{H}", jstr(holder)))
+        em.kind = "native"
+        return True
+    ent = single_entity_expr(holder)
+    if ent is not None:
+        em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
+                       f' if (_t != null) {call.replace("{H}", "_t.getNameForScoreboard()")} }}')
+        em.kind = "native"
+        return True
+    sel = parse_selector(holder)
+    lo = entity_loop_open(sel, "_dnE") if sel else None
+    if lo is None:
+        em.reason = f"display name 셀렉터({holder[:25]}) 미지원"
+        return False
+    em.java.extend(lo)
+    em.java.append("    " + call.replace("{H}", "_dnE.getNameForScoreboard()"))
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
 def emit_scoreboard_numberformat(nn: list[str], args: dict, em: Emitted) -> bool:
     """scoreboard players display numberformat <targets> <objective> [fixed <text>|blank|...].
        순위 표시(timerdisplay 에 '$(rank)등' 고정)의 핵심 — 폴백되면 화면 갱신이 안 된다."""
@@ -3610,8 +3796,35 @@ def emit_scoreboard_objectives(nn: list[str], args: dict, em: Emitted) -> bool:
             em.java.append(f'KfcGen.setObjectiveDisplay(sb, server, {jstr(name)}, {jstr(disp)});')
             em.kind = "native"
             return True
+        if "numberformat" in nn:
+            if "fixed" in nn:
+                contents = first_arg(args, "contents") or first_arg(args, "format")
+                if contents is None:
+                    em.reason = "objectives modify numberformat fixed 텍스트 없음"
+                    return False
+                em.java.append(f'KfcGen.objectiveNumberFormatFixed(source, sb, {jstr(name)}, {jstr(contents)});')
+            elif "blank" in nn:
+                em.java.append(f'KfcGen.objectiveNumberFormatBlank(sb, {jstr(name)});')
+            elif "styled" in nn:
+                em.reason = "objectives modify numberformat styled 미지원"
+                return False
+            else:
+                em.java.append(f'KfcGen.objectiveNumberFormatReset(sb, {jstr(name)});')
+            em.kind = "native"
+            return True
         em.reason = f"objectives modify {[n for n in nn if n not in ('scoreboard','objectives','modify')]} 1차 미지원"
         return False
+    if verb == "setdisplay":
+        # scoreboard objectives setdisplay <slot> [<objective>]
+        slot = first_arg(args, "slot")
+        if not slot:
+            em.reason = "objectives setdisplay 슬롯 없음"
+            return False
+        obj_n = first_arg(args, "objective")
+        objj = "null" if obj_n is None else jstr(obj_n)
+        em.java.append(f'KfcGen.setObjectiveDisplaySlot(sb, {jstr(slot)}, {objj});')
+        em.kind = "native"
+        return True
     if verb == "remove":
         name = first_arg(args, "objective")
         if not name:
@@ -5256,13 +5469,26 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 item_id, custom_nbt = parsed
                 nbt_j = "null" if custom_nbt is None else jstr(custom_nbt)
                 iid_j = "null" if item_id == "*" else jstr(item_id)
+                slot_j = jstr(slot["raw"])
                 if ent["raw"] == "@s":
-                    eexpr = "executor"
+                    c = f'KfcGen.itemsMatchSlots(executor, {slot_j}, {iid_j}, {nbt_j})'
                 else:
                     eexpr = single_entity_expr(ent["raw"])
-                    if eexpr is None:
-                        return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
-                c = f'KfcGen.itemsMatchSlots({eexpr}, {jstr(slot["raw"])}, {iid_j}, {nbt_j})'
+                    if eexpr is not None:
+                        c = f'KfcGen.itemsMatchSlots({eexpr}, {slot_j}, {iid_j}, {nbt_j})'
+                    else:
+                        # 멀티 타겟(@a/@e/@n …) 존재검사. 태그만 있는 셀렉터는 네이티브,
+                        # 복잡 필터(scores/distance/type 등)는 정확성 위해 브릿지.
+                        _isel = parse_selector(ent["raw"])
+                        if _isel is None or not _sel_tags_only(_isel):
+                            return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
+                        _tp = java_str_array(_isel.tags_pos); _tn = java_str_array(_isel.tags_neg)
+                        if _isel.base in ("a", "p", "r"):
+                            c = f'KfcGen.anyPlayerItemsMatch(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j})'
+                        elif _isel.base in ("e", "n"):
+                            c = f'KfcGen.anyEntityItemsMatch(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j})'
+                        else:
+                            return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
                 conds.append(f'!({c})' if neg else c)
                 i = skip_after(nn, i, "item_predicate")
                 continue
@@ -6046,7 +6272,7 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         # if-조건의 인자 노드들(조건 자체는 emit_execute 가 conds 로 따로 감쌈)
         "data", "path", "block", "pos", "loaded", "predicate",
         "items", "slots", "item_predicate", "biome", "dimension",
-        "function", "name",
+        "function", "name", "storage",
         # 위치/회전 재바인딩 수정자 - parse_modifiers 가 rebind 문장으로 환원하고
         # emit_execute 가 store 결과를 그 rebind 로 감싼다. 여기선 통과만.
         "positioned", "rotated", "facing", "align", "anchored",
@@ -6074,11 +6300,28 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         else:
             ent = single_entity_expr(holder)
             if ent is None:
-                em.reason = f"store score 대상이 셀렉터({holder})"
-                return False
-            dst_writer = lambda valexpr: (
-                f'{{ net.minecraft.entity.Entity _se = {ent};'
-                f' if (_se != null) KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, {valexpr}); }}')
+                _ssel = parse_selector(holder)
+                if _ssel is not None and _ssel.base in ("a", "p", "r") and _sel_tags_only(_ssel):
+                    _tp = java_str_array(_ssel.tags_pos); _tn = java_str_array(_ssel.tags_neg)
+                    dst_writer = lambda valexpr: (
+                        f'{{ int _stv = {valexpr};'
+                        f' for (net.minecraft.server.network.ServerPlayerEntity _se : ctx.allPlayers)'
+                        f' if (KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
+                        f' KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, _stv); }}')
+                elif _ssel is not None and _ssel.base in ("e", "n") and _sel_tags_only(_ssel):
+                    _tp = java_str_array(_ssel.tags_pos); _tn = java_str_array(_ssel.tags_neg)
+                    dst_writer = lambda valexpr: (
+                        f'{{ int _stv = {valexpr};'
+                        f' for (net.minecraft.entity.Entity _se : ctx.world.iterateEntities())'
+                        f' if (KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
+                        f' KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, _stv); }}')
+                else:
+                    em.reason = f"store score 대상이 셀렉터({holder})"
+                    return False
+            else:
+                dst_writer = lambda valexpr: (
+                    f'{{ net.minecraft.entity.Entity _se = {ent};'
+                    f' if (_se != null) KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, {valexpr}); }}')
     elif dst_kind == "storage":
         sid = last_arg(args, "target")
         spath = last_arg(args, "path")
@@ -6304,15 +6547,22 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
             return None
         if ":" not in fid_called:
             fid_called = "minecraft:" + fid_called
-        if fid_called in MACRO_FNS:
-            em.reason = f"store←function(매크로 {fid_called[:20]}) 1차 미지원"
-            return None
-        # 함수의 executeReturn 결과(마지막 return 값)를 저장
+        is_macro = fid_called in MACRO_FNS
+        margs = "null"
+        if is_macro:
+            margs = _macro_args_expr(args, nn)
+            if margs is None:
+                em.reason = f"store←function(매크로 {fid_called[:20]}) with 소스 미해소"
+                return None
+        # 함수의 executeReturn 결과(마지막 return 값)를 저장. 매크로면 macroArgs 동반.
         if ALL_FIDS and fid_called not in ALL_FIDS:
             _ns, _p = fid_called.split(":", 1)
-            return (f'KfcGen.instantExecuteFunctionReturn(source, '
-                    f'net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)}))')
-        return f'{fqcn(fid_called)}.executeReturn(source)'
+            idexpr = f'net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)})'
+            return (f'KfcGen.instantExecuteFunctionReturn(source, {idexpr}, {margs})'
+                    if is_macro else
+                    f'KfcGen.instantExecuteFunctionReturn(source, {idexpr})')
+        return (f'{fqcn(fid_called)}.executeReturn(source, {margs})'
+                if is_macro else f'{fqcn(fid_called)}.executeReturn(source)')
     elif cmd == "random" and "value" in nn:
         rng = first_arg(args, "range")
         lo, hi = parse_range(rng) if rng else (None, None)

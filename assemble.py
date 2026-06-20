@@ -206,6 +206,30 @@ def _find_reused_set_exprs(emitted) -> set:
     return reused
 
 
+def _compute_tail_return(indented_body: str) -> str:
+    """executeReturn 끝의 `return 0;` 이 unreachable(컴파일 에러) 이 되지 않도록,
+       본문 마지막 비공백 줄이 무조건 return 또는 'return 으로 끝나는 무조건 블록 닫기'면
+       trailing return 을 생략한다. 일반/매크로 함수 공통."""
+    body_lines_stripped = [l for l in indented_body.split("\n") if l.strip()]
+    last = body_lines_stripped[-1].strip() if body_lines_stripped else ""
+    omit = bool(re.match(r'^return\b.*;$', last))
+    if not omit and last == "}":
+        raw = indented_body.split("\n")
+        li = max(i for i, l in enumerate(raw) if l.strip())
+        if re.match(r'^\s{8}\}$', raw[li]):
+            depth = 0
+            for j in range(li, -1, -1):
+                s = raw[j].rstrip()
+                depth += s.count("}") - s.count("{")
+                if depth == 0:
+                    if raw[j].strip() == "{":
+                        inner_last = body_lines_stripped[-2].strip() if len(body_lines_stripped) >= 2 else ""
+                        if re.match(r'^return\b.*;$', inner_last):
+                            omit = True
+                    break
+    return "" if omit else "\n        return 0;"
+
+
 def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartriderpack") -> JavaClass:
     """한 함수의 파스트리 줄들 -> 자바 클래스 코드."""
     set_group(group)   # emit 의 fqcn 이 같은 group 을 쓰도록 (호출↔패키지 일치)
@@ -388,52 +412,21 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     macro_note = f"\n *  매크로 함수 - 변수: {', '.join(macro_params)}." if is_macro_fn else ""
 
     if is_macro_fn:
-        # void 매크로 메서드에선 mcfunction 의 `return <값>` 이 'return <값>;' 로 나오면
-        # 컴파일 에러(void). 값은 못 돌려주므로 흐름제어만 살려 return; 으로 바꾼다.
-        # (호출식이 있으면 호출은 보존하고 뒤에 return; 을 둔다.)
-        def _voidify_returns(b):
-            def _r(m):
-                ind, expr = m.group(1), m.group(2).strip()
-                return f"{ind}{expr}; return;" if "(" in expr else f"{ind}return;"
-            return re.sub(r'^([ \t]*)return\s+(.+?);[ \t]*$', _r, b, flags=re.M)
-        indented_body = _voidify_returns(indented_body)
-        # 매크로 함수: 기존 void execute(source, macroArgs) 유지 (+ 무인자 호환 래퍼는 생략)
-        sig = "execute(ServerCommandSource source, Map<String, String> macroArgs)"
-        methods = f"""    public static void {sig} {{
+        # int executeReturn(source, macroArgs) 가 본문(return 값 전파), void execute 는 래퍼.
+        # → `store result score X run function <macro> with ...` 가 반환값을 캡처 가능.
+        tail_return = _compute_tail_return(indented_body)
+        methods = f"""    public static void execute(ServerCommandSource source, Map<String, String> macroArgs) {{
+        executeReturn(source, macroArgs);
+    }}
+
+    public static int executeReturn(ServerCommandSource source, Map<String, String> macroArgs) {{
         {prelude}
-{indented_body}
+{indented_body}{tail_return}
     }}"""
     else:
         # 일반 함수: int executeReturn(source) 가 실제 본문(return 값 전파),
         #            void execute(source) 는 그 결과를 버리는 래퍼.
-        # 끝의 return 0; 이 unreachable 이 되지 않도록, 본문 마지막 비공백 줄이
-        # return; 또는 무조건 return 을 포함한 블록 닫기('}')면 trailing return 생략.
-        body_lines_stripped = [l for l in indented_body.split("\n") if l.strip()]
-        last = body_lines_stripped[-1].strip() if body_lines_stripped else ""
-        omit = bool(re.match(r'^return\b.*;$', last))
-        if not omit and last == "}":
-            # 마지막이 블록 닫기. 그 블록이 '무조건 실행 블록'({ 로 시작, if 아님)이고
-            # 내부가 return 으로 끝나면 그 뒤 return 0 은 unreachable -> omit.
-            # 본문 원본 줄에서 매칭 여는 줄 찾기: 최상위(8칸) '}' 의 짝.
-            raw = indented_body.split("\n")
-            # 마지막 비공백 '}' 의 인덱스
-            li = max(i for i, l in enumerate(raw) if l.strip())
-            if re.match(r'^\s{8}\}$', raw[li]):
-                # 8칸 깊이의 여는 '{' 를 역방향 탐색 (depth 매칭)
-                depth = 0
-                for j in range(li, -1, -1):
-                    s = raw[j].rstrip()
-                    depth += s.count("}") - s.count("{")
-                    if depth == 0:
-                        opener = raw[j].strip()
-                        # 무조건 블록: 여는 줄이 정확히 '{' (if/for 없음)
-                        if opener == "{":
-                            # 블록 내부 마지막 실행문이 return 이면 omit
-                            inner_last = body_lines_stripped[-2].strip() if len(body_lines_stripped) >= 2 else ""
-                            if re.match(r'^return\b.*;$', inner_last):
-                                omit = True
-                        break
-        tail_return = "" if omit else "\n        return 0;"
+        tail_return = _compute_tail_return(indented_body)
         methods = f"""    public static void execute(ServerCommandSource source) {{
         executeReturn(source);
     }}

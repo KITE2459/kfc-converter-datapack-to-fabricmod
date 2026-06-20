@@ -1440,6 +1440,51 @@ public final class KfcGen {
         } catch (Exception e) { return -1; }
     }
 
+    /** vanilla `data ... entity <slot>[.subpath]` 슬롯 접근자.
+     *  weapon.offhand / equipment.offhand / armor.head / container.N 등은 raw NBT 경로가 아니라
+     *  해당 슬롯의 ItemStack 을 NBT({id,count,components})로 직렬화해 접근하는 가상 경로다.
+     *  (특히 플레이어 오프핸드는 Inventory[Slot:-106]에 저장돼 writeNbt 경로로는 안 잡힘 →
+     *   반드시 슬롯으로 해소해야 `equipment.offhand.components.minecraft:custom_data` 등이 동작.)
+     *  선행 1~2 세그먼트로 가장 긴 유효 단일 슬롯명을 찾고, 나머지는 아이템 NBT 내부 하위경로로 적용. */
+    private static net.minecraft.nbt.NbtElement slotAccessorNbt(net.minecraft.entity.Entity e, String path) {
+        if (e == null || path == null || path.isEmpty()) return null;
+        String[] segs = path.split("\\.");
+        // 플레이어 전용 가상 접근자 SelectedItem (현재 선택 핫바=메인핸드). writeNbt 에 없음 → 메인핸드로 해소.
+        if (segs.length >= 1 && segs[0].equals("SelectedItem")) {
+            int mh = resolveSlot("weapon.mainhand");
+            if (mh < 0) return null;
+            net.minecraft.inventory.StackReference ref = e.getStackReference(mh);
+            if (ref == net.minecraft.inventory.StackReference.EMPTY) return null;
+            net.minecraft.item.ItemStack stack = ref.get();
+            if (stack == null || stack.isEmpty()) return null;
+            net.minecraft.nbt.NbtElement itemNbt;
+            try { itemNbt = stack.toNbt(e.getRegistryManager()); } catch (Exception ex) { return null; }
+            if (segs.length == 1) return itemNbt;
+            StringBuilder sub = new StringBuilder();
+            for (int i = 1; i < segs.length; i++) { if (sub.length() > 0) sub.append('.'); sub.append(segs[i]); }
+            return getAtPath(itemNbt, sub.toString());
+        }
+        int maxTake = Math.min(2, segs.length);
+        for (int take = maxTake; take >= 1; take--) {
+            StringBuilder sn = new StringBuilder();
+            for (int i = 0; i < take; i++) { if (i > 0) sn.append('.'); sn.append(segs[i]); }
+            int slotId = resolveSlot(sn.toString());
+            if (slotId < 0) continue;
+            net.minecraft.inventory.StackReference ref = e.getStackReference(slotId);
+            if (ref == net.minecraft.inventory.StackReference.EMPTY) return null;
+            net.minecraft.item.ItemStack stack = ref.get();
+            if (stack == null || stack.isEmpty()) return null;  // 빈 슬롯 → 경로 부재(vanilla 동일)
+            net.minecraft.nbt.NbtElement itemNbt;
+            try { itemNbt = stack.toNbt(e.getRegistryManager()); }
+            catch (Exception ex) { return null; }
+            if (take >= segs.length) return itemNbt;
+            StringBuilder sub = new StringBuilder();
+            for (int i = take; i < segs.length; i++) { if (sub.length() > 0) sub.append('.'); sub.append(segs[i]); }
+            return getAtPath(itemNbt, sub.toString());
+        }
+        return null;
+    }
+
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<net.minecraft.command.argument.ItemStackArgument>>
             ITEM_ARG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -1687,6 +1732,8 @@ public final class KfcGen {
             if (f != null) return true;
             if (e instanceof net.minecraft.entity.decoration.DisplayEntity) return false;
         }
+        // 슬롯 접근자(weapon/equipment/armor/container.*) — writeNbt 경로로는 안 잡히므로 우선 검사.
+        if (slotAccessorNbt(e, path.replace(" ", "")) != null) return true;
         try {
             net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(root);
@@ -1796,8 +1843,13 @@ public final class KfcGen {
                 for (java.util.Map.Entry<String, String> e : macroArgs.entrySet())
                     nbt.putString(e.getKey(), e.getValue());
             }
-            net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure =
-                    fn.withMacroReplaced(nbt, manager.getDispatcher());
+            net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
+            try {
+                procedure = fn.withMacroReplaced(nbt, manager.getDispatcher());
+            } catch (Exception macroMissing) {
+                // 매크로 인자 미해소(`with` 소스 부재) → 바닐라처럼 실행 안 함. 반환 0.
+                return 0;
+            }
             net.minecraft.command.ReturnValueConsumer consumer = new net.minecraft.command.ReturnValueConsumer() {
                 public void onResult(boolean success, int value) { ret[0] = value; }
             };
@@ -1837,8 +1889,14 @@ public final class KfcGen {
                     nbt.putString(e.getKey(), e.getValue());
                 }
             }
-            net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure =
-                    fn.withMacroReplaced(nbt, manager.getDispatcher());
+            net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
+            try {
+                procedure = fn.withMacroReplaced(nbt, manager.getDispatcher());
+            } catch (Exception macroMissing) {
+                // 매크로 함수인데 인자가 없음 = `with <source>` 가 해소되지 않았음(또는 빈 인자).
+                // 바닐라는 이 경우 함수를 실행하지 않으므로(인자 획득 실패) 조용히 스킵 — 에러 스팸 방지.
+                return;
+            }
             net.minecraft.server.command.CommandManager.callWithContext(source, (context) -> {
                 net.minecraft.command.CommandExecutionContext.enqueueProcedureCall(
                         context, procedure, source,
@@ -2599,6 +2657,8 @@ public final class KfcGen {
         if (lf != null) return lf;
         net.minecraft.nbt.NbtElement f = displayGetFast(e, pt0);
         if (f != null) return f;
+        net.minecraft.nbt.NbtElement slot = slotAccessorNbt(e, pt0);   // weapon/equipment/armor/container 슬롯 접근자
+        if (slot != null) return slot;
         net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(n);
         return getAtPath(n, path);
@@ -3168,9 +3228,10 @@ public final class KfcGen {
     /** 점 표기 경로의 컴파운드를 반환(없으면 null). 마지막 키가 가리키는 값이 컴파운드여야 함. */
     private static net.minecraft.nbt.NbtCompound compoundAt(net.minecraft.nbt.NbtCompound root, String path) {
         if (root == null) return null;
-        Object[] d = descend(root, path, false);
-        if (d == null) return null;
-        net.minecraft.nbt.NbtElement leaf = ((net.minecraft.nbt.NbtCompound) d[0]).get((String) d[1]);
+        // descend 는 점-분리 컴파운드만 처리해 리스트 인덱스(round[0]) 를 해소 못한다.
+        // getAtPath 는 NbtPath.parse 라 foo.bar[0].baz 같은 전체 경로를 지원 →
+        // `function X with storage <id> <path>` 의 매크로 인자를 정확히 읽는다.
+        net.minecraft.nbt.NbtElement leaf = getAtPath(root, path);
         return (leaf instanceof net.minecraft.nbt.NbtCompound lc) ? lc : null;
     }
 

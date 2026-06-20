@@ -141,6 +141,26 @@ def parse_range(raw: str) -> tuple[str | None, str | None]:
     return (raw, raw)
 
 
+def _dist_arg(v) -> str:
+    """distance min/max 토큰 -> 자바 double 식.
+       None -> '-1'(무제한), MACROVAR 포함 -> Double.parseDouble(...) 런타임 파싱, 숫자 -> 그대로.
+       (매크로 함수에서 distance=..$(range) 의 $(range) 가 macroArgs.get(..)=String 으로 들어와도
+        숫자 파라미터에 맞게 파싱되도록 보장.)"""
+    if v is None:
+        return "-1"
+    e = _jnum(str(v), "Double.parseDouble")
+    return e if e is not None else str(v)
+
+
+def _int_arg(v, default: str) -> str:
+    """정수 셀렉터 필드(level/limit 등) 토큰 -> 자바 int 식.
+       None -> default, MACROVAR 포함 -> Integer.parseInt(...) 런타임 파싱, 숫자 -> 그대로."""
+    if v is None:
+        return default
+    e = _jnum(str(v), "Integer.parseInt")
+    return e if e is not None else str(v)
+
+
 def holder_expr(raw: str) -> str:
     """스코어 홀더 -> 자바 holder name 식.
        '@s' -> 실행자 이름 ; '@...' -> None(셀렉터) ; '*' -> None(전체) ;
@@ -696,7 +716,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
     if sel.distance is not None:
         lo, hi = sel.distance
         conds.append(f'KfcGen.posInRange({src_var}.getPosition(), {evar}.getPos(), '
-                     f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+                     f'{_dist_arg(lo)}, {_dist_arg(hi)})')
     # 회전(x_rotation/y_rotation)은 _selector_extra_conds 에서 일괄 추가(중복 방지).
     # 게임모드
     if sel.gamemode is not None:
@@ -842,7 +862,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         if sel.distance is not None:
             lo, hi = sel.distance
             parts.append(f'KfcGen.posInRange({src_var}.getPosition(), executor.getPos(), '
-                         f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+                         f'{_dist_arg(lo)}, {_dist_arg(hi)})')
         if not parts:
             return "(executor != null)"
         return "(executor != null && " + " && ".join(parts) + ")"
@@ -870,7 +890,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             lo3, hi3 = sel.distance if sel.distance else (None, None)
             if lo3 is not None or hi3 is not None:
                 tagconds.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
-                                f'{lo3 if lo3 is not None else -1}, {hi3 if hi3 is not None else -1})')
+                                f'{_dist_arg(lo3)}, {_dist_arg(hi3)})')
             if sel.gamemode is not None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 tagconds.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -882,12 +902,12 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         lo2, hi2 = sel.distance if sel.distance else (None, None)
         tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
         return (f'KfcGen.anyEntityAnyType(ctx, {src_var}.getPosition(), {tp}, {tn}, '
-                f'{lo2 if lo2 is not None else -1}, {hi2 if hi2 is not None else -1})')
+                f'{_dist_arg(lo2)}, {_dist_arg(hi2)})')
     lo = hi = "-1"
     if sel.distance is not None:
         dlo, dhi = sel.distance
-        lo = dlo if dlo is not None else "-1"
-        hi = dhi if dhi is not None else "-1"
+        lo = _dist_arg(dlo)
+        hi = _dist_arg(dhi)
     tp = java_str_array(sel.tags_pos)
     tn = java_str_array(sel.tags_neg)
     if sel.base in ("a", "p", "r"):
@@ -898,7 +918,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             if sel.distance is not None:
                 dl, dh = sel.distance
                 pc.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
-                          f'{dl if dl is not None else -1}, {dh if dh is not None else -1})')
+                          f'{_dist_arg(dl)}, {_dist_arg(dh)})')
             if sel.gamemode is not None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -1152,8 +1172,8 @@ def nearest_entity_java(sel: "Selector") -> str | None:
     lo = hi = "-1"
     if sel.distance is not None:
         dlo, dhi = sel.distance
-        lo = dlo if dlo is not None else "-1"
-        hi = dhi if dhi is not None else "-1"
+        lo = _dist_arg(dlo)
+        hi = _dist_arg(dhi)
     tp = java_str_array(sel.tags_pos)
     tn = java_str_array(sel.tags_neg)
     if sel.base in ("a", "p", "r"):
@@ -2395,8 +2415,8 @@ def _selector_extra_conds(sel, var: str) -> list:
         c.append(f'KfcGen.nameIs({var}, {jstr(val)}, {str(inv).lower()})')
     if sel.level is not None:
         lo, hi = sel.level
-        loj = "Integer.MIN_VALUE" if lo is None else str(lo)
-        hij = "Integer.MAX_VALUE" if hi is None else str(hi)
+        loj = _int_arg(lo, "Integer.MIN_VALUE")
+        hij = _int_arg(hi, "Integer.MAX_VALUE")
         c.append(f'KfcGen.levelInRange({var}, {loj}, {hij})')
     for adv_id, spec in sel.advancements:
         if isinstance(spec, dict):
@@ -2462,7 +2482,7 @@ def _entity_loop_open_core(sel, var: str):
     """셀렉터 -> 'for (Entity var : ...) {' 여는 줄들. @a/@e 지원. 못하면 None."""
     tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
     lo, hi = sel.distance if sel.distance else (None, None)
-    dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+    dmin = _dist_arg(lo); dmax = _dist_arg(hi)
     if sel.base == "a":
         if sel.sort in ("nearest", "furthest"):
             # sort=nearest/furthest — origin(현재 source 위치, at 으로 rebind 됨) 기준 정렬 순회.
@@ -2483,8 +2503,8 @@ def _entity_loop_open_core(sel, var: str):
             conds.append(f'!({ge})' if sel.gamemode_neg else ge)
         if sel.distance:
             _dlo, _dhi = sel.distance
-            _dmin = "-1" if _dlo is None else str(_dlo)
-            _dmax = "-1" if _dhi is None else str(_dhi)
+            _dmin = _dist_arg(_dlo)
+            _dmax = _dist_arg(_dhi)
             conds.append(f'KfcGen.inRange({box_origin_expr(sel, "source")}, {var}, {_dmin}, {_dmax})')
         _sp = _loop_score_pred_conds(sel, var)
         if _sp is None:
@@ -2673,7 +2693,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         if sel.distance is not None:
             dlo, dhi = sel.distance
             conds.append(f'KfcGen.posInRange(source.getPosition(), _t.getPos(), '
-                         f'{dlo if dlo is not None else -1}, {dhi if dhi is not None else -1})')
+                         f'{_dist_arg(dlo)}, {_dist_arg(dhi)})')
         if sel.gamemode is not None:
             gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
             conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
@@ -2700,7 +2720,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         return False
     tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
     lo, hi = sel.distance if sel.distance else (None, None)
-    dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+    dmin = _dist_arg(lo); dmax = _dist_arg(hi)
     if types:
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
         _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit})'
@@ -5621,7 +5641,7 @@ def _emit_as_loop_recursive(line, head, tail, em, sel):
         if sel.base in ("e", "n") and not sel.type_id:
             tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
             lo, hi = sel.distance if sel.distance else (None, None)
-            dmin = "-1" if lo is None else str(lo); dmax = "-1" if hi is None else str(hi)
+            dmin = _dist_arg(lo); dmax = _dist_arg(hi)
             loop_open = [f'for (net.minecraft.entity.Entity {_asE} : KfcGen.allEntitiesAnyType('
                          f'ctx, executor, {tp}, {tn}, {dmin}, {dmax})) {{']
         else:
@@ -5847,8 +5867,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     # distance= 필터 - 바닐라는 '소스 위치' 기준 (executor 위치 아님)
     if sel.distance:
         _dlo, _dhi = sel.distance
-        _dmin = "-1" if _dlo is None else str(_dlo)
-        _dmax = "-1" if _dhi is None else str(_dhi)
+        _dmin = _dist_arg(_dlo)
+        _dmax = _dist_arg(_dhi)
         conds.append(f'KfcGen.inRange({pre_src}.getPosition(), en, {_dmin}, {_dmax})')
     for obj_name, (lo, hi) in sel.scores.items():
         lo_j = "null" if lo is None else f"Integer.valueOf({lo})"
@@ -6362,7 +6382,7 @@ def _particle_viewers_expr(raw: str) -> str | None:
     if sel.distance is not None:
         lo, hi = sel.distance
         conds.append(f'KfcGen.posInRange(source.getPosition(), _pv.getPos(), '
-                     f'{lo if lo is not None else -1}, {hi if hi is not None else -1})')
+                     f'{_dist_arg(lo)}, {_dist_arg(hi)})')
     if sel.gamemode is not None:
         ge = f'KfcGen.gamemodeIs(_pv, {jstr(sel.gamemode)})'
         conds.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -6434,8 +6454,8 @@ def single_entity_expr(raw: str) -> str | None:
     tp = jarr_tags(sel.tags_pos)
     tn = jarr_tags(sel.tags_neg)
     lo, hi = sel.distance if sel.distance else (None, None)
-    dmin = "-1" if lo is None else str(lo)
-    dmax = "-1" if hi is None else str(hi)
+    dmin = _dist_arg(lo)
+    dmax = _dist_arg(hi)
 
     if sel.base in ("p", "r") or (sel.base == "a" and sel.limit == 1):
         # @a[limit=1] 은 sort=arbitrary(위치 무관, 첫 매치) — @p(nearest)와 다르다.
@@ -6463,7 +6483,7 @@ def single_entity_expr(raw: str) -> str | None:
             if sel.distance is not None:
                 dl5, dh5 = sel.distance
                 pc.append(f'KfcGen.posInRange(source.getPosition(), _pe.getPos(), '
-                          f'{dl5 if dl5 is not None else -1}, {dh5 if dh5 is not None else -1})')
+                          f'{_dist_arg(dl5)}, {_dist_arg(dh5)})')
             body5 = " && ".join(pc) if pc else "true"
             if _is_arbitrary:
                 return f'KfcGen.firstPlayerWhere(ctx, _pe -> ({body5}))'
@@ -6596,7 +6616,9 @@ def sanitize(s):
 def pascal(s):
     parts = re.split(r'[^A-Za-z0-9]+', s)
     n = "".join(p[:1].upper() + p[1:] for p in parts if p) or "Fn"
-    return ("F" + n) if n[0].isdigit() else n
+    # 모든 생성 클래스명에 'Kfc' 접두사 — MC/자바 네이티브 클래스명(Entity/Item/World 등)과의
+    # 충돌 방지. 호출부(fqcn)·정의부(function_to_class) 모두 이 함수를 거치므로 일관 적용.
+    return "Kfc" + n
 
 
 # ───────────────────────── 한 줄 처리 ─────────────────────────

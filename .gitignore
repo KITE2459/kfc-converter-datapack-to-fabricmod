@@ -6,6 +6,7 @@ build/
 openjdk-21-x86/
 testdatapack/
 *.json
+test*
 
 # eclipse
 

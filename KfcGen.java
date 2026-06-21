@@ -977,8 +977,15 @@ public final class KfcGen {
             return e != null ? e : net.minecraft.sound.SoundEvent.of(id);  // 미등록도 id 그대로 재생(바닐라 허용)
         });
         net.minecraft.sound.SoundCategory cat = SOUND_CAT_CACHE.computeIfAbsent(category, c -> {
-            try { return net.minecraft.sound.SoundCategory.valueOf(c.toUpperCase(java.util.Locale.ROOT)); }
-            catch (Exception ex) { return net.minecraft.sound.SoundCategory.MASTER; }
+            // /playsound 의 source 인자명(record/block/player)은 SoundCategory enum 상수명
+            // (RECORDS/BLOCKS/PLAYERS)과 다르다. valueOf(c.toUpperCase()) 는 이 셋에서
+            // IllegalArgumentException 이 나 catch 의 MASTER 로 폴백됐다
+            // = record 카테고리 BGM 이 master 슬라이더로 조절되는 버그.
+            // 바닐라처럼 getName()(=인자명)으로 매칭한다(바로 위 stopSound 와 동일 방식).
+            for (net.minecraft.sound.SoundCategory sc : net.minecraft.sound.SoundCategory.values()) {
+                if (sc.getName().equalsIgnoreCase(c)) return sc;
+            }
+            return net.minecraft.sound.SoundCategory.MASTER;
         });
         p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
                 net.minecraft.registry.entry.RegistryEntry.of(ev), cat,

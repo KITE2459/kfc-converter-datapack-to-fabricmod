@@ -6136,6 +6136,33 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     if _rebinds_nullable(mod_rebinds):
         _msrc = _v2_final_src(mod_rebinds, "es")
         mod_conds = [f'{_msrc} != null'] + mod_conds   # 매치실패 fork 사망 -> continue
+    # ── @s: 셀렉터는 '소스(실행자) 엔티티 자신'만 가리킨다. 절대 월드를 순회하지 않는다. ──
+    #   @s[scores=...]/@s[tag=...] 는 소스 엔티티가 필터를 만족할 때만 1회 실행한다.
+    #   이전엔 @s 에 필터가 붙으면 base 가 a/p/r 도 limit==1 도 아니어서 @e(ANY)처럼
+    #   resolve_entity_types -> jtypes="ANY" -> iterateEntities() 전 엔티티 스캔으로 떨어졌다.
+    #   그 결과 멀티플레이에서 한 플레이어의 트리 하강이 '월드의 모든 매칭 엔티티'로 재귀해
+    #   다른 플레이어의 노트를 그 플레이어 위치가 아닌 소스 위치로 교차 재생 -> 브금이 깨졌다
+    #   (음정/위치/감쇠 등 소리 속성이 바닐라와 달라짐). 소스 엔티티 1개만 검사하도록 고정한다.
+    if sel.base == "s":
+        sconds = [re.sub(r'\ben\b', 'e', c) for c in conds]
+        guard = " && ".join(["e != null"] + sconds)
+        out.append(f'{{ net.minecraft.entity.Entity e = {pre_src}.getEntity();')
+        out.append(f'  if ({guard}) {{')
+        out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+        for s in mod_rebinds:
+            out.append("    " + s)
+        if mod_conds:
+            out.append(f'    if (({" && ".join(mod_conds)})) {{')
+            for b in body:
+                out.append("        " + b)
+            out.append("    }")
+        else:
+            for b in body:
+                out.append("    " + b)
+        out.append("} }")
+        em.java.extend(_wrap_pre(out))
+        em.kind = "native"
+        return True
     # ── 단일 셀렉터(@n/@p/@r/limit=1): 루프가 아니라 '소스 위치 기준 최근접 1개' 선택 ──
     # (@n 을 전체 루프로 풀면 바닐라와 의미가 달라진다 - 최근접 하나만 실행 대상.)
     if sel.base in ("n", "p", "r") or sel.limit == 1:

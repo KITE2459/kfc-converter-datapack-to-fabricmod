@@ -312,6 +312,29 @@ def _extract_two_methods(text, mang):
     ex_t = re.sub(r'\bexecuteReturn\(', f'{mang}_executeReturn(', ex_t)
     return ex_t, rt_t
 
+def _prune_empty_dirs(root, verbose=True):
+    """버킷 병합으로 per-함수 .java 가 모두 사라진 뒤 남는 빈 패키지 폴더를 정리한다.
+       bottom-up(os.walk topdown=False)으로 돌며, 처리 시점에 비어 있는 디렉터리만
+       rmdir 한다. 자식이 먼저 제거되면 부모도 비게 되어 연쇄적으로 정리된다.
+       파일이 남은 폴더(buckets/, generated/KfcGen, ModEntry 등)는 비지 않으므로 보존된다."""
+    import os
+    root = Path(root)
+    removed = 0
+    for dirpath, _dirnames, _filenames in os.walk(root, topdown=False):
+        d = Path(dirpath)
+        if d == root:
+            continue
+        try:
+            if not any(d.iterdir()):   # 매번 새로 확인 → 앞서 제거된 자식 반영
+                d.rmdir()
+                removed += 1
+        except OSError:
+            pass
+    if verbose and removed:
+        print(f"[bucketize] pruned {removed} empty directories")
+    return removed
+
+
 def bucketize(src_root: Path, group: str, pins: set | None = None,
               bucket_max_fns=200, bucket_max_bytes=350 * 1024, verbose=True):
     """생성된 1함수=1클래스 트리를 버킷 클래스로 재편. 반환 stats."""
@@ -400,6 +423,9 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
         nt = rewrite_calls(t)
         if nt != t:
             jf.write_text(nt, encoding="utf-8")
+
+    # 7) 비워진 패키지 폴더 정리(병합 후 per-함수 .java 가 전부 사라진 디렉터리들)
+    _prune_empty_dirs(src_root, verbose=verbose)
 
     if verbose:
         print(f"[bucketize] {len(classes)} functions -> {written} bucket classes "

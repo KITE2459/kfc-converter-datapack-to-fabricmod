@@ -3490,7 +3490,15 @@ public final class KfcGen {
     public static void bossbarRemove(net.minecraft.server.command.ServerCommandSource src, String idStr) {
         net.minecraft.entity.boss.BossBarManager mgr = src.getServer().getBossBarManager();
         net.minecraft.entity.boss.CommandBossBar b = mgr.get(bbId(idStr));
-        if (b != null) mgr.remove(b);
+        if (b == null) return;
+        // 이미 보고 있던 클라이언트에 'hide' 패킷을 확실히 보낸다.
+        // mgr.remove() 만으로는 뷰어에게 제거 패킷이 가지 않아(버전/타이밍에 따라)
+        // 데이터만 지워지고 화면엔 고스트 보스바가 남을 수 있다. 정상 동작하는
+        // 감속 보스바(`bossbar set players` = clearPlayers 경로)와 동일하게,
+        // 제거 전에 명시적으로 플레이어를 모두 떼어내고 숨긴 뒤 매니저에서 제거한다.
+        b.clearPlayers();
+        b.setVisible(false);
+        mgr.remove(b);
     }
     public static void bossbarSetName(net.minecraft.server.command.ServerCommandSource src, String idStr, String nameJson) {
         net.minecraft.entity.boss.CommandBossBar b = bossbarGet(src, idStr);

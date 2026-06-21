@@ -873,14 +873,16 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         if sel.base in ("a", "p", "r") and not sel.type_id:
             pexprs = []
             ok_precompiled = True
-            for pid in sel.predicates:
+            for _pi, pid in enumerate(sel.predicates):
                 neg = pid.startswith("!")
                 key = pid[1:] if neg else pid
-                ex = PREDICATES_PLAYER.get(key)
+                # 일반식(instanceof 가드 포함)만 사용 — _pe 가 ServerPlayerEntity 임이 보장되어도
+                # 가드 없는 player 전용 호출을 코드베이스에서 완전히 배제(잠재 위험 원천 차단).
+                ex = PREDICATES.get(key)
                 if ex is None:
                     ok_precompiled = False
                     break
-                e2 = ex.replace("{P}", "_pe")
+                e2 = ex.replace("{P}", "_pe").replace("{E}", "_pe").replace("_kp", f"_kp{_pi}")
                 pexprs.append(f"!({e2})" if neg else e2)
             if not ok_precompiled:
                 # 컴파일타임 predicate JSON 부재 -> 범용 런타임 폴백(testPredicate)
@@ -2752,16 +2754,22 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
 def predicate_guards(predicates, var: str, player: bool = False):
     """predicate id 목록 -> var 대상 boolean 식 리스트. 미컴파일 predicate 있으면 None.
 
-    player=True 면 PREDICATES_PLAYER({P}) 우선(대상이 ServerPlayerEntity 인 경우),
-    없으면 일반식 PREDICATES({E}) 로 폴백. player-input 의 instanceof 바인딩 `_kp` 는
-    인덱스로 유니크화하여 같은 식/줄에서 다중 predicate 사용 시 변수 충돌을 막는다.
+    안전성 원칙: 항상 instanceof 가드가 포함된 일반식 PREDICATES({E}) 만 사용한다.
+    플레이어 전용 호출(getPlayerInput 등)이 들어간 predicate 라도 일반식은
+    `(var instanceof ServerPlayerEntity _kpN && _kpN.…())` 형태라 var 의 정적 타입이
+    Entity 든 ServerPlayerEntity 든 항상 컴파일·동작이 안전하다.
+    (과거엔 player=True 일 때 PREDICATES_PLAYER 의 무가드 `{P}.getPlayerInput()` 을 썼는데,
+     루프 변수가 Entity 로 선언되는 경로에서 Entity.getPlayerInput() 컴파일 에러를 유발하는
+     잠재 버그였다. player 컨텍스트라도 instanceof 는 항상 참이라 손해가 없으므로 일반식으로 통일.)
+    player 인자는 호출부 호환을 위해 남겨두되 무시한다.
+    player-input 의 instanceof 바인딩 `_kp` 는 인덱스로 유니크화해 같은 식에서 다중 사용 시 충돌을 막는다.
     `!pred` 접두는 부정 가드로 변환.
     """
     out = []
     for i, pid in enumerate(predicates):
         neg = pid.startswith("!")
         key = pid[1:] if neg else pid
-        ex = (PREDICATES_PLAYER.get(key) if player else None) or PREDICATES.get(key)
+        ex = PREDICATES.get(key)
         if ex is None:
             # 컴파일타임 predicate JSON 부재 -> 런타임 LootCondition 평가로 대체.
             pid_norm = key if ":" in key else "minecraft:" + key

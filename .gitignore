@@ -3,6 +3,8 @@
 .gradle/
 build/
 *.zip
+openjdk-21-x86/
+testdatapack/
 
 # eclipse
 

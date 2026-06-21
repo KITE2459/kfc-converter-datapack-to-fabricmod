@@ -1,11 +1,11 @@
 # gradle
 
-.gradle/*
-build/*
+.gradle/
+build/
 *.zip
-openjdk-21-x86/*
-testdatapack/*
 openjdk-21-x86/
+testdatapack/
+*.json
 
 # eclipse
 

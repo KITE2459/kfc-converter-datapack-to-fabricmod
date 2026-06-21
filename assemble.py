@@ -246,6 +246,19 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     reject_reason = ""
 
     emitted = [emit_line(obj) for obj in parse_trees]
+    # ── 자기재귀(self-recursion) 감지 → 함수 단위 브릿지 강제 ──
+    # `run function X` 류는 직접 Java 호출(X.execute / X.executeReturn)로 컴파일된다.
+    # 데이터 기반 꼬리재귀(예: trackselect:.../show-track-loop, show-theme-loop)는
+    # 자기 자신을 호출해 JVM 콜스택을 깊이=반복횟수 만큼 쌓고 StackOverflowError 로
+    # 서버를 죽인다. 바닐라는 함수 호출을 명령 큐로 '반복' 실행(maxCommandChainLength
+    # 한도, 초과 시 조용히 중단)하므로 터지지 않는다. 브릿지(instantExecuteFunction)는
+    # 바닐라 CommandExecutionContext 를 그대로 쓰므로, 자기 자신을 호출하는 함수는
+    # 함수 단위로 브릿지에 맡겨 바닐라 시맨틱(+컷오프)과 100% 일치시키고 크래시를 막는다.
+    _self_fqcn = f"{package}.{cls}"
+    is_self_recursive = any(
+        ((_self_fqcn + ".execute(") in _l) or ((_self_fqcn + ".executeReturn(") in _l)
+        for _em in emitted for _l in _em.java
+    )
     # 함수 단위 파싱 거부: 한 줄이라도 무효 명령이면 mcfunction 은 함수 전체를 로드 거부.
     for obj, em in zip(parse_trees, emitted):
         if em.rejects_function:
@@ -335,7 +348,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         n_native = n_gated = 0
         n_bridge = len(parse_trees)
         fully_converted = False
-    elif _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
+    elif is_self_recursive or _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
         # ── 함수 단위 폴백 ──  (강제 브릿지 prefix 매칭 시에도 이 경로)
         # 정책: instantExecuteCommand(자바->바닐라 디스패처)는 최적화 이득이 없어 최종 산출에서
         # 금지. 그런 줄(dispatch)이 하나라도 있으면 함수 전체를 원본 mcfunction 실행으로 폴백한다.
@@ -346,7 +359,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         ns_id, path_id = fid.split(":", 1)
         commented = "\n".join("        // " + l for l in "\n".join(body_lines).rstrip().split("\n"))
         n_br = sum(1 for em in emitted if em.kind in ("bridge", "dispatch"))
-        tag = "강제 브릿지(디버깅)" if _is_force_bridged(fid) else f"부분 변환(디스패처 의존 {n_br}/{len(parse_trees)}줄)"
+        tag = ("자기재귀 → 브릿지(스택오버플로 방지)" if is_self_recursive
+               else "강제 브릿지(디버깅)" if _is_force_bridged(fid)
+               else f"부분 변환(디스패처 의존 {n_br}/{len(parse_trees)}줄)")
         if has_macro_line:
             # 매크로 함수: void 시그니처 - 반환 전파 없이 실행만.
             body = (f'// {tag} - 함수 단위 폴백.\n'

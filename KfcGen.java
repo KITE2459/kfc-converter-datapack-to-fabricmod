@@ -3432,24 +3432,38 @@ public final class KfcGen {
         return src.getServer().getBossBarManager().get(bbId(idStr));
     }
 
-    /** 텍스트 컴포넌트(SNBT풍 lenient JSON) → Text. 실패 시 literal 폴백. */
+    /** 텍스트 컴포넌트(SNBT풍 lenient JSON) → Text. 실패 시 literal 폴백.
+     *  바닐라 BossBarCommand 와 동일하게, 파싱 후 Texts.parse 로 selector/score/nbt
+     *  컴포넌트를 '명령 실행 시점'에 해소한다. 해소하지 않으면 미해소 SelectorTextContent
+     *  가 그대로 저장되어, 클라이언트가 "@a[tag=bangjang]" 같은 셀렉터 패턴을 리터럴로
+     *  렌더한다(보고된 "방장 @a[tag=bangjang]" 증상의 원인). */
     private static net.minecraft.text.Text bbText(
             net.minecraft.server.command.ServerCommandSource src, String json, String fallback) {
         try {
             net.minecraft.text.Text t = net.minecraft.text.Text.Serialization
                     .fromLenientJson(json, src.getRegistryManager());
-            if (t != null) return t;
+            if (t != null) {
+                try {
+                    return net.minecraft.text.Texts.parse(src, t, (net.minecraft.entity.Entity) null, 0);
+                } catch (Exception parseFail) {
+                    return t;   // 해소 실패 시 파싱본 그대로(최소한 add 는 성공)
+                }
+            }
         } catch (Exception ignored) {}
         return net.minecraft.text.Text.literal(fallback);
     }
 
-    /** bossbar add: 이미 있으면 그대로 반환(중복 add 무시 — load 1회 안전). */
+    /** bossbar add: 이미 있으면 이름을 최신 add 값으로 갱신 후 반환.
+     *  원본 데이터팩은 'bossbar remove → bossbar add' 순서로 매 호출 재생성하므로,
+     *  remove 가 어떤 이유로 누락되었거나 level.dat 로 복원된 잔존 바가 있을 때
+     *  과거의 stale/미해소-selector 이름이 그대로 남아 "없음 중첩"처럼 보이는 것을 막는다.
+     *  (이름을 bbText 로 재해소하므로 selector 도 현재 상태로 갱신된다.) */
     public static net.minecraft.entity.boss.CommandBossBar bossbarAdd(
             net.minecraft.server.command.ServerCommandSource src, String idStr, String nameJson) {
         net.minecraft.util.Identifier id = bbId(idStr);
         net.minecraft.entity.boss.BossBarManager mgr = src.getServer().getBossBarManager();
         net.minecraft.entity.boss.CommandBossBar bar = mgr.get(id);
-        if (bar != null) return bar;
+        if (bar != null) { bar.setName(bbText(src, nameJson, idStr)); return bar; }
         return mgr.add(id, bbText(src, nameJson, idStr));
     }
 

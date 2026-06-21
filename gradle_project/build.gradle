@@ -113,6 +113,31 @@ loom {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  파서 서버 포트 — 25565 고정 충돌 회피
+//  다른 MC 서버가 이미 25565 를 쓰고 있어도 파싱이 가능하도록, 서버 부팅 전에
+//  20000번대 이상에서 사용 가능한 포트를 찾아(바인드 시도→성공 시 즉시 해제) 잠깐 점유하고
+//  server.properties 의 server-port 로 지정한다. 루프백(127.0.0.1)에만 바인드해
+//  외부 노출/LAN 충돌도 차단한다(파서는 네트워크가 불필요, SERVER_STARTED 직후 stop).
+// ════════════════════════════════════════════════════════════════════
+int pickFreeParsePort() {
+    def host = java.net.InetAddress.getByName("127.0.0.1")
+    for (int p = 20000; p <= 65535; p++) {
+        ServerSocket ss = null
+        try {
+            ss = new ServerSocket()
+            ss.setReuseAddress(true)
+            ss.bind(new java.net.InetSocketAddress(host, p))
+            return p          // 바인드 성공 = 사용 가능. finally 의 close() 직후 서버가 점유.
+        } catch (IOException ignored) {
+            // 해당 포트 사용 중 → 다음 포트 시도
+        } finally {
+            if (ss != null) { try { ss.close() } catch (IOException ignored2) {} }
+        }
+    }
+    throw new GradleException("20000~65535 범위에서 사용 가능한 포트를 찾지 못했습니다.")
+}
+
 // [2] parse — lines.json → trees.json (Fabric runServer 위에서 ParseDumper)
 //     runServer 는 Loom 제공 task. Knot 클래스로더 위에서 돌아 access widener 적용됨.
 //     ParseDumper 가 SERVER_STARTED 에서 파싱 후 server.stop() → 게임루프 없이 즉시 종료.
@@ -125,8 +150,11 @@ tasks.named('runServer') {
         def runDir = file("run")
         runDir.mkdirs()
         new File(runDir, "eula.txt").text = "eula=true\n"
+        // 25565 고정 충돌 회피: 빈 포트를 찾아 점유 후 server-port 로 지정(루프백 한정).
+        int parsePort = pickFreeParsePort()
+        println "[runServer] 파싱 서버 포트 = ${parsePort} (127.0.0.1, 25565 충돌 회피)"
         new File(runDir, "server.properties").text =
-            "online-mode=false\nlevel-type=minecraft\\:flat\nmax-players=1\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nsync-chunk-writes=false\n"
+            "online-mode=false\nlevel-type=minecraft\\:flat\nmax-players=1\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nsync-chunk-writes=false\nserver-port=${parsePort}\nserver-ip=127.0.0.1\n"
 
         // ★ 데이터팩을 서버 월드의 datapacks/ 에 넣어, 서버 시작 시 커스텀 태그/predicate
         //   (예: kartmobil:ignoreblock 같은 block tag)를 레지스트리에 로드시킨다.

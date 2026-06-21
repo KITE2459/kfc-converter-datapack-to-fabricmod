@@ -210,7 +210,8 @@ def _compute_tail_return(indented_body: str) -> str:
     """executeReturn 끝의 `return 0;` 이 unreachable(컴파일 에러) 이 되지 않도록,
        본문 마지막 비공백 줄이 무조건 return 또는 'return 으로 끝나는 무조건 블록 닫기'면
        trailing return 을 생략한다. 일반/매크로 함수 공통."""
-    body_lines_stripped = [l for l in indented_body.split("\n") if l.strip()]
+    body_lines_stripped = [l for l in indented_body.split("\n")
+                           if l.strip() and not l.lstrip().startswith("//")]
     last = body_lines_stripped[-1].strip() if body_lines_stripped else ""
     omit = bool(re.match(r'^return\b.*;$', last))
     if not omit and last == "}":
@@ -257,7 +258,14 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
     cse_seq = [0]
     cse_set_seq = [0]   # _eset 전용 카운터(기존 _sel 번호 불변 → 순수 가산적)
+    hit_terminal = False
     for obj, em in zip(parse_trees, emitted):
+        # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
+        # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
+        if hit_terminal:
+            body_lines.append(f'// [도달불가 - 앞선 return 으로 함수 종료] {obj["line"]}')
+            continue
+
         if em.kind == "native":
             n_native += 1
         elif em.kind == "gated":
@@ -313,6 +321,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         if barrier:
             cse_cache.clear()         # 변형 후 모든 캐시 무효화
             cse_set_cache.clear()
+
+        if em.terminal:
+            hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리
 
     if rejected:
         # 원본 mcfunction 과 동일하게 함수 전체 비활성. 원래 본문은 주석으로 보존(디버깅).

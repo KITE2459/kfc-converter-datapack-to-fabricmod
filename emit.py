@@ -70,6 +70,7 @@ class Emitted:
     rejects_function: bool = False                    # True면 이 줄이 함수 전체를 무효화(mcfunction 파싱거부 재현)
     macro_params: list = field(default_factory=list)  # 이 줄이 쓰는 매크로 변수명(시그니처 결정용)
     side_effects: list = field(default_factory=list)  # 값 식 평가 전에 먼저 실행할 부수효과 문장
+    terminal: bool = False                            # True면 이 줄이 무조건 함수를 종료(top-level return). 이후 줄은 도달불가(바닐라 동치) → 드롭.
 
     def bridge(self, reason: str) -> "Emitted":
         # 자바->바닐라 디스패처 호출은 최적화 이득이 없어 최종 산출에서 쓰지 않는다.
@@ -1568,8 +1569,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                     _ns, _p = fid.split(":", 1) if ":" in fid else ("minecraft", fid)
                     em.java.append(f"return KfcGen.instantExecuteFunctionReturn(source, "
                                    f"net.minecraft.util.Identifier.of({jstr(_ns)}, {jstr(_p)}));")
+                    em.terminal = True
                     return True
                 em.java.append(f"return {fqcn(fid)}.executeReturn(source);")
+                em.terminal = True
                 return True
             # return run <비함수 커맨드> -> 내부 커맨드를 emit 후 결과(성공=1) 반환
             inner_chain = []
@@ -1586,6 +1589,7 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 em.java.extend(inner.java)
                 em.java.append("return 1;")
                 em.kind = inner.kind
+                em.terminal = True
                 return True
             em.reason = inner.reason or f"return run {sub_cmd} 네이티브화 불가"
             return False
@@ -1598,6 +1602,7 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             except ValueError:
                 rv = "1"  # 비정수 값은 보수적으로 1(참)
         em.java.append(f"return {rv};")
+        em.terminal = True
         return True
 
     # ---- data (modify/get/...) : 질문1=A, 최대 네이티브 시도 ----

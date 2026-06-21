@@ -209,12 +209,13 @@ def _iter_trees(trees_path: str):
                 yield json.loads(line)
 
 
-def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "kartriderpack", profile=None, clean: bool = True):
+def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "kartriderpack", profile=None, clean: bool = True, merge: bool = True):
     # 데이터팩 입력을 한 번 열어(디렉터리/zip 투명) 모든 로더-리소스 복사에서 재사용.
     dp_src = open_datapack(datapack_root) if datapack_root else None
-    emit.load_entity_type_tags(dp_src)
-    emit.load_block_tags(dp_src)
-    emit.load_predicates(dp_src)
+    if dp_src is not None:
+        emit.load_entity_type_tags(dp_src)
+        emit.load_block_tags(dp_src)
+        emit.load_predicates(dp_src)
 
     out_root = Path(out_dir)
     # 이전 변환의 잔재 .java/리소스가 남아 빌드를 깨는 것을 막는다(예: 삭제/改名된 함수의 옛 클래스).
@@ -413,6 +414,20 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     write_entrypoint(src_root, group, tags, generated_fids)
     write_resources(out_root, group, tags, dp_src)
 
+    # ── [pass-3] 후처리: 오버사이즈 브릿지 + 버킷화(여러 함수를 한 클래스로 묶어 클래스 수 감축) ──
+    # ModEntry(tick) 가 생성된 뒤라 외부 FQCN 참조가 자동 핀된다. tick/load 는 명시 핀으로도 전달.
+    # 기본 상시 버킷화. 끄려면 --no-merge (또는 --none-merge).
+    if merge:
+        try:
+            import merge_pass
+            pins = set(tags.get("tick", [])) | set(tags.get("load", []))
+            mstats = merge_pass.run_postpass(src_root, group, pins=pins,
+                                             strategy="bucket", verbose=True)
+            print(f"[generate] pass-3 postprocess(bucket): {mstats}")
+        except Exception as _me:
+            import traceback; traceback.print_exc()
+            print(f"[generate][warn] bucket pass skipped due to error: {_me}")
+
     print(f"[generate] {fn_count} classes -> {src_root}")
     tot = sum(stats.values())
     if tot:
@@ -477,7 +492,7 @@ dependencies {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.fork = true
-    options.forkOptions.memoryMaximumSize = '4g'
+    options.forkOptions.memoryMaximumSize = '6g'
     // 초대형(수만~십수만 클래스) 팩이면 증분분석이 메모리만 쓰므로 아래 주석 해제:
     // options.incremental = false
 }
@@ -871,7 +886,8 @@ def build(datapack_root: str, out_src_dir: str, argv: list):
     _asm.set_force_bridge(force)
     _asm.set_trace(traced)
     generate(trees_json, datapack_root, out_src_dir, group, profile=profile,
-             clean=("--no-clean" not in argv))
+             clean=("--no-clean" not in argv),
+             merge=not any(f in argv for f in ("--no-merge", "--none-merge")))
     print(f"[build] done -> {out_src_dir}")
 
 
@@ -906,7 +922,8 @@ def main():
         print(f"[generate] package group: {group} | profile: {profile.name} "
               f"(MC {profile.minecraft_version} / Fabric {profile.fabric_loader_version})")
         generate(sys.argv[2], datapack_root, sys.argv[4], group, profile=profile,
-                 clean=("--no-clean" not in sys.argv))
+                 clean=("--no-clean" not in sys.argv),
+                 merge=not any(f in sys.argv for f in ("--no-merge", "--none-merge")))
     else:
         print(f"unknown command: {cmd}"); print(__doc__); sys.exit(1)
 

@@ -1,2 +1,0 @@
-$tag @n[tag=target_$(number),distance=..$(range),tag=enemy.target,limit=1,type=#minecraft:target] remove target_$(number)
-$tag @n[tag=enemy.attribute.taunt,distance=..$(range),type=#minecraft:target] add target_$(number)

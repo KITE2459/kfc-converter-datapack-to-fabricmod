@@ -1,3 +1,0 @@
-data modify storage enemy data set value {health:5000, speed:0, money:0,id:healing-crystal,name:{color:yellow,"text":"힐링 크리스탈\n","bold":true}}
-
-summon end_crystal ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_breeze,enemy.target,enemy.core,enemy.data,enemy.attribute.taunt],Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_breeze,enemy.text],text:[{"color":"dark_green","text":"힐링 크리스탈\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

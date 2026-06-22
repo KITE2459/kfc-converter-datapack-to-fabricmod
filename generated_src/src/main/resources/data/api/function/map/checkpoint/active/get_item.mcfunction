@@ -1,4 +1,0 @@
-$give @s emerald_block[item_name=[{text:"[ 적 스폰 지점 ]",color:green,bold:true},{text:" 맵: ",color:gray,bold:false},{text:"$(map)",color:yellow,bold:false}],custom_data={map:"$(map)",type:"spawn"}]
-$give @s diamond_block[item_name=[{text:"[ 적 체크포인트 ]",color:aqua,bold:true},{text:" 맵: ",color:gray,bold:false},{text:"$(map)",color:yellow,bold:false}],custom_data={map:"$(map)",type:"check"}]
-$give @s black_concrete[item_name=[{text:"[ 적 도착 지점 ]",color:gray,bold:true},{text:" 맵: ",color:gray,bold:false},{text:"$(map)",color:yellow,bold:false}],custom_data={map:"$(map)",type:"dest"}]
-$give @s barrier[item_name=[{text:"[ 포인트 삭제 ]",color:red,bold:true},{text:" 맵: ",color:gray,bold:false},{text:"$(map)",color:yellow,bold:false}],custom_data={map:"$(map)",type:"delete"}]

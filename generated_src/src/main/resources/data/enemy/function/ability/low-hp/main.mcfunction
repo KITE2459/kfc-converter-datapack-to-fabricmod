@@ -1,1 +1,0 @@
-$function enemy:ability/low-hp/$(id)

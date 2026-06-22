@@ -1,2 +1,0 @@
-execute if score @s[tag=tower.sound] tower.animation matches 1 run playsound minecraft:entity.firework_rocket.large_blast record @a ~ ~ ~ 0.4 0.7
-execute if score @s[tag=tower.sound] tower.animation matches 1 run playsound minecraft:block.chain.fall record @a ~ ~ ~ 1.0 0.7

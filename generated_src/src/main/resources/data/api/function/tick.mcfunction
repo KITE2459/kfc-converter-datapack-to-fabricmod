@@ -1,2 +1,0 @@
-execute as @a[tag=player.map_modify] at @s run function api:map/checkpoint/main with entity @s equipment.offhand.components.minecraft:custom_data
-execute as @a[tag=player.map_modify] at @s run function api:map/checkpoint/path/main with storage player temp.components.minecraft:custom_data

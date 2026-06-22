@@ -1,1 +1,0 @@
-$rotate @s facing entity @e[tag=target_$(number),tag=enemy.target,limit=1,type=#minecraft:target] eyes

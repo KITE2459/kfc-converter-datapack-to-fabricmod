@@ -1,1 +1,0 @@
-tellraw @s [{text:"적 스폰 지점이 설정되었습니다!",color:"green"}]

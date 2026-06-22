@@ -1,1 +1,0 @@
-execute at @s run function enemy:ability/timer/breeze/main

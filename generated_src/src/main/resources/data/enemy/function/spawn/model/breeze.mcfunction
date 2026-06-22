@@ -1,3 +1,0 @@
-data modify storage enemy data set value {health:400, speed:0.22, defence:25,money:400,id:breeze,name:{color:white,"text":"브리즈\n","bold":true}, skills:{timer:100}}
-
-summon breeze ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_breeze,enemy.target,enemy.core,enemy.data],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_breeze,enemy.text],text:[{"color":"dark_green","text":"좀비\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

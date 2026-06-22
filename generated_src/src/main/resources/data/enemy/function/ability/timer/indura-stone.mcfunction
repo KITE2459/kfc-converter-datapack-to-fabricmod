@@ -1,1 +1,0 @@
-function enemy:hit/death {money:0,id:indura-stone}

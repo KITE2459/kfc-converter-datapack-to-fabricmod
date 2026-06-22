@@ -1,1 +1,0 @@
-$function tower:attack/fire/hitscan/hit-marker/animation/$(model)

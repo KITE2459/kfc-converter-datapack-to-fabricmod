@@ -1,2 +1,0 @@
-execute if score @s[tag=tower.sound] tower.animation matches 1 run playsound minecraft:entity.firework_rocket.blast record @a ~ ~ ~ 0.6 1
-execute if score @s[tag=tower.sound] tower.animation matches 1 at @s run particle flame ^ ^ ^2 0 0 0 0.1 1 force @a

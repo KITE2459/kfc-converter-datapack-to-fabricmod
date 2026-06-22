@@ -1,2 +1,0 @@
-execute if entity @s[tag=enemy.skill-loop.1] at @s run function enemy:ability/timer/sculk-titan/summon-zombie
-execute if entity @s[tag=enemy.skill-loop.2] at @s run function enemy:ability/timer/sculk-titan/stun-tower

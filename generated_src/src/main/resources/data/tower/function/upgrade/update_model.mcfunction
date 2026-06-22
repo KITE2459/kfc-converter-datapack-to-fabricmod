@@ -1,1 +1,0 @@
-$function tower:spawn/model/$(model)/lv$(level)

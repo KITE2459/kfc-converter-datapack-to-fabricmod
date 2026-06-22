@@ -1,2 +1,0 @@
-execute if score @s enemy.progress < max enemy.progress run scoreboard players set #temp game.return 1
-execute if score @s enemy.progress < max enemy.progress run scoreboard players operation max enemy.progress = @s enemy.progress

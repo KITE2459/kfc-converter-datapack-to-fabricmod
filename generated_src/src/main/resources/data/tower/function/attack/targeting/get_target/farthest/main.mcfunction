@@ -1,3 +1,0 @@
-$tag @e[tag=target_$(number),tag=enemy.target,limit=1] remove target_$(number)
-$execute if data storage tower temp.Bullet.attribute.freeze as @e[distance=..$(range),tag=enemy.target,sort=farthest,limit=1,scores={enemy.state.freeze=..0}] run tag @s add target_$(number)
-$execute unless entity @e[tag=target_$(number)] as @e[distance=..$(range),tag=enemy.target,sort=farthest,limit=1] run tag @s add target_$(number)

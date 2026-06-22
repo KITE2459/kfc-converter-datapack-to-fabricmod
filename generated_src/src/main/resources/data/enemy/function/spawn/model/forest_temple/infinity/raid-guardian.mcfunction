@@ -1,3 +1,0 @@
-data modify storage enemy data set value {health:12500, defence:175, speed:0.15, money:15000,id:raid-guardian,name:{color:white,"text":"레이드 가디언\n","bold":true}, skills:{low_hp:10000}}
-
-summon zombie ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_drowned,enemy.target,enemy.core,enemy.data,enemy.immune.bleed,enemy.immune.freeze,enemy.immune.stun,enemy.skill-trigger.low-hp],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_drowned,enemy.text],text:[{"color":"dark_green","text":"좀비\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

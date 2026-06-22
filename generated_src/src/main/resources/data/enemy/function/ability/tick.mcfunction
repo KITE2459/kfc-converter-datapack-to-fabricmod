@@ -1,2 +1,0 @@
-execute as @e[tag=sculk-sonicwave.blast] at @s run function enemy:ability/timer/sculk-titan/sculk-sonicwave-blast
-execute as @e[tag=evoker-fangs] at @s run function enemy:ability/timer/evoker/evoker-fangs

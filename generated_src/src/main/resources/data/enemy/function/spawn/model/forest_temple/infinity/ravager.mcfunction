@@ -1,3 +1,0 @@
-data modify storage enemy data set value {health:4000, speed:0.23, defence:125, money:8000,id:ravager,name:{color:white,"text":"파괴수\n","bold":true}}
-
-summon ravager ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_ravager,enemy.target,enemy.core,enemy.data,enemy.immune.freeze,enemy.immune.stun],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_ravager,enemy.text],text:[{"color":"dark_green","text":"좀비\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

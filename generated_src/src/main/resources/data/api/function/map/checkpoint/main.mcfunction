@@ -1,2 +1,0 @@
-data modify storage player temp set from entity @s equipment.offhand
-execute if data storage player temp.components.minecraft:custom_data.map run function api:map/checkpoint/use_checkpoint/main with storage player temp.components.minecraft:custom_data

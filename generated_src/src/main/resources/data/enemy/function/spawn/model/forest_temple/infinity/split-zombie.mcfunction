@@ -1,3 +1,0 @@
-data modify storage enemy data set value {health:2000, speed:0.13, money:135, id:split-zombie,name:{color:dark_purple,"text":"분열 좀비\n","bold":true}}
-
-summon zombie ~ ~ ~ {equipment:{head:{id:slime_block}},Tags:[enemy,enemy.hitbox_type_drowned,enemy.target,enemy.core,enemy.data,enemy.skill-trigger.death,enemy.immune.poison],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_drowned,enemy.text],text:[{"color":"dark_green","text":"분열 좀비\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

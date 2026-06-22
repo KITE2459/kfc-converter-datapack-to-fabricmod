@@ -1,5 +1,0 @@
-execute as @e[tag=map.point,tag=map.spawn_point] at @s run particle minecraft:dust{color:[0.000,1.000,0.000],scale:2} ~ ~ ~ 0.1 0.1 0.1 0 1 force @a[tag=player.map_modify]
-execute as @e[tag=map.point,tag=map.spawn_point] at @s run particle minecraft:dust{color:[1.000,0.000,0.000],scale:1} ^ ^ ^0.5 0 0 0 0 1 force @a[tag=player.map_modify]
-execute as @e[tag=map.point,tag=map.check_point] at @s run particle minecraft:dust{color:[0.000,0.000,1.000],scale:2} ~ ~ ~ 0.1 0.1 0.1 0 1 force @a[tag=player.map_modify]
-execute as @e[tag=map.point,tag=map.check_point] at @s run particle minecraft:dust{color:[1.000,0.000,0.000],scale:1} ^ ^ ^0.5 0 0 0 0 1 force @a[tag=player.map_modify]
-execute as @e[tag=map.point,tag=map.dest_point] at @s run particle minecraft:dust{color:[1.000,0.000,0.000],scale:2} ~ ~ ~ 0.1 0.1 0.1 0 1 force @a[tag=player.map_modify]

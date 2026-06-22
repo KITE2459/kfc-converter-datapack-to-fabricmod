@@ -1,0 +1,1 @@
+execute as @a if score @s player.id = #temp player.id run playsound minecraft:entity.villager.work_fletcher weather @s ~ ~ ~ 1 1 1

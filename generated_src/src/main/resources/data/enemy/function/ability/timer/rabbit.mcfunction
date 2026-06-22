@@ -1,0 +1,1 @@
+execute at @s run function enemy:ability/timer/rabbit/main

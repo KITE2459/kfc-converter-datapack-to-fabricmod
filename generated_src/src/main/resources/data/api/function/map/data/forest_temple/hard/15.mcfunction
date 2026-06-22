@@ -1,0 +1,15 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[14].tick_0 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[14].tick_1 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[14].tick_9 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[14].tick_19 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[14].tick_29 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[14].tick_30 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[14].tick_39 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[14].tick_60 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[14].tick_90 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[14].tick_120 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[14].tick_149 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[14].tick_169 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[14].tick_189 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[14].end set value 189

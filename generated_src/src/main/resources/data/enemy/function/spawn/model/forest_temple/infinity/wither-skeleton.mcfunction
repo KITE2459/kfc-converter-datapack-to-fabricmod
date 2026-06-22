@@ -1,0 +1,3 @@
+data modify storage enemy data set value {health:4500, speed:0.17, money:300,id:wither-skeleton,name:{color:white,"text":"위더 스켈레톤\n","bold":true}}
+
+summon wither_skeleton ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_wither_skeleton,enemy.target,enemy.core,enemy.data,enemy.immune.flame],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_wither_skeleton,enemy.text],text:[{"color":"dark_green","text":"wither_skeleton\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

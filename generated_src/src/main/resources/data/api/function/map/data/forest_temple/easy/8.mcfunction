@@ -1,0 +1,17 @@
+data modify storage map forest_temple.easy.round append value {}
+data modify storage map forest_temple.easy.round[7].tick_0 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_9 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_14 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_19 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_24 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_29 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_34 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_39 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_44 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_49 set value {difficulty:easy,map:forest_temple,model:quick-zombie}
+data modify storage map forest_temple.easy.round[7].tick_54 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_80 set value {difficulty:easy,map:forest_temple,model:heavy-zombie}
+data modify storage map forest_temple.easy.round[7].tick_100 set value {difficulty:easy,map:forest_temple,model:heavy-zombie}
+data modify storage map forest_temple.easy.round[7].tick_119 set value {difficulty:easy,map:forest_temple,model:zombie}
+data modify storage map forest_temple.easy.round[7].tick_120 set value {difficulty:easy,map:forest_temple,model:armord-zombie}
+data modify storage map forest_temple.easy.round[7].end set value 120

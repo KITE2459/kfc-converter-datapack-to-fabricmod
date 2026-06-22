@@ -1,0 +1,3 @@
+data modify storage enemy data set value {health:1500, speed:0.13, money:1500,id:charged-creeper,name:{color:white,"text":"충전된 크리퍼\n","bold":true}}
+
+summon creeper ~ ~ ~ {powered:1b, Tags:[enemy,enemy.hitbox_type_creeper,enemy.target,enemy.core,enemy.data,enemy.skill-trigger.death],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_creeper,enemy.text],text:[{"color":"dark_green","text":"크리퍼\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

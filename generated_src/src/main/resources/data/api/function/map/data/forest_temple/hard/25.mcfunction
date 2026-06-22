@@ -1,0 +1,17 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[24].tick_4 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_9 set value {difficulty:hard,map:forest_temple,model:creeper}
+data modify storage map forest_temple.hard.round[24].tick_10 set value {difficulty:hard,map:forest_temple,model:pillager}
+data modify storage map forest_temple.hard.round[24].tick_24 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_29 set value {difficulty:hard,map:forest_temple,model:evoker}
+data modify storage map forest_temple.hard.round[24].tick_30 set value {difficulty:hard,map:forest_temple,model:pillager}
+data modify storage map forest_temple.hard.round[24].tick_44 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_49 set value {difficulty:hard,map:forest_temple,model:pillager}
+data modify storage map forest_temple.hard.round[24].tick_64 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_69 set value {difficulty:hard,map:forest_temple,model:pillager}
+data modify storage map forest_temple.hard.round[24].tick_79 set value {difficulty:hard,map:forest_temple,model:illusioner}
+data modify storage map forest_temple.hard.round[24].tick_84 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_89 set value {difficulty:hard,map:forest_temple,model:pillager}
+data modify storage map forest_temple.hard.round[24].tick_104 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].tick_154 set value {difficulty:hard,map:forest_temple,model:vindicator}
+data modify storage map forest_temple.hard.round[24].end set value 154

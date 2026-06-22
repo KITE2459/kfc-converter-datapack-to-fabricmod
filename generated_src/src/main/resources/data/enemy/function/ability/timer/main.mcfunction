@@ -1,0 +1,1 @@
+$function enemy:ability/timer/$(id)

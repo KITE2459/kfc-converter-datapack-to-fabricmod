@@ -1,0 +1,12 @@
+data modify storage map forest_temple.normal.round append value {}
+data modify storage map forest_temple.normal.round[9].tick_9 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[9].tick_19 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[9].tick_29 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[9].tick_29 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[9].tick_39 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[9].tick_49 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[9].tick_49 set value {difficulty:normal,map:forest_temple,model:healing-zombie}
+data modify storage map forest_temple.normal.round[9].tick_59 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[9].tick_79 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[9].tick_89 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[9].end set value 89

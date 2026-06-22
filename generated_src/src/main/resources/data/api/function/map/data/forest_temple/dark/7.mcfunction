@@ -1,0 +1,17 @@
+data modify storage map forest_temple.dark.round append value {}
+data modify storage map forest_temple.dark.round[6].tick_0 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_10 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_20 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_30 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_31 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[6].tick_40 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_50 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_59 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[6].tick_60 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[6].tick_61 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[6].tick_79 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[6].tick_90 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[6].tick_99 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[6].tick_119 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[6].tick_199 set value {difficulty:dark,map:forest_temple,model:zoglin}
+data modify storage map forest_temple.dark.round[6].end set value 199

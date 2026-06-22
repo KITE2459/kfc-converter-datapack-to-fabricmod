@@ -1,0 +1,1 @@
+$function tower:animation/machine-gun/lv$(level)/main

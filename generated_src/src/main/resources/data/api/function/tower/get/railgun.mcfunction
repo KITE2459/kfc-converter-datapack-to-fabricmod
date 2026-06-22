@@ -1,0 +1,6 @@
+give @p copper_ingot[minecraft:item_name={text:"[ 레일건 ]",bold:false,color:green},minecraft:item_model=diamond_horse_armor,minecraft:lore=[{text:"3600G",color:yellow}],minecraft:custom_data={is_tower:1b,\
+Tower_Status:{name:{text:"[ 레일건 ]",bold:false,color:green},number:2,level:0,model:railgun,location:2,attack:80,attack_speed:80,info:{attack_speed:"4s"},range:25,Bullet:{type:hitscan,model:arrow,life:60},price:3600,sell_price:1800,size:2f,translation:-1f,hitbox:1f,target_mode:1,limit:2},\
+Tower_Upgrade:{\
+Tower_Status:{name:{text:"[ 레일건 ]",bold:false,color:green},number:2,level:1,model:railgun,location:2,attack:1500,attack_speed:110,info:{attack_speed:"5.5s"},range:30,Bullet:{type:hitscan,model:arrow,life:60},price:25000,sell_price:14300,size:2f,translation:-1f,hitbox:1f},\
+Tower_Upgrade:{\
+Tower_Status:{name:{text:"[ 레일건 ]",bold:false,color:green},number:2,level:2,model:railgun,location:2,attack:5000,attack_speed:140,info:{attack_speed:"7s"},range:40,Bullet:{type:hitscan,model:arrow,life:75},price:75000,sell_price:51800,size:2f,translation:-1f,hitbox:1f}}}}]

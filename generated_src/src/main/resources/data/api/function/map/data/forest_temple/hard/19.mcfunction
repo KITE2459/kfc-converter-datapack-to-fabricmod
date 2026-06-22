@@ -1,0 +1,17 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[18].tick_0 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_9 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_10 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[18].tick_29 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_39 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[18].tick_49 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_69 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_70 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[18].tick_74 set value {difficulty:hard,map:forest_temple,model:revive-zombie}
+data modify storage map forest_temple.hard.round[18].tick_89 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_99 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[18].tick_109 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_129 set value {difficulty:hard,map:forest_temple,model:wither-skeleton}
+data modify storage map forest_temple.hard.round[18].tick_130 set value {difficulty:hard,map:forest_temple,model:skeleton}
+data modify storage map forest_temple.hard.round[18].tick_199 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[18].end set value 199

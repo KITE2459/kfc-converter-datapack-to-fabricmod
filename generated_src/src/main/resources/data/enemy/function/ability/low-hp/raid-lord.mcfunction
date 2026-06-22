@@ -1,0 +1,1 @@
+data modify entity @s data.speed set value 12

@@ -89,7 +89,7 @@ public final class KfcGen {
         int t = ctx.server.getTicks();
         if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
             java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>();
-            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) list.add(e);
+            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) if (e != null) list.add(e);
             SNAP_ENTITIES = list; SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
         }
         return SNAP_ENTITIES;
@@ -485,6 +485,27 @@ public final class KfcGen {
         for (int cx = cx1; cx <= cx2; cx++)
             for (int cz = cz1; cz <= cz2; cz++)
                 world.setChunkForced(cx, cz, true);
+    }
+
+    // forceload remove <from> [<to>] — 컬럼 좌표 범위의 강제로드 해제(add 와 동일 루프, false).
+    public static void forceloadRemove(net.minecraft.server.world.ServerWorld world,
+                                       int fx, int fz, int tx, int tz) {
+        if (world == null) return;
+        int cx1 = Math.min(fx, tx) >> 4, cx2 = Math.max(fx, tx) >> 4;
+        int cz1 = Math.min(fz, tz) >> 4, cz2 = Math.max(fz, tz) >> 4;
+        for (int cx = cx1; cx <= cx2; cx++)
+            for (int cz = cz1; cz <= cz2; cz++)
+                world.setChunkForced(cx, cz, false);
+    }
+
+    // forceload remove all — 현재 강제로드된 모든 청크 해제. 순회 중 변경 방지 위해 배열 복사 후 해제.
+    public static void forceloadRemoveAll(net.minecraft.server.world.ServerWorld world) {
+        if (world == null) return;
+        long[] forced = world.getForcedChunks().toLongArray();
+        for (long key : forced) {
+            world.setChunkForced(net.minecraft.util.math.ChunkPos.getPackedX(key),
+                                 net.minecraft.util.math.ChunkPos.getPackedZ(key), false);
+        }
     }
 
     /** title <targets> times <fadeIn> <stay> <fadeOut> */

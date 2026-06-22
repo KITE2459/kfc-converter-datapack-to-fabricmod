@@ -1,0 +1,1 @@
+scoreboard players remove @s enemy.state.stun-immune 1

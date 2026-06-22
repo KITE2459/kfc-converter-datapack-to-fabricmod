@@ -1,0 +1,2 @@
+execute if entity @s[tag=enemy.skill-loop.1] at @s run function enemy:ability/timer/evoker/summon-vex
+execute if entity @s[tag=enemy.skill-loop.2,scores={enemy.skill-trigger.timer-cooldown=0}] at @s run function enemy:ability/timer/evoker/stun-tower

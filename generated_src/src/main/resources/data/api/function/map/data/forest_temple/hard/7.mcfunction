@@ -1,0 +1,12 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[6].tick_0 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_20 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_40 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_60 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_80 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_100 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_120 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_140 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_160 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].tick_180 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[6].end set value 180

@@ -1,0 +1,10 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[3].tick_0 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[3].tick_1 set value {difficulty:hard,map:forest_temple,model:zombie-villager}
+data modify storage map forest_temple.hard.round[3].tick_20 set value {difficulty:hard,map:forest_temple,model:zombie-villager}
+data modify storage map forest_temple.hard.round[3].tick_40 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[3].tick_41 set value {difficulty:hard,map:forest_temple,model:zombie-villager}
+data modify storage map forest_temple.hard.round[3].tick_60 set value {difficulty:hard,map:forest_temple,model:zombie-villager}
+data modify storage map forest_temple.hard.round[3].tick_80 set value {difficulty:hard,map:forest_temple,model:drowned}
+data modify storage map forest_temple.hard.round[3].tick_81 set value {difficulty:hard,map:forest_temple,model:zombie-villager}
+data modify storage map forest_temple.hard.round[3].end set value 81

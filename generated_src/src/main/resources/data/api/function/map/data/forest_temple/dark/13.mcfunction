@@ -1,0 +1,15 @@
+data modify storage map forest_temple.dark.round append value {}
+data modify storage map forest_temple.dark.round[12].tick_0 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_20 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_40 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_49 set value {difficulty:dark,map:forest_temple,model:stray}
+data modify storage map forest_temple.dark.round[12].tick_60 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_80 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_100 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_120 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_140 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_160 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_180 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].tick_199 set value {difficulty:dark,map:forest_temple,model:zoglin}
+data modify storage map forest_temple.dark.round[12].tick_200 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[12].end set value 200

@@ -1,0 +1,2 @@
+execute if score @s tower.state.stun matches 1.. at @s run particle dust{color:[0.000,0.000,0.000],scale:1} ~ ~ ~ 0.4 0.4 0.4 0 15 force @a
+scoreboard players remove @s[scores={tower.state.stun=1..}] tower.state.stun 1

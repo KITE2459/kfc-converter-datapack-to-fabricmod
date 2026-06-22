@@ -1,0 +1,9 @@
+data modify storage map forest_temple.normal.round append value {}
+data modify storage map forest_temple.normal.round[12].tick_0 set value {difficulty:normal,map:forest_temple,model:breeze}
+data modify storage map forest_temple.normal.round[12].tick_0 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].tick_19 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].tick_39 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].tick_149 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].tick_169 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].tick_189 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[12].end set value 189

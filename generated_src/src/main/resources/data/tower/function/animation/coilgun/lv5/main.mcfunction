@@ -1,0 +1,2 @@
+execute if score @s[tag=tower.sound] tower.animation matches 20 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 2.0
+execute if score @s[tag=tower.sound] tower.animation matches 20 run playsound minecraft:item.armor.equip_chain record @a ~ ~ ~ 1 1

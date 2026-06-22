@@ -1,0 +1,2 @@
+execute store result storage tower temp.number int 1 run scoreboard players get @n[tag=tower.data] tower.number
+execute at @s run function tower:attack/fire/hitscan/hit-marker/move/ray with storage tower temp

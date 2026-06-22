@@ -1,0 +1,1 @@
+$execute as @a if score @s player.id = #temp player.id run function tower:upgrade/sound/$(model)/main

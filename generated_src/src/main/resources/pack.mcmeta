@@ -1,0 +1,14 @@
+{
+    "pack": {
+        "description": "TDPack",
+        "pack_format": 71
+    },
+        "filter": {
+            "block": [
+            {
+                "namespace": "minecraft",
+                "path": "^(?=.*(?:advancement)).*$"
+            }
+        ]
+    }   
+}

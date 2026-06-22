@@ -1,0 +1,3 @@
+data modify storage enemy data set value {health:225, speed:0.07, money:200, defence:25, id:armord-zombie,name:{color:white,"text":"아머드 좀비\n","bold":true}}
+
+summon zombie ~ ~ ~ {equipment:{head:{id:netherite_helmet},chest:{id:netherite_chestplate},legs:{id:netherite_leggings},feet:{id:netherite_boots}},Tags:[enemy,enemy.hitbox_type_drowned,enemy.target,enemy.core,enemy.data],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_drowned,enemy.text],text:[{"color":"dark_green","text":"아머드 좀비\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}]}

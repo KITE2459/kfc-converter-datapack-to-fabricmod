@@ -1,0 +1,1 @@
+summon block_display ~ ~ ~ {Passengers:[{id:"minecraft:item_display",item:{id:"minecraft:beacon",count:1},item_display:"none",transformation:{left_rotation:[0f,1f,0f,0f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[2f,0.2f,2f]},Tags:[tower.supporter,not-allocated,tower]}],Tags:[tower.supporter,not-allocated,tower]}

@@ -1,0 +1,13 @@
+data modify storage map forest_temple.hard.round append value {}
+data modify storage map forest_temple.hard.round[26].tick_0 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[26].tick_1 set value {difficulty:hard,map:forest_temple,model:charged-creeper}
+data modify storage map forest_temple.hard.round[26].tick_34 set value {difficulty:hard,map:forest_temple,model:illusioner}
+data modify storage map forest_temple.hard.round[26].tick_39 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[26].tick_79 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[26].tick_89 set value {difficulty:hard,map:forest_temple,model:illusioner}
+data modify storage map forest_temple.hard.round[26].tick_99 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[26].tick_100 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[26].tick_119 set value {difficulty:hard,map:forest_temple,model:horse-skeleton}
+data modify storage map forest_temple.hard.round[26].tick_159 set value {difficulty:hard,map:forest_temple,model:dash-zombie}
+data modify storage map forest_temple.hard.round[26].tick_160 set value {difficulty:hard,map:forest_temple,model:charged-creeper}
+data modify storage map forest_temple.hard.round[26].end set value 160

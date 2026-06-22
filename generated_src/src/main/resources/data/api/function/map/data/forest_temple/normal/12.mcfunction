@@ -1,0 +1,17 @@
+data modify storage map forest_temple.normal.round append value {}
+data modify storage map forest_temple.normal.round[11].tick_0 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[11].tick_0 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[11].tick_9 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_19 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[11].tick_24 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_39 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_39 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[11].tick_50 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[11].tick_59 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[11].tick_69 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_79 set value {difficulty:normal,map:forest_temple,model:quick-husk}
+data modify storage map forest_temple.normal.round[11].tick_99 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_100 set value {difficulty:normal,map:forest_temple,model:heavy-husk}
+data modify storage map forest_temple.normal.round[11].tick_129 set value {difficulty:normal,map:forest_temple,model:phantom}
+data modify storage map forest_temple.normal.round[11].tick_169 set value {difficulty:normal,map:forest_temple,model:healing-zombie}
+data modify storage map forest_temple.normal.round[11].end set value 169

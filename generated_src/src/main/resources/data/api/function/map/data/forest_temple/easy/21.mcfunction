@@ -1,0 +1,17 @@
+data modify storage map forest_temple.easy.round append value {}
+data modify storage map forest_temple.easy.round[20].tick_0 set value {difficulty:easy,map:forest_temple,model:horse-zombie}
+data modify storage map forest_temple.easy.round[20].tick_19 set value {difficulty:easy,map:forest_temple,model:spider}
+data modify storage map forest_temple.easy.round[20].tick_19 set value {difficulty:easy,map:forest_temple,model:cave-spider}
+data modify storage map forest_temple.easy.round[20].tick_39 set value {difficulty:easy,map:forest_temple,model:spider}
+data modify storage map forest_temple.easy.round[20].tick_39 set value {difficulty:easy,map:forest_temple,model:cave-spider}
+data modify storage map forest_temple.easy.round[20].tick_49 set value {difficulty:easy,map:forest_temple,model:split-zombie}
+data modify storage map forest_temple.easy.round[20].tick_50 set value {difficulty:easy,map:forest_temple,model:horse-zombie}
+data modify storage map forest_temple.easy.round[20].tick_59 set value {difficulty:easy,map:forest_temple,model:spider}
+data modify storage map forest_temple.easy.round[20].tick_59 set value {difficulty:easy,map:forest_temple,model:cave-spider}
+data modify storage map forest_temple.easy.round[20].tick_79 set value {difficulty:easy,map:forest_temple,model:spider}
+data modify storage map forest_temple.easy.round[20].tick_79 set value {difficulty:easy,map:forest_temple,model:cave-spider}
+data modify storage map forest_temple.easy.round[20].tick_99 set value {difficulty:easy,map:forest_temple,model:spider}
+data modify storage map forest_temple.easy.round[20].tick_99 set value {difficulty:easy,map:forest_temple,model:cave-spider}
+data modify storage map forest_temple.easy.round[20].tick_100 set value {difficulty:easy,map:forest_temple,model:horse-zombie}
+data modify storage map forest_temple.easy.round[20].tick_149 set value {difficulty:easy,map:forest_temple,model:split-zombie}
+data modify storage map forest_temple.easy.round[20].end set value 149

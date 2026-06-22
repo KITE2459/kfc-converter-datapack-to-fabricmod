@@ -1,0 +1,1 @@
+execute as @e[distance=..5,tag=enemy.data] at @s if function tower:attack/fire/sword/hit-marker/move/detect-hitbox-area-0 run tag @s add sword-hit-area

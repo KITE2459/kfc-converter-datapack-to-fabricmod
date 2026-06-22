@@ -2264,11 +2264,15 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         em.kind = "native"; return True
 
     if command == "forceload":
-        if nn[1:2] != ["add"]:
-            em.reason = f"forceload {nn[1] if len(nn) > 1 else '?'} 1차 미지원"; return False
+        sub = nn[1] if len(nn) > 1 else None
+        if sub not in ("add", "remove"):
+            em.reason = f"forceload {sub or '?'} 미지원"; return False
         frm = first_arg(args, "from"); to = first_arg(args, "to")
+        if sub == "remove" and nn[2:3] == ["all"]:
+            em.java.append('KfcGen.forceloadRemoveAll(source.getWorld());')
+            em.kind = "native"; return True
         if not frm:
-            em.reason = "forceload 좌표 없음"; return False
+            em.reason = f"forceload {sub} 좌표 없음"; return False
         # from/to 는 2D 컬럼좌표(x z). cond_pos_expr 은 3D용이라 직접 파싱.
         def _col(raw):
             ps = raw.split()
@@ -2295,8 +2299,9 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             return (comps[0], comps[1])
         fc = _col(frm); tc = _col(to) if to else fc
         if fc is None or tc is None:
-            em.reason = f"forceload 좌표({frm}) 미지원"; return False
-        em.java.append(f'KfcGen.forceloadAdd(source.getWorld(), {fc[0]}, {fc[1]}, {tc[0]}, {tc[1]});')
+            em.reason = f"forceload {sub} 좌표({frm}) 미지원"; return False
+        _helper = "forceloadAdd" if sub == "add" else "forceloadRemove"
+        em.java.append(f'KfcGen.{_helper}(source.getWorld(), {fc[0]}, {fc[1]}, {tc[0]}, {tc[1]});')
         em.kind = "native"; return True
 
     # ---- loot (바닐라 LootCommand: source -> List<ItemStack> -> target) ----
@@ -6236,6 +6241,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             if lim:
                 out.append("{ int _lim = 0;")
             out.append("for (Entity e : ctx.world.iterateEntities()) {")
+            out.append("    if (e == null) continue;   // iterateEntities() 가 null 슬롯을 낼 수 있음(NPE 방지)")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
             out.append("    " + src_line)
             out.extend(mr1)
@@ -6364,7 +6370,7 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
                     dst_writer = lambda valexpr: (
                         f'{{ int _stv = {valexpr};'
                         f' for (net.minecraft.entity.Entity _se : ctx.world.iterateEntities())'
-                        f' if (KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
+                        f' if (_se != null && KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
                         f' KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, _stv); }}')
                 else:
                     em.reason = f"store score 대상이 셀렉터({holder})"
@@ -6661,6 +6667,25 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
             em.reason = f"store←clear 대상({tgt[:20]}) 미지원"
             return None
         return f'KfcGen.clearItems({ent}, {iid_j}, {cd}, {mc})'
+    elif cmd == "execute":
+        # store result ... run execute if entity <sel>  → 매치 엔티티 수(바닐라 result=count).
+        # 단순형(단일 if entity, 다중/단일셀렉터/limit 아님)만 네이티브; 그 외는 브릿지.
+        enn = nn[1:]
+        if enn[:2] == ["if", "entity"] and (enn.count("if") + enn.count("unless")) == 1:
+            sel_raw = first_arg(args, "entities")
+            sel = parse_selector(sel_raw) if sel_raw else None
+            if sel is None or sel.base in ("n", "p", "r", "s") or sel.limit:
+                em.reason = f"store←execute if entity 셀렉터({str(sel_raw)[:25]}) 미지원"
+                return None
+            lo = entity_loop_open(sel, "_ece")
+            if lo is None:
+                em.reason = f"store←execute if entity({str(sel_raw)[:25]}) 해소 불가"
+                return None
+            cnt = _fresh_var("secnt")
+            em.side_effects = [f"int {cnt} = 0;"] + lo + [f"    {cnt}++;", "}"]
+            return cnt
+        em.reason = "store 소스 execute 미지원"
+        return None
     em.reason = f"store 소스 {cmd} 미지원"
     return None
 

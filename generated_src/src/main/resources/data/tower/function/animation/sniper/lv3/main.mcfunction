@@ -1,0 +1,2 @@
+execute if score @s[tag=tower.sound] tower.animation matches 35 run playsound item.spyglass.use record @a ~ ~ ~ 1 1
+execute if score @s[tag=tower.sound] tower.animation matches 35 run playsound minecraft:item.armor.equip_chain record @a ~ ~ ~ 1 1

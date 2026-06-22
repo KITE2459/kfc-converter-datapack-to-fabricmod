@@ -1,0 +1,8 @@
+data modify storage temp attribute-text set value [{text:"[총알 속성]",color:dark_purple}]
+execute if data storage tower temp.Bullet.attribute.freeze run data modify storage temp attribute-text append value [{text:"\n    [빙결] ",bold:false,color:aqua},{"nbt":"temp.Bullet.attribute.freeze","storage":"tower",bold:false,color:light_purple}]
+execute if data storage tower temp.Bullet.attribute.bleed run data modify storage temp attribute-text append value [{text:"\n    [출혈] ",bold:false,color:red},{"nbt":"temp.Bullet.attribute.bleed","storage":"tower",bold:false,color:light_purple}]
+execute if data storage tower temp.Bullet.attribute.poison run data modify storage temp attribute-text append value [{text:"\n    [중독] ",bold:false,color:green},{text:"0.",bold:false,color:light_purple},{"nbt":"temp.Bullet.attribute.poison","storage":"tower",bold:false,color:light_purple},{text:"%",bold:false,color:light_purple}]
+execute if data storage tower temp.Bullet.attribute.flame run data modify storage temp attribute-text append value [{text:"\n    [화염] ",bold:false,color:gold},{"nbt":"temp.Bullet.attribute.flame","storage":"tower",bold:false,color:light_purple}]
+execute if data storage tower temp.Bullet.attribute.stun run data modify storage temp attribute-text append value [{text:"\n    [기절] ",bold:false,color:yellow},{"nbt":"temp.Bullet.attribute.stun","storage":"tower",bold:false,color:light_purple}]
+execute if data storage tower temp.Bullet.attribute.weakness run data modify storage temp attribute-text append value [{text:"\n    [취약] ",bold:false,color:dark_purple},{"nbt":"temp.Bullet.attribute.weakness","storage":"tower",bold:false,color:light_purple}]
+tellraw @s {nbt:"attribute-text",storage:"temp",interpret:true}

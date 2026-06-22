@@ -1,0 +1,1 @@
+execute as @a run function game:ui/actionbar

@@ -1,0 +1,16 @@
+data modify storage map forest_temple.easy.round append value {}
+data modify storage map forest_temple.easy.round[17].tick_0 set value {difficulty:easy,map:forest_temple,model:split-zombie}
+data modify storage map forest_temple.easy.round[17].tick_30 set value {difficulty:easy,map:forest_temple,model:silverfish}
+data modify storage map forest_temple.easy.round[17].tick_40 set value {difficulty:easy,map:forest_temple,model:silverfish}
+data modify storage map forest_temple.easy.round[17].tick_49 set value {difficulty:easy,map:forest_temple,model:split-zombie}
+data modify storage map forest_temple.easy.round[17].tick_50 set value {difficulty:easy,map:forest_temple,model:silverfish}
+data modify storage map forest_temple.easy.round[17].tick_99 set value {difficulty:easy,map:forest_temple,model:giant}
+data modify storage map forest_temple.easy.round[17].tick_99 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_109 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_119 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_129 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_139 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_149 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_159 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].tick_169 set value {difficulty:easy,map:forest_temple,model:shiled-zombie}
+data modify storage map forest_temple.easy.round[17].end set value 169

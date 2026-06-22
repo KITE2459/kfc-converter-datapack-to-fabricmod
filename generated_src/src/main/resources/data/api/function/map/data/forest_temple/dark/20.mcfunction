@@ -1,0 +1,11 @@
+data modify storage map forest_temple.dark.round append value {}
+data modify storage map forest_temple.dark.round[19].tick_0 set value {difficulty:dark,map:forest_temple,model:dark}
+data modify storage map forest_temple.dark.round[19].tick_1 set value {difficulty:dark,map:forest_temple,model:zombie}
+data modify storage map forest_temple.dark.round[19].tick_19 set value {difficulty:dark,map:forest_temple,model:zombie}
+data modify storage map forest_temple.dark.round[19].tick_39 set value {difficulty:dark,map:forest_temple,model:zombie}
+data modify storage map forest_temple.dark.round[19].tick_69 set value {difficulty:dark,map:forest_temple,model:dark}
+data modify storage map forest_temple.dark.round[19].tick_139 set value {difficulty:dark,map:forest_temple,model:dark}
+data modify storage map forest_temple.dark.round[19].tick_174 set value {difficulty:dark,map:forest_temple,model:dark-headbomb}
+data modify storage map forest_temple.dark.round[19].tick_209 set value {difficulty:dark,map:forest_temple,model:dark}
+data modify storage map forest_temple.dark.round[19].tick_299 set value {difficulty:dark,map:forest_temple,model:zombie}
+data modify storage map forest_temple.dark.round[19].end set value 299

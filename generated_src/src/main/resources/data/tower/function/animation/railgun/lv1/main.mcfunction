@@ -1,0 +1,13 @@
+execute if score @s[tag=tower.sound] tower.animation matches 30..110 run playsound minecraft:block.note_block.didgeridoo record @a ~ ~ ~ 0.05 0.5
+execute if score @s[tag=tower.sound] tower.animation matches 120 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.1
+execute if score @s[tag=tower.sound] tower.animation matches 102 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.2
+execute if score @s[tag=tower.sound] tower.animation matches 86 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.3
+execute if score @s[tag=tower.sound] tower.animation matches 72 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.4
+execute if score @s[tag=tower.sound] tower.animation matches 60 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.5
+execute if score @s[tag=tower.sound] tower.animation matches 50 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.6
+execute if score @s[tag=tower.sound] tower.animation matches 42 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.7
+execute if score @s[tag=tower.sound] tower.animation matches 36 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.8
+execute if score @s[tag=tower.sound] tower.animation matches 32 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 1.9
+execute if score @s[tag=tower.sound] tower.animation matches 30 run playsound minecraft:block.trial_spawner.about_to_spawn_item record @a ~ ~ ~ 1 2.0
+execute if score @s[tag=tower.sound] tower.animation matches 30 run playsound minecraft:block.trial_spawner.ambient_ominous record @a ~ ~ ~ 1 1
+execute if score @s[tag=tower.sound] tower.animation matches 30 run playsound minecraft:event.mob_effect.bad_omen record @a ~ ~ ~ 1 1

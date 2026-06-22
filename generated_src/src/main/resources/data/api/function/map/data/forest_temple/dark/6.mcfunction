@@ -1,0 +1,15 @@
+data modify storage map forest_temple.dark.round append value {}
+data modify storage map forest_temple.dark.round[5].tick_0 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[5].tick_1 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[5].tick_2 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[5].tick_20 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[5].tick_21 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[5].tick_40 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[5].tick_41 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[5].tick_60 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[5].tick_80 set value {difficulty:dark,map:forest_temple,model:corrupted-zombie}
+data modify storage map forest_temple.dark.round[5].tick_81 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[5].tick_82 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[5].tick_100 set value {difficulty:dark,map:forest_temple,model:corrupted-drowned}
+data modify storage map forest_temple.dark.round[5].tick_101 set value {difficulty:dark,map:forest_temple,model:corrupted-husk}
+data modify storage map forest_temple.dark.round[5].end set value 101

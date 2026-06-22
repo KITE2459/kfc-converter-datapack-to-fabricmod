@@ -1,0 +1,22 @@
+execute if entity @s[tag=enemy.hitbox_type_breeze] positioned ~-0.675 ~0 ~-0.675 if entity @n[type=marker,tag=hitscan-marker,dx=1.35,dy=2.52,dz=1.35] run return 1
+execute if entity @s[tag=enemy.hitbox_type_cave_spider] positioned ~-0.725 ~-0.5 ~-0.725 if entity @n[type=marker,tag=hitscan-marker,dx=1.45,dy=1.25,dz=1.45] run return 1
+execute if entity @s[tag=enemy.hitbox_type_creeper] positioned ~-0.675 ~0 ~-0.675 if entity @n[type=marker,tag=hitscan-marker,dx=1.35,dy=2.45,dz=1.35] run return 1
+execute if entity @s[tag=enemy.hitbox_type_drowned] positioned ~-0.675 ~0 ~-0.675 if entity @n[type=marker,tag=hitscan-marker,dx=1.35,dy=2.7,dz=1.35] run return 1
+execute if entity @s[tag=enemy.hitbox_type_enderman] positioned ~-0.675 ~0 ~-0.675 if entity @n[type=marker,tag=hitscan-marker,dx=1.35,dy=3.65,dz=1.35] run return 1
+execute if entity @s[tag=enemy.hitbox_type_endermite] positioned ~-0.575 ~-0.7 ~-0.575 if entity @n[type=marker,tag=hitscan-marker,dx=1.15,dy=1.05,dz=1.15] run return 1
+execute if entity @s[tag=enemy.hitbox_type_phantom] positioned ~-0.825 ~-0.5 ~-0.825 if entity @n[type=marker,tag=hitscan-marker,dx=1.65,dy=1.25,dz=1.65] run return 1
+execute if entity @s[tag=enemy.hitbox_type_rabbit] positioned ~-0.575 ~-0.5 ~-0.575 if entity @n[type=marker,tag=hitscan-marker,dx=1.15,dy=1.25,dz=1.15] run return 1
+execute if entity @s[tag=enemy.hitbox_type_ravager] positioned ~-1.35 ~0 ~-1.35 if entity @n[type=marker,tag=hitscan-marker,dx=2.7,dy=2.95,dz=2.7] run return 1
+execute if entity @s[tag=enemy.hitbox_type_skeleton] positioned ~-0.675 ~0 ~-0.675 if entity @n[type=marker,tag=hitscan-marker,dx=1.35,dy=2.74,dz=1.35] run return 1
+execute if entity @s[tag=enemy.hitbox_type_skeleton_horse] positioned ~-1.07324 ~0 ~-1.07324 if entity @n[type=marker,tag=hitscan-marker,dx=2.14648,dy=2.35,dz=2.14648] run return 1
+execute if entity @s[tag=enemy.hitbox_type_spider] positioned ~-1.075 ~-0.1 ~-1.075 if entity @n[type=marker,tag=hitscan-marker,dx=2.15,dy=1.65,dz=2.15] run return 1
+execute if entity @s[tag=enemy.hitbox_type_vex] positioned ~-0.575 ~-0.2 ~-0.575 if entity @n[type=marker,tag=hitscan-marker,dx=1.15,dy=1.55,dz=1.15] run return 1
+execute if entity @s[tag=enemy.hitbox_type_warden] positioned ~-0.825 ~0 ~-0.825 if entity @n[type=marker,tag=hitscan-marker,dx=1.65,dy=3.65,dz=1.65] run return 1
+execute if entity @s[tag=enemy.hitbox_type_wither_skeleton] positioned ~-0.725 ~0 ~-0.725 if entity @n[type=marker,tag=hitscan-marker,dx=1.45,dy=3.15,dz=1.45] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zombie_baby] positioned ~-0.525 ~-0.025 ~-0.525 if entity @n[type=marker,tag=hitscan-marker,dx=1.05,dy=1.725,dz=1.05] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zombie_scale_1_1] positioned ~-0.705 ~0 ~-0.705 if entity @n[type=marker,tag=hitscan-marker,dx=1.41,dy=2.895,dz=1.41] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zombie_scale_1_5] positioned ~-0.825 ~0 ~-0.825 if entity @n[type=marker,tag=hitscan-marker,dx=1.65,dy=3.45,dz=1.65] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zombie_scale_1_8] positioned ~-0.975 ~0 ~-0.975 if entity @n[type=marker,tag=hitscan-marker,dx=1.95,dy=4.05,dz=1.95] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zombie_scale_2] positioned ~1.15 ~0 ~-1.15 if entity @n[type=marker,tag=hitscan-marker,dx=2.3,dy=4.6,dz=2.3] run return 1
+execute if entity @s[tag=enemy.hitbox_type_zoglin] positioned ~-1.025 ~ ~-1.025 if entity @n[type=marker,tag=hitscan-marker,dx=1.15,dy=1.15,dz=1.15] run return 1
+return 0

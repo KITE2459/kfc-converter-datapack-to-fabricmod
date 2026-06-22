@@ -1,0 +1,3 @@
+data modify storage enemy data set value {health:60, speed:0.2, money:0, id:split-zombie,name:{color:white,"text":"좀비 분열체\n","bold":true}}
+
+summon zombie ~ ~ ~ {Tags:[enemy,enemy.hitbox_type_zombie_baby,enemy.target,enemy.core,enemy.data,enemy.immune.poison],NoAI:1b,Invulnerable:1b,Passengers:[{id:"minecraft:text_display",billboard:"vertical",Tags:[enemy,enemy.hitbox_type_zombie_baby,enemy.text],text:[{"color":"dark_green","text":"좀비 분열체\n","bold":true},{"color":"red","text":"Hp"},{"color":"white","text":":"},{"color":"yellow",text:"None"}],transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0.1f,0f],scale:[1f,1f,1f]}}],IsBaby:1b,equipment:{head:{id:slime_block}}}

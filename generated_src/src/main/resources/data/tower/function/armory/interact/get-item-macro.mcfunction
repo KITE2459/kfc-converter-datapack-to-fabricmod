@@ -1,0 +1,1 @@
+execute at @n[tag=armory-tower] run item replace entity @s weapon.mainhand from block ~ ~-3 ~ container.0

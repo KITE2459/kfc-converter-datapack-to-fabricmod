@@ -1,0 +1,1 @@
+$execute store result score #count tower.limit if entity @e[tag=tower.core,tag=$(model)]

@@ -1,0 +1,3 @@
+execute if entity @s[scores={enemy.skill-trigger.timer-cooldown=0}] unless entity @n[tag=tower.data,scores={tower.y=-60}] run scoreboard players set @s enemy.skill-trigger.timer-cooldown 10
+execute if entity @s[scores={enemy.skill-trigger.timer-cooldown=-20}] run scoreboard players set @n[tag=tower.data,scores={tower.y=-60}] tower.state.stun 55
+execute if entity @s[scores={enemy.skill-trigger.timer-cooldown=-40}] run scoreboard players operation @s enemy.skill-trigger.timer-cooldown = @s enemy.skill-trigger.timer

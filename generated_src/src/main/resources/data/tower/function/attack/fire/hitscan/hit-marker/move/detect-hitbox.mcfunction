@@ -1,0 +1,1 @@
+$execute as @n[tag=target_$(number),distance=..5] at @s if function tower:attack/fire/hitscan/hit-marker/move/detect-hitbox-macro run scoreboard players set #temp game.return 41

@@ -96,6 +96,17 @@ class Emitted:
 
 
 # ───────────────────────── 헬퍼 ─────────────────────────
+def _scbound(v, sentinel):
+    """점수 매칭 bound → 항상 primitive int 식으로.
+       None=개구간 센티넬(Integer.MIN/MAX_VALUE), 숫자 리터럴=그대로,
+       그 외(매크로 런타임 식, 예: macroArgs.get("x"))=Integer.parseInt(...) 로 파싱.
+       → scoreMatches(...,int,int) 단일 오버로드로 박싱 없이 매칭."""
+    if v is None:
+        return sentinel
+    sv = str(v)
+    return sv if sv.lstrip("-").isdigit() else f"Integer.parseInt({sv})"
+
+
 def jstr(s: str) -> str:
     """자바 문자열 리터럴."""
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -600,8 +611,8 @@ def at_effect_cond(raw: str) -> str | None:
     guards += [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
     guards += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
     for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
-        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        slo_j = _scbound(slo, "Integer.MIN_VALUE")
+        shi_j = _scbound(shi, "Integer.MAX_VALUE")
         guards.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
     if base == "s":
         return ('(executor instanceof net.minecraft.server.network.ServerPlayerEntity _pp && '
@@ -633,8 +644,8 @@ def at_s_selecteditem_cond(raw: str) -> str | None:
                 return None
             obj, rng = mm.group(1), mm.group(2)
             lo, hi = parse_range(rng)
-            lo_j = "null" if lo is None else f"Integer.valueOf({lo})"
-            hi_j = "null" if hi is None else f"Integer.valueOf({hi})"
+            lo_j = _scbound(lo, "Integer.MIN_VALUE")
+            hi_j = _scbound(hi, "Integer.MAX_VALUE")
             parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(obj)}, {lo_j}, {hi_j})')
     # SelectedItemSlot nbt + scores 외 다른 필터가 있으면 처리 불가(정확성 우선)
     leftover = re.sub(r'nbt=\{[^}]*\}', '', inner)
@@ -725,8 +736,8 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
         conds.append(f'!({ge})' if sel.gamemode_neg else ge)
     # 점수
     for o2, (slo, shi) in (sel.scores or {}).items():
-        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        slo_j = _scbound(slo, "Integer.MIN_VALUE")
+        shi_j = _scbound(shi, "Integer.MAX_VALUE")
         conds.append(f'KfcGen.scoreMatches(sb, {evar}.getNameForScoreboard(), '
                      f'{jstr(o2)}, {slo_j}, {shi_j})')
     # predicate (런타임 testPredicate 폴백 포함)
@@ -852,8 +863,8 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         for t in sel.tags_neg:
             parts.append(f'!executor.getCommandTags().contains({jstr(t)})')
         for o2, (slo, shi) in sel.scores.items():
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
                          f'{jstr(o2)}, {slo_j}, {shi_j})')
         rc = rotation_conds(sel, "executor")
@@ -926,8 +937,8 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
             for o2, (slo, shi) in sel.scores.items():
-                slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-                shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                slo_j = _scbound(slo, "Integer.MIN_VALUE")
+                shi_j = _scbound(shi, "Integer.MAX_VALUE")
                 pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), '
                           f'{jstr(o2)}, {slo_j}, {shi_j})')
             return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc) if pc else "true"}))'
@@ -1631,8 +1642,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             conds = [f'executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
             conds += [f'!executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
             for o2, (slo, shi) in (sel.scores or {}).items():
-                slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-                shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                slo_j = _scbound(slo, "Integer.MIN_VALUE")
+                shi_j = _scbound(shi, "Integer.MAX_VALUE")
                 conds.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
             conds += _kill_pred_guards("executor")
             conds += _selector_extra_conds(sel, "executor")
@@ -1647,8 +1658,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             return False
         em.java.extend(loop)
         for o2, (slo, shi) in (sel.scores or {}).items():
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             em.java.append(f'    if (!KfcGen.scoreMatches(sb, _k.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
         for g in _kill_pred_guards("_k"):
             em.java.append(f'    if (!({g})) continue;')
@@ -1961,8 +1972,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             em.kind = "native"; return True
         em.java.extend(lo)
         for o2, (slo, shi) in sel.scores.items():
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             em.java.append(f'    if (!KfcGen.scoreMatches(sb, _kE.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
         em.java.append('    KfcGen.killEntity(_kE);')
         em.java.append("}")
@@ -2434,8 +2445,8 @@ def emit_tellraw_title(nn, args, em, cmd):
     def _player_guards(var):
         gs = []
         for o2, (slo, shi) in (sel.scores.items() if sel and sel.scores else []):
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             gs.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
         for pid in (sel.predicates if sel else []):
             neg_p = pid.startswith("!"); key = pid[1:] if neg_p else pid
@@ -2566,8 +2577,8 @@ def _loop_score_pred_conds(sel, var: str):
        (단순 루프 빌더가 빠뜨리던 제약 - 누락 시 거짓양성). predicate 미해소면 None."""
     conds = []
     for obj_name, (slo, shi) in (sel.scores or {}).items():
-        lo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-        hi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        lo_j = _scbound(slo, "Integer.MIN_VALUE")
+        hi_j = _scbound(shi, "Integer.MAX_VALUE")
         conds.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
     if sel.predicates:
         pg = predicate_guards(sel.predicates, var, player=(sel.base in ("a", "p", "r")))
@@ -2849,8 +2860,8 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
             gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
             conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
         for o2, (slo, shi) in sel.scores.items():
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             conds.append(f'KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
         for ns, inv in _nbt_conds:
             conds.append(f'KfcGen.nbtMatches(_t, {ns}, {inv})')
@@ -2888,8 +2899,8 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         chk = f'KfcGen.entityInTypeTag(_t, {jstr(tid)})'
         em.java.append(f'    if ({"" if tneg else "!"}({chk})) continue;')
     for o2, (slo, shi) in sel.scores.items():
-        slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-        shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        slo_j = _scbound(slo, "Integer.MIN_VALUE")
+        shi_j = _scbound(shi, "Integer.MAX_VALUE")
         em.java.append(f'    if (!KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
     if sel.predicates:
         for g in predicate_guards(sel.predicates, "_t", player=False):
@@ -3390,8 +3401,8 @@ def bossbar_player_collection(sel_raw: str, var: str):
     def _score_guards():
         gs = []
         for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
-            slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-            shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
             gs.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
         return gs
 
@@ -3933,8 +3944,8 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
                 em.reason = f"scoreboard operation 다중 대상({dholder[:25]}) 타입 미해소"
                 return False
             for o2, (slo2, shi2) in (dsel.scores or {}).items():
-                slo_j = "null" if slo2 is None else f"Integer.valueOf({slo2})"
-                shi_j = "null" if shi2 is None else f"Integer.valueOf({shi2})"
+                slo_j = _scbound(slo2, "Integer.MIN_VALUE")
+                shi_j = _scbound(shi2, "Integer.MAX_VALUE")
                 body.append(f'    if (!KfcGen.scoreMatches(sb, _od.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
             body.append(f'    KfcGen.opScore(sb, _od.getNameForScoreboard(), {jstr(do)}, {jstr(op)}, {sname0}, {jstr(so)});')
             body.append("}")
@@ -4601,7 +4612,7 @@ def _v2_segments(head: list[dict]):
             i = pre_start = j
         elif node == "on":
             rel = head[i + 1].get("node") if i + 1 < len(head) else None
-            if rel not in ("passengers", "vehicle", "attacker", "target"):
+            if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller"):
                 return None
             flush(i)
             segs.append(("on", rel))
@@ -4798,7 +4809,7 @@ def _v2_fanout_as(sel_raw, exe, src, depth):
 
 def _v2_fanout_on(rel, exe, src, depth):
     ne, ns = f"_vE{depth}", f"_vS{depth}"
-    _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget"}
+    _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController"}
     if rel in _single:
         opens = [f"{{ ServerCommandSource {ns} = KfcGen.{_single[rel]}({src});",
                  f"  if ({ns} != null) {{",
@@ -4997,8 +5008,8 @@ def _emit_store_cond(head, em) -> bool:
             em.reason = f"store if score 셀렉터홀더({sh}) 미지원"
             return False
         slo, shi = parse_range(first_arg(vargs, "range") or "")
-        lo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-        hi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+        lo_j = _scbound(slo, "Integer.MIN_VALUE")
+        hi_j = _scbound(shi, "Integer.MAX_VALUE")
         basec = f"KfcGen.scoreMatches(sb, {shg}, {jstr(so)}, {lo_j}, {hi_j})"
         valexpr = f"(!({basec}) ? 1 : 0)" if negate else f"({basec} ? 1 : 0)"
     else:
@@ -5201,7 +5212,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
         rel = None
         for s in head[on_idx + 1:on_idx + 2]:
             rel = s.get("node")
-        if rel not in ("passengers", "vehicle", "attacker", "target"):
+        if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller"):
             em.reason = f"on {rel} (1차 미지원)"
             return False
         _on_depth += 1
@@ -5248,7 +5259,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
         inner_body = [re.sub(r'\bexecutor\b', oe, b) for b in inner_body]
         _on_depth -= 1
         out = []
-        _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget"}
+        _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController"}
         if rel in _single:
             out.append(f"{{ ServerCommandSource {ov} = KfcGen.{_single[rel]}({pre_src});")
             out.append(f"  if ({ov} != null) {{")
@@ -5401,8 +5412,8 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 if disc == "matches":
                     rng = next_arg("range")
                     lo, hi = parse_range(rng["raw"])
-                    lo = "null" if lo is None else f"Integer.valueOf({lo})"
-                    hi = "null" if hi is None else f"Integer.valueOf({hi})"
+                    lo = _scbound(lo, "Integer.MIN_VALUE")
+                    hi = _scbound(hi, "Integer.MAX_VALUE")
                     if ent_expr is not None:
                         # 셀렉터 홀더: neg 를 helper 안에서(null 체크 뒤) 적용 -> 빈 셀렉터는 if/unless 무관 미실행
                         c = (f'KfcGen.entityScoreMatches(sb, {ent_expr}, {jstr(tobj["raw"])}, '
@@ -5904,8 +5915,8 @@ def _emit_as_loop_recursive(line, head, tail, em, sel):
                         em.reason = "as @s predicate 미해소"; return False
                     guards += pg
                 for o2, (slo, shi) in sel.scores.items():
-                    slo_j = "null" if slo is None else f"Integer.valueOf({slo})"
-                    shi_j = "null" if shi is None else f"Integer.valueOf({shi})"
+                    slo_j = _scbound(slo, "Integer.MIN_VALUE")
+                    shi_j = _scbound(shi, "Integer.MAX_VALUE")
                     guards.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
                                   f'{jstr(o2)}, {slo_j}, {shi_j})')
                 # @s 의 distance 는 자기 자신(거리 0) -> 무시(항상 통과)
@@ -6110,8 +6121,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         _dmax = _dist_arg(_dhi)
         conds.append(f'KfcGen.inRange({pre_src}.getPosition(), en, {_dmin}, {_dmax})')
     for obj_name, (lo, hi) in sel.scores.items():
-        lo_j = "null" if lo is None else f"Integer.valueOf({lo})"
-        hi_j = "null" if hi is None else f"Integer.valueOf({hi})"
+        lo_j = _scbound(lo, "Integer.MIN_VALUE")
+        hi_j = _scbound(hi, "Integer.MAX_VALUE")
         conds.append(f'KfcGen.scoreMatches(sb, en.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
     for pid in sel.predicates:
         expr = PREDICATES.get(pid)
@@ -6758,8 +6769,8 @@ def single_entity_expr(raw: str) -> str | None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
             for o5, (sl5, sh5) in sel.scores.items():
-                sl_j = "null" if sl5 is None else f"Integer.valueOf({sl5})"
-                sh_j = "null" if sh5 is None else f"Integer.valueOf({sh5})"
+                sl_j = _scbound(sl5, "Integer.MIN_VALUE")
+                sh_j = _scbound(sh5, "Integer.MAX_VALUE")
                 pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), {jstr(o5)}, {sl_j}, {sh_j})')
             rcp = rotation_conds(sel, "_pe")
             if rcp is None:
@@ -6801,8 +6812,8 @@ def single_entity_expr(raw: str) -> str | None:
                 e = f'KfcGen.entityTypeIs(_ee, {jstr(tid)})'
                 extra.append(f'!({e})' if sel.type_neg else e)
             for o6, (sl6, sh6) in (sel.scores or {}).items():
-                sl_j = "null" if sl6 is None else f"Integer.valueOf({sl6})"
-                sh_j = "null" if sh6 is None else f"Integer.valueOf({sh6})"
+                sl_j = _scbound(sl6, "Integer.MIN_VALUE")
+                sh_j = _scbound(sh6, "Integer.MAX_VALUE")
                 extra.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
             rce = rotation_conds(sel, "_ee")
             if rce is None:
@@ -6821,8 +6832,8 @@ def single_entity_expr(raw: str) -> str | None:
             return None  # @e/@n 의 gamemode 는 미지원 - 무시 대신 거부(정확성)
         ec = []
         for o6, (sl6, sh6) in (sel.scores or {}).items():
-            sl_j = "null" if sl6 is None else f"Integer.valueOf({sl6})"
-            sh_j = "null" if sh6 is None else f"Integer.valueOf({sh6})"
+            sl_j = _scbound(sl6, "Integer.MIN_VALUE")
+            sh_j = _scbound(sh6, "Integer.MAX_VALUE")
             ec.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
         rce = rotation_conds(sel, "_ee")
         if rce is None:

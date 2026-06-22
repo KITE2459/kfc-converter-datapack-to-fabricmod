@@ -74,6 +74,27 @@ public final class KfcGen {
         return c;
     }
 
+    // ── 틱 단위 엔티티 스냅샷 캐시 ──
+    // @e/@a 스캔이 한 틱 안에서 여러 함수에 걸쳐 world.iterateEntities() 를 반복 호출하던 비용 제거.
+    // 캐시는 '엔티티 참조 목록'만 보관하고, 태그/점수/위치/nbt 필터는 호출 시점에 그 참조에서
+    // 라이브로 읽으므로 고증에 영향 없음(태그/점수 변동은 캐시를 무효화할 필요가 없다).
+    // 무효화 조건: (a) 서버 틱이 바뀜(getTicks) → 게임이 스폰/디스폰한 변화 반영,
+    //            (b) 우리 명령이 엔티티를 추가/제거(summon/lootSpawn/killEntity) → ENTITY_GEN 증가.
+    static long ENTITY_GEN = 0;
+    private static net.minecraft.server.MinecraftServer SNAP_SERVER;
+    private static int  SNAP_TICK = Integer.MIN_VALUE;
+    private static long SNAP_GEN  = -1;
+    private static java.util.List<net.minecraft.entity.Entity> SNAP_ENTITIES;
+    public static java.util.List<net.minecraft.entity.Entity> entitiesSnapshot(GameContext ctx) {
+        int t = ctx.server.getTicks();
+        if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
+            java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>();
+            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) list.add(e);
+            SNAP_ENTITIES = list; SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
+        }
+        return SNAP_ENTITIES;
+    }
+
     /** 네이티브화하지 못한 명령을 런타임에 1회 파싱·실행하는 브릿지 폴백. */
     /** caret(^) 로컬좌표 → 절대좌표. 마크 LocalCoordinates 공식 그대로.
      *  rot: Vec2f(x=pitch, y=yaw). (x,y,z) = (^left, ^up, ^forward). */
@@ -238,7 +259,7 @@ public final class KfcGen {
     /** if entity <@e/@n[...]> 범용 존재검사 — 임의 가드 람다로 전 엔티티 1개라도 매칭하는지. */
     public static boolean anyEntityWhere(GameContext ctx,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (pred.test(e)) return true;
         }
         return false;
@@ -493,7 +514,7 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (!posInRange(origin, e.getPos(), minDist, maxDist)) continue;
             out.add(e);
@@ -549,7 +570,7 @@ public final class KfcGen {
             return !ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             return true;
@@ -572,7 +593,7 @@ public final class KfcGen {
             }
             return best;
         }
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             double d = (o == null) ? 0 : e.getPos().squaredDistanceTo(o);
@@ -835,11 +856,18 @@ public final class KfcGen {
 
     // ── nbt 셀렉터: 바닐라 EntitySelectorOptions.nbt 와 동일한 NBT 부분매칭 ──
     //    (이 기능은 본질적으로 NBT 질의이므로 NbtPredicate/NbtHelper 가 충실한 구현)
+    // 기대 NBT(리터럴 문자열)는 매 호출 동일하므로 파싱 결과를 캐시 — StringNbtReader 반복 파싱 제거.
+    // 비교 입력으로만 읽기 전용 사용(NbtHelper.matches 는 expected 를 변형하지 않음)하므로 안전.
+    private static final java.util.Map<String, net.minecraft.nbt.NbtCompound> NBT_EXPECT_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
     public static boolean nbtMatches(net.minecraft.entity.Entity e, String expectedNbt, boolean inverted) {
         boolean match;
         try {
-            net.minecraft.nbt.NbtCompound expected =
-                net.minecraft.nbt.StringNbtReader.readCompound(expectedNbt);
+            net.minecraft.nbt.NbtCompound expected = NBT_EXPECT_CACHE.get(expectedNbt);
+            if (expected == null) {
+                expected = net.minecraft.nbt.StringNbtReader.readCompound(expectedNbt);
+                NBT_EXPECT_CACHE.put(expectedNbt, expected);
+            }
             net.minecraft.nbt.NbtCompound actual =
                 net.minecraft.predicate.NbtPredicate.entityToNbt(e);
             match = net.minecraft.nbt.NbtHelper.matches(expected, actual, true);
@@ -858,6 +886,7 @@ public final class KfcGen {
     public static void killEntity(net.minecraft.entity.Entity e) {
         if (e != null && !(e instanceof net.minecraft.server.network.ServerPlayerEntity)) {
             e.discard();
+            ENTITY_GEN++;
         }
     }
 
@@ -1017,6 +1046,25 @@ public final class KfcGen {
         if (!(e instanceof net.minecraft.entity.Targeter t)) return null;
         net.minecraft.entity.LivingEntity tg = t.getTarget();
         return tg == null ? null : src.withEntity(tg);
+    }
+
+    // execute on origin — 실행자가 Ownable(투사체/소환물 등)이면 그 소유자(던진/소환한 주체)로 교체.
+    //   예: ender_pearl 의 origin = 펄을 던진 플레이어. 없으면 null(미실행) — 바닐라와 동일.
+    public static net.minecraft.server.command.ServerCommandSource onOrigin(
+            net.minecraft.server.command.ServerCommandSource src) {
+        net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
+        if (!(e instanceof net.minecraft.entity.Ownable o)) return null;
+        net.minecraft.entity.Entity owner = o.getOwner();
+        return owner == null ? null : src.withEntity(owner);
+    }
+
+    // execute on controller — 탈것의 '조종하는 승객'(첫 승객)으로 교체, 없으면 null(미실행).
+    public static net.minecraft.server.command.ServerCommandSource onController(
+            net.minecraft.server.command.ServerCommandSource src) {
+        net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
+        if (e == null) return null;
+        net.minecraft.entity.Entity c = e.getControllingPassenger();
+        return c == null ? null : src.withEntity(c);
     }
 
     /** on passengers — source 엔티티의 승객 목록(엔티티만 교체, 위치/회전 유지). */
@@ -1386,7 +1434,7 @@ public final class KfcGen {
                         ent.refreshPositionAndAngles(x, y, z, ent.getYaw(), ent.getPitch());
                         return ent;
                     });
-            if (e != null) world.spawnNewEntityAndPassengers(e);
+            if (e != null) { world.spawnNewEntityAndPassengers(e); ENTITY_GEN++; }
         } catch (Exception ignored) {}
     }
 
@@ -1717,7 +1765,7 @@ public final class KfcGen {
             net.minecraft.entity.ItemEntity ie = new net.minecraft.entity.ItemEntity(
                     world, pos.x, pos.y, pos.z, st.copy());
             ie.setToDefaultPickupDelay();
-            world.spawnEntity(ie);
+            world.spawnEntity(ie); ENTITY_GEN++;
         }
     }
 
@@ -2149,6 +2197,19 @@ public final class KfcGen {
         return true;
     }
 
+    // 핫패스 점수 매칭(이 데이터팩 ~18.8만 곳): Integer 박싱 없는 primitive 오버로드.
+    // 개구간은 Integer.MIN_VALUE/MAX_VALUE 센티넬(점수 정수범위와 수학적으로 동일).
+    // read() 의 Integer 반환 박싱도 우회해 호출당 박싱 0.
+    public static boolean scoreMatches(ServerScoreboard sb, String holder, String o,
+                                       int min, int max) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return false;
+        ReadableScoreboardScore sc = sb.getScore(holderOf(holder), ob);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        return v >= min && v <= max;
+    }
+
     /** if score <a> OP <b> (비교형). 둘 중 하나라도 값 없으면 false(=mcfunction 시맨틱). */
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, String hb, String ob) {
@@ -2250,7 +2311,7 @@ public final class KfcGen {
             return !ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             return true;
@@ -2267,7 +2328,7 @@ public final class KfcGen {
                     en -> entityInTypeTag(en, tagId) && matchTags(en, tagsPos, tagsNeg)
                           && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!entityInTypeTag(e, tagId)) continue;
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
@@ -2309,7 +2370,7 @@ public final class KfcGen {
             }
             return best;
         }
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
@@ -2404,7 +2465,7 @@ public final class KfcGen {
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
@@ -2721,7 +2782,7 @@ public final class KfcGen {
     /** if items entity @e/@n <slot> <pred> : 어떤 엔티티든 슬롯에 일치 아이템 보유(태그 필터 반영). */
     public static boolean anyEntityItemsMatch(GameContext ctx, String[] tagsPos, String[] tagsNeg,
                                               String slot, String itemId, String customNbt) {
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             boolean ok = true;
             for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
             if (ok) for (String t : tagsNeg) if (e.getCommandTags().contains(t)) { ok = false; break; }
@@ -2781,7 +2842,7 @@ public final class KfcGen {
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTags(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);

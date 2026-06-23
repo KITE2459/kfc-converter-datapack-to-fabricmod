@@ -95,6 +95,27 @@ public final class KfcGen {
         return SNAP_ENTITIES;
     }
 
+    // ── 틱 내 스폰/킬에 의한 스냅샷 무효화(thrashing) 제거 ──
+    // TD 류 팩은 한 틱에 총알·이펙트를 대량 스폰/제거한다. 기존엔 그때마다 ENTITY_GEN++ 로
+    // 스냅샷을 통째로 무효화 → 같은 틱 안에서 nearest/as @e 가 호출될 때마다 world 전체를
+    // 재수집(O(전체엔티티)) 했다. 우리 명령의 스폰/킬은 '어떤 엔티티가' 바뀌었는지 알 수 있으므로
+    // 스냅샷을 통째로 버리지 말고 증분 갱신한다. (바닐라/브릿지 스폰은 틱 경계에서 재수집되어
+    // 정확성 유지 — 기존 per-tick 스냅샷 시맨틱 그대로.)
+    static void snapAdd(net.minecraft.entity.Entity e) {
+        ENTITY_GEN++;                        // gen 은 단조 증가 유지(다른 캐시/판정과 일관)
+        if (e == null || SNAP_ENTITIES == null) return;
+        if (e.hasPassengers()) return;       // 탑승자 동반 스폰(드묾) → SNAP_GEN 미갱신 = 전체 재수집 폴백
+        SNAP_ENTITIES.add(e);
+        SNAP_GEN = ENTITY_GEN;               // 증분 반영했으므로 현재 gen 으로 '유효' 표시
+    }
+    static void snapRemove(net.minecraft.entity.Entity e) {
+        ENTITY_GEN++;
+        if (e == null || SNAP_ENTITIES == null) return;
+        if (e.hasPassengers()) return;       // 탑승자 동반 제거 → 전체 재수집 폴백
+        SNAP_ENTITIES.remove(e);
+        SNAP_GEN = ENTITY_GEN;
+    }
+
     /** 네이티브화하지 못한 명령을 런타임에 1회 파싱·실행하는 브릿지 폴백. */
     /** caret(^) 로컬좌표 → 절대좌표. 마크 LocalCoordinates 공식 그대로.
      *  rot: Vec2f(x=pitch, y=yaw). (x,y,z) = (^left, ^up, ^forward). */
@@ -907,7 +928,7 @@ public final class KfcGen {
     public static void killEntity(net.minecraft.entity.Entity e) {
         if (e != null && !(e instanceof net.minecraft.server.network.ServerPlayerEntity)) {
             e.discard();
-            ENTITY_GEN++;
+            snapRemove(e);
         }
     }
 
@@ -996,6 +1017,19 @@ public final class KfcGen {
         double y1 = Math.min(o.y, o.y + dy), y2 = Math.max(o.y, o.y + dy) + 1;
         double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
         return p.x >= x1 && p.x < x2 && p.y >= y1 && p.y < y2 && p.z >= z1 && p.z < z2;
+    }
+    /** x,y,z,dx,dy,dz 볼륨 셀렉터 매칭. 바닐라는 발 좌표(점)가 아니라 **엔티티 히트박스가
+     *  볼륨 박스와 교차**하는지로 판정한다(EntitySelectorReader: box.intersects(getBoundingBox)).
+     *  점 기준이면 카트 탑승 등으로 발 y 가 박스 하한 아래로 살짝 내려갈 때 오탈락한다(방장 인식 버그).
+     *  박스 지오메트리(min, max+1)는 anyEntityInBox/allEntitiesInBox(getOtherEntities)와 동일. */
+    public static boolean posInBox(net.minecraft.util.math.Vec3d o, double dx, double dy, double dz,
+                                   net.minecraft.entity.Entity e) {
+        if (e == null) return false;
+        double x1 = Math.min(o.x, o.x + dx), x2 = Math.max(o.x, o.x + dx) + 1;
+        double y1 = Math.min(o.y, o.y + dy), y2 = Math.max(o.y, o.y + dy) + 1;
+        double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
+        return new net.minecraft.util.math.Box(x1, y1, z1, x2, y2, z2)
+                .intersects(e.getBoundingBox());
     }
     public static boolean anyEntityInBox(GameContext ctx, net.minecraft.util.math.Vec3d o,
             net.minecraft.entity.EntityType<?>[] types,
@@ -1455,7 +1489,7 @@ public final class KfcGen {
                         ent.refreshPositionAndAngles(x, y, z, ent.getYaw(), ent.getPitch());
                         return ent;
                     });
-            if (e != null) { world.spawnNewEntityAndPassengers(e); ENTITY_GEN++; }
+            if (e != null) { world.spawnNewEntityAndPassengers(e); snapAdd(e); }
         } catch (Exception ignored) {}
     }
 
@@ -1786,7 +1820,7 @@ public final class KfcGen {
             net.minecraft.entity.ItemEntity ie = new net.minecraft.entity.ItemEntity(
                     world, pos.x, pos.y, pos.z, st.copy());
             ie.setToDefaultPickupDelay();
-            world.spawnEntity(ie); ENTITY_GEN++;
+            world.spawnEntity(ie); snapAdd(ie);
         }
     }
 
@@ -3109,6 +3143,25 @@ public final class KfcGen {
         if (appendAtPath(root, path, elem, prepend)) storageSave(server, id, root);
     }
 
+    /** data modify <path> merge value <compound> : 경로의 컴파운드(없으면 생성)에 깊은 병합.
+     *  바닐라 MERGE 연산: path.getOrInit(NbtCompound::new) 후 각 대상에 copyFrom(재귀 병합). */
+    private static boolean mergeAtPath(net.minecraft.nbt.NbtElement root, String path,
+                                       net.minecraft.nbt.NbtElement val) {
+        if (!(val instanceof net.minecraft.nbt.NbtCompound vc)) return false;
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
+        if (p == null) return false;
+        try {
+            boolean changed = false;
+            for (net.minecraft.nbt.NbtElement el : p.getOrInit(root, net.minecraft.nbt.NbtCompound::new)) {
+                if (el instanceof net.minecraft.nbt.NbtCompound cc) {
+                    cc.copyFrom((net.minecraft.nbt.NbtCompound) vc.copy());
+                    changed = true;
+                }
+            }
+            return changed;
+        } catch (Exception e) { return false; }
+    }
+
     public static void nbtAppendEntity(net.minecraft.entity.Entity e, String path,
                                        net.minecraft.nbt.NbtElement elem, boolean prepend) {
         if (e == null || elem == null) return;
@@ -3165,11 +3218,7 @@ public final class KfcGen {
     }
 
     public static int storageGetNumber(net.minecraft.server.MinecraftServer server, String id, String path) {
-        net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
-        Object[] d = descend(root, path, false);
-        if (d == null) return 0;
-        net.minecraft.nbt.NbtCompound parent = (net.minecraft.nbt.NbtCompound) d[0];
-        return parent.getInt((String) d[1], 0);
+        return (int) nbtNum(getAtPath(storageRoot(server, id), path));  // NbtPath: 인덱스/필터 경로 정확
     }
 
     /** NbtElement → double(숫자형 아니면 0). */
@@ -3204,21 +3253,19 @@ public final class KfcGen {
         return nbtNum(getAtPath(storageRoot(server, id), path));
     }
 
+    /** /data get <path> <scale> 의 정수 결과 = floor(value*scale).
+     *  바닐라는 MathHelper.floor(내림)을 쓴다(attribute get 의 0방향 절삭과 다름, MC-279197).
+     *  공식은 위키 명시: n = value*scale; out = n < (int)n ? (int)n-1 : (int)n  (= 음수 내림). */
+    public static int floorScale(double value, double scale) {
+        double n = value * scale;
+        return n < (int) n ? (int) n - 1 : (int) n;
+    }
+
     public static void storagePutNumber(net.minecraft.server.MinecraftServer server, String id,
                                         String path, double value, String type) {
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
-        Object[] d = descend(root, path, true);
-        net.minecraft.nbt.NbtCompound parent = (net.minecraft.nbt.NbtCompound) d[0];
-        String key = (String) d[1];
-        switch (type) {
-            case "float":  parent.putFloat(key, (float) value); break;
-            case "double": parent.putDouble(key, value); break;
-            case "byte":   parent.putByte(key, (byte) value); break;
-            case "short":  parent.putShort(key, (short) value); break;
-            case "long":   parent.putLong(key, (long) value); break;
-            default:       parent.putInt(key, (int) value); break;
-        }
-        storageSave(server, id, root);
+        if (root == null) root = new net.minecraft.nbt.NbtCompound();
+        if (putAtPath(root, path, numberNbt(type, value))) storageSave(server, id, root);  // NbtPath
     }
 
     /** 임의 SNBT 값을 경로에 기록. mode: set | append | prepend | merge.
@@ -3238,29 +3285,17 @@ public final class KfcGen {
             if (tmpl == SNBT_INVALID) return;
             net.minecraft.nbt.NbtElement val = tmpl.copy();
             net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
-            Object[] d = descend(root, path, true);
-            net.minecraft.nbt.NbtCompound parent = (net.minecraft.nbt.NbtCompound) d[0];
-            String key = (String) d[1];
+            if (root == null) root = new net.minecraft.nbt.NbtCompound();
+            // 바닐라 NbtPath(인덱스 round[10]/필터 foo[{id:1}] 정확 처리) 사용 — descend(단순 . split)는
+            // 인덱스를 키 이름으로 오해해 NBT 구조가 바닐라와 달라졌다(storage 경로의 86%가 인덱스 포함).
+            boolean changed;
             switch (mode) {
-                case "append", "prepend" -> {
-                    net.minecraft.nbt.NbtElement cur = parent.get(key);
-                    net.minecraft.nbt.NbtList list =
-                            (cur instanceof net.minecraft.nbt.NbtList l) ? l : new net.minecraft.nbt.NbtList();
-                    if ("prepend".equals(mode)) list.add(0, val); else list.add(val);
-                    parent.put(key, list);
-                }
-                case "merge" -> {
-                    net.minecraft.nbt.NbtElement cur = parent.get(key);
-                    if (cur instanceof net.minecraft.nbt.NbtCompound cc
-                            && val instanceof net.minecraft.nbt.NbtCompound vc) {
-                        cc.copyFrom(vc);
-                    } else {
-                        parent.put(key, val);
-                    }
-                }
-                default -> parent.put(key, val);   // set
+                case "append"  -> changed = appendAtPath(root, path, val, false);
+                case "prepend" -> changed = appendAtPath(root, path, val, true);
+                case "merge"   -> changed = mergeAtPath(root, path, val);
+                default        -> changed = putAtPath(root, path, val);   // set
             }
-            storageSave(server, id, root);
+            if (changed) storageSave(server, id, root);
         } catch (Exception ignored) {}
     }
 
@@ -3280,10 +3315,10 @@ public final class KfcGen {
 
     public static void storageRemovePath(net.minecraft.server.MinecraftServer server, String id, String path) {
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
-        Object[] d = descend(root, path, false);
-        if (d == null) return;
-        ((net.minecraft.nbt.NbtCompound) d[0]).remove((String) d[1]);
-        storageSave(server, id, root);
+        if (root == null) return;
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);  // 인덱스/필터 경로 정확
+        if (p == null) return;
+        try { if (p.remove(root) > 0) storageSave(server, id, root); } catch (Exception ignored) {}
     }
 
     // ──────────────── entity NBT (data ... entity @s <path>) ────────────────
@@ -3292,9 +3327,7 @@ public final class KfcGen {
     public static int entityGetNumber(net.minecraft.entity.Entity e, String path) {
         net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(nbt);
-        Object[] d = descend(nbt, path, false);
-        if (d == null) return 0;
-        return ((net.minecraft.nbt.NbtCompound) d[0]).getInt((String) d[1], 0);
+        return (int) nbtNum(getAtPath(nbt, path));   // NbtPath: 인덱스/필터 경로 정확
     }
 
     /** null-safe 버전 — 셀렉터 대상이 없으면 0. */
@@ -3306,9 +3339,7 @@ public final class KfcGen {
     public static void entityPutNumber(net.minecraft.entity.Entity e, String path, double value) {
         net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(nbt);
-        Object[] d = descend(nbt, path, true);
-        ((net.minecraft.nbt.NbtCompound) d[0]).putInt((String) d[1], (int) value);
-        e.readNbt(nbt);
+        if (putAtPath(nbt, path, net.minecraft.nbt.NbtInt.of((int) value))) e.readNbt(nbt);   // NbtPath
     }
 
     /** data modify entity <e> <path> set value <snbt> — 임의 SNBT 값 기록. */
@@ -3346,9 +3377,7 @@ public final class KfcGen {
             if (displaySetFast(e, path.replace(" ", ""), val)) return;
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
-            Object[] d = descend(nbt, path, true);
-            ((net.minecraft.nbt.NbtCompound) d[0]).put((String) d[1], val);
-            e.readNbt(nbt);
+            if (putAtPath(nbt, path, val)) e.readNbt(nbt);   // NbtPath: 인덱스/필터 경로 정확
         } catch (Exception ignored) {}
     }
 
@@ -3400,10 +3429,9 @@ public final class KfcGen {
         }
         net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(nbt);
-        Object[] d = descend(nbt, path, false);
-        if (d == null) return;
-        ((net.minecraft.nbt.NbtCompound) d[0]).remove((String) d[1]);
-        e.readNbt(nbt);
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);   // NbtPath
+        if (p == null) return;
+        try { if (p.remove(nbt) > 0) e.readNbt(nbt); } catch (Exception ignored) {}
     }
 
     // ──────────────── 매크로 인자 (function X with .../{...}) ────────────────

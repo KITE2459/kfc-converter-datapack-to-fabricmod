@@ -723,7 +723,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
     # 박스(dx/dy/dz)
     if sel.volume is not None:
         dx, dy, dz = sel.volume
-        conds.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, {evar}.getPos())')
+        conds.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, {evar})')
     # 거리
     if sel.distance is not None:
         lo, hi = sel.distance
@@ -810,7 +810,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         dx, dy, dz = sel.volume
         pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
         pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
-        pc.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, _pe.getPos())')
+        pc.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, _pe)')
         if sel.gamemode is not None:
             ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
             pc.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -2631,7 +2631,7 @@ def _entity_loop_open_core(sel, var: str):
         if sel.volume is not None:
             dx, dy, dz = sel.volume
             conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, '
-                         f'{dx}, {dy}, {dz}, {var}.getPos())')
+                         f'{dx}, {dy}, {dz}, {var})')
         if sel.gamemode is not None:
             ge = f'KfcGen.gamemodeIs({var}, {jstr(sel.gamemode)})'
             conds.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -6118,7 +6118,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     if sel.volume is not None:
         _vdx, _vdy, _vdz = sel.volume
         conds.append(f'KfcGen.posInBox({box_origin_expr(sel, pre_src)}, '
-                     f'{_vdx}, {_vdy}, {_vdz}, en.getPos())')
+                     f'{_vdx}, {_vdy}, {_vdz}, en)')
     # distance= 필터 - 바닐라는 '소스 위치' 기준 (executor 위치 아님)
     if sel.distance:
         _dlo, _dhi = sel.distance
@@ -6240,8 +6240,11 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         else:
             if lim:
                 out.append("{ int _lim = 0;")
-            out.append("for (Entity e : ctx.world.iterateEntities()) {")
-            out.append("    if (e == null) continue;   // iterateEntities() 가 null 슬롯을 낼 수 있음(NPE 방지)")
+            # 틱 단위 스냅샷 사용: 한 틱 안 다수의 as @e 루프가 world.iterateEntities() 를
+            # 매번 재순회하던 비용 제거(enemy:tick 등 매 틱 수십 회). 스냅샷은 '루프 시작 시점
+            # 1회 해소' 라 바닐라 as @e 시맨틱(순회 중 스폰 미포함)에 오히려 더 정확하다.
+            # 태그/점수/위치 필터는 참조에서 라이브로 읽으므로 고증 영향 없음.
+            out.append("for (Entity e : KfcGen.entitiesSnapshot(ctx)) {")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
             out.append("    " + src_line)
             out.extend(mr1)
@@ -6369,8 +6372,8 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
                     _tp = java_str_array(_ssel.tags_pos); _tn = java_str_array(_ssel.tags_neg)
                     dst_writer = lambda valexpr: (
                         f'{{ int _stv = {valexpr};'
-                        f' for (net.minecraft.entity.Entity _se : ctx.world.iterateEntities())'
-                        f' if (_se != null && KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
+                        f' for (net.minecraft.entity.Entity _se : KfcGen.entitiesSnapshot(ctx))'
+                        f' if (KfcGen.entityHasTags(_se, {_tp}, {_tn}))'
                         f' KfcGen.setScore(sb, _se.getNameForScoreboard(), {jstr(obj)}, _stv); }}')
                 else:
                     em.reason = f"store score 대상이 셀렉터({holder})"
@@ -6525,14 +6528,10 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
         tgtkind = nn[2]  # entity | storage
         path = first_arg(args, "path")
         scale_arg = first_arg(args, "scale") or "1"
-        # data get 의 결과 = floor(value * scale). getAtPath(NbtPath) 라 리스트 인덱스도 지원.
+        # data get 의 결과 = floor(value * scale) (바닐라 MathHelper.floor; (int) 절삭 아님 - 음수에서 차이).
+        # getAtPath(NbtPath) 라 리스트 인덱스(Rotation[0])도 지원.
         def _scaled_get(g):
-            try:
-                if float(scale_arg) == 1.0:
-                    return f"(int)({g})"
-            except ValueError:
-                pass
-            return f"(int)(({g}) * {scale_arg})"
+            return f"KfcGen.floorScale({g}, {scale_arg})"
         if tgtkind == "entity":
             sel = first_arg(args, "target")
             if sel == "@s":

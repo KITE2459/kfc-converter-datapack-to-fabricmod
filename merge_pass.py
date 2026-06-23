@@ -433,6 +433,116 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
     return {"buckets": written, "functions": len(classes)}
 
 
+# ═══════════════════════ 메모리 버킷화 (디스크 왕복 제거) ═══════════════════════
+# generate 가 함수별 .java 를 디스크에 쓰면, 위 bucketize 는 그걸 전부 되읽고(load_tree)
+# 버킷으로 합친 뒤 원본 .java 를 다시 삭제한다 — 대형 팩(수십만 함수)에서 '쓰기+되읽기+삭제'
+# 왕복이 generate I/O 의 주 비용이다. 이 함수는 메모리상의 생성 클래스 레코드(Cls, path=None)
+# 에서 곧장 버킷 .java 를 생성해 그 왕복을 없앤다. 산출(버킷 클래스 바이트)은 파일 기반
+# bucketize 와 동일하다(동일 정렬·동일 할당·동일 재작성).
+#   · records: 'Auto-generated from datapack function' 클래스들(=per-함수 생성물)만.
+#              stub(브릿지)·KfcGen·ModEntry 는 기존과 동일하게 디스크 파일로 남는다.
+#   · 비생성 on-disk 파일(ModEntry/stub 등)의 호출부 재작성은 파일 기반과 동일하게 수행.
+def bucketize_records(records, src_root: Path, group: str,
+                      bucket_max_fns: int = 200, bucket_max_bytes: int = 350 * 1024,
+                      method_cap: int = METHOD_CAP, verbose: bool = True):
+    src_root = Path(src_root)
+    records = [c for c in records if getattr(c, "fid", None)]
+    if not records:
+        return {"buckets": 0, "functions": 0, "bridged": 0}
+
+    # 1) 오버사이즈(>64KB 메서드) → mcfunction 브릿지 (메모리상 text 치환; 기준은 파일 기반과 동일)
+    bridged = 0
+    for c in records:
+        if c.size > method_cap:
+            c.text = bridge_oversized(c)
+            c.size = len(c.text.encode("utf-8"))
+            bridged += 1
+            if verbose:
+                print(f"  [bridge>64KB] {c.fid}")
+
+    # 2) 결정적 순서(파일 기반 bucketize 와 동일: fqcn 정렬)
+    items = sorted(records, key=lambda c: c.fqcn)
+
+    # 3) 버킷 할당 (동일 규칙: ≤bucket_max_fns 개 / ≤bucket_max_bytes)
+    buckets = []
+    cur = []; cur_bytes = 0
+    for c in items:
+        if cur and (len(cur) >= bucket_max_fns or cur_bytes + c.size > bucket_max_bytes):
+            buckets.append(cur); cur = []; cur_bytes = 0
+        cur.append(c); cur_bytes += c.size
+    if cur:
+        buckets.append(cur)
+
+    # 4) fqcn → (bucketFQCN, mang) 전역 맵 + 버킷 멤버 메서드 추출
+    bucket_pkg = f"{group}.buckets"
+    remap = {}
+    bucket_of = {}
+    for bi, group_cls in enumerate(buckets):
+        cls_name = f"Bucket{bi}"
+        bfqcn = f"{bucket_pkg}.{cls_name}"
+        members = []; imports = set()
+        for c in group_cls:
+            mang = _mangle(c.fid)
+            two = _extract_two_methods(c.text, mang)
+            if two is None:
+                continue
+            ex_t, rt_t = two
+            members.append((c, mang, ex_t, rt_t))
+            imports.update(_imports_of(c.text))
+            remap[c.fqcn] = (bfqcn, mang)
+        bucket_of[bi] = (cls_name, members, imports)
+
+    # 5) 전역 호출 재작성기 (<oldFQCN>.execute( -> <bfqcn>.<mang>_execute()
+    call_re = re.compile(r'([A-Za-z_][\w.]+)\.(execute|executeReturn)\s*\(')
+    def rewrite_calls(text):
+        def _r(m):
+            fq, meth = m.group(1), m.group(2)
+            if fq in remap:
+                bfqcn, mang = remap[fq]
+                return f'{bfqcn}.{mang}_{meth}('
+            return m.group(0)
+        return call_re.sub(_r, text)
+
+    # 6) 버킷 클래스 작성 (파일 기반 bucketize 와 동일 템플릿)
+    bucket_dir = src_root / Path(*bucket_pkg.split("."))
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+    base_imp = {f"{group}.generated.KfcGen", "net.minecraft.server.command.ServerCommandSource"}
+    written = 0
+    for bi, (cls_name, members, imports) in bucket_of.items():
+        body_methods = []
+        for (c, mang, ex_t, rt_t) in members:
+            body_methods.append("    " + rewrite_calls(ex_t).strip())
+            body_methods.append("    " + rewrite_calls(rt_t).strip())
+        imp_lines = sorted(set(l[len("import "):].rstrip(";") for l in imports) | base_imp)
+        proj = [i for i in imp_lines if i.startswith(group)]
+        mc = [i for i in imp_lines if not i.startswith(group)]
+        import_block = "\n".join(f"import {i};" for i in proj + mc)
+        code = (f"package {bucket_pkg};\n\n{import_block}\n\n"
+                f"/** Auto-bucketed: {len(members)} datapack functions. */\n"
+                f"public final class {cls_name} {{\n"
+                f"    private {cls_name}() {{ throw new UnsupportedOperationException(); }}\n\n"
+                + "\n\n".join(body_methods) + "\n}\n")
+        (bucket_dir / f"{cls_name}.java").write_text(code, encoding="utf-8")
+        written += 1
+
+    # 7) 비생성 on-disk 파일(ModEntry/stub 등) 호출 재작성 (KfcGen·버킷 제외) — 파일 기반과 동일
+    for jf in src_root.rglob("*.java"):
+        if jf.parent == bucket_dir:
+            continue
+        if "generated" in jf.parts and jf.stem == "KfcGen":
+            continue
+        t = jf.read_text(encoding="utf-8")
+        nt = rewrite_calls(t)
+        if nt != t:
+            jf.write_text(nt, encoding="utf-8")
+
+    if verbose:
+        print(f"[bucketize:mem] {len(records)} functions -> {written} bucket classes "
+              f"(<= {bucket_max_fns} fns / {bucket_max_bytes//1024}KB each), bridged {bridged} "
+              f"(no per-function file round-trip)")
+    return {"buckets": written, "functions": len(records), "bridged": bridged}
+
+
 def run_postpass(src_root: Path, group: str, pins: set | None = None,
                  strategy: str = "bucket", bucket_threshold: int = 3000,
                  verbose: bool = True):

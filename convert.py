@@ -386,6 +386,15 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     generated_fids = set()
     fn_count = 0
 
+    # ── [A] 메모리 버킷화 경로 ──
+    # merge(기본·버킷) 시 함수별 .java 를 디스크에 쓰지 않고 메모리(_records)에 모았다가
+    # pass-3 에서 한 번에 버킷 클래스로 직접 생성한다. 기존엔 188K 개별 파일을 쓰고(pass-2)
+    # → bucketize 가 전부 되읽고 → 버킷으로 합치고 → 188K 를 다시 삭제하는 왕복이 있었다.
+    # 이 왕복(대형 팩 수십만 회 파일 연산)을 제거한다. 산출 버킷은 바이트 동일.
+    # merge=False(--no-merge) 면 함수별 .java 자체가 산출물이므로 기존대로 디스크에 쓴다.
+    import merge_pass as _mp_mod
+    _records = [] if merge else None
+
     # 워커 수 결정: 기본은 '실제 사용 가능한 최대 코어'. KFC_JOBS 로 명시 시 그 값.
     def _usable_cpus() -> int:
         # 우선순위: 프로세스가 실제 스케줄 가능한 코어 수 -> cpu_count -> 1.
@@ -421,9 +430,13 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         fid, pkg, cls, code, nat, gat, br, full = res[:8]
         if len(res) > 8 and res[8]:
             called.update(res[8])          # raw 워커가 모은 호출대상 합치기
-        pkg_dir = src_root / Path(*pkg.split("."))
-        pkg_dir.mkdir(parents=True, exist_ok=True)
-        (pkg_dir / f"{cls}.java").write_text(code, encoding="utf-8")
+        if _records is not None:
+            # [A] 디스크 미기록: 메모리 누적(Cls 가 code 텍스트에서 fid/pkg/cls/macro 파싱).
+            _records.append(_mp_mod.Cls(None, code))
+        else:
+            pkg_dir = src_root / Path(*pkg.split("."))
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / f"{cls}.java").write_text(code, encoding="utf-8")
         stats["native"] += nat
         stats["gated"] += gat
         stats["bridge"] += br
@@ -530,13 +543,27 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     if merge:
         try:
             import merge_pass
-            pins = set(tags.get("tick", [])) | set(tags.get("load", []))
-            mstats = merge_pass.run_postpass(src_root, group, pins=pins,
-                                             strategy="bucket", verbose=True)
+            if _records is not None:
+                # [A] 메모리 경로: 디스크 왕복 없이 누적 레코드에서 바로 버킷 생성.
+                #     (ModEntry/stub 등 on-disk 비생성 파일의 호출부도 여기서 재작성됨.)
+                mstats = merge_pass.bucketize_records(_records, src_root, group, verbose=True)
+            else:
+                pins = set(tags.get("tick", [])) | set(tags.get("load", []))
+                mstats = merge_pass.run_postpass(src_root, group, pins=pins,
+                                                 strategy="bucket", verbose=True)
             print(f"[generate] pass-3 postprocess(bucket): {mstats}")
         except Exception as _me:
             import traceback; traceback.print_exc()
             print(f"[generate][warn] bucket pass skipped due to error: {_me}")
+            # [A] 폴백: 메모리 경로 실패 시, 누적 레코드를 함수별 .java 로 흘려 써서
+            #     최소한 (버킷 없는) 빌드 가능한 산출을 보장한다(= --no-merge 와 동급).
+            if _records is not None:
+                for c in _records:
+                    pkg_dir = src_root / Path(*c.package.split("."))
+                    pkg_dir.mkdir(parents=True, exist_ok=True)
+                    p = pkg_dir / f"{c.cls}.java"
+                    if not p.exists():
+                        p.write_text(c.text, encoding="utf-8")
 
     print(f"[generate] {fn_count} classes -> {src_root}")
     tot = sum(stats.values())

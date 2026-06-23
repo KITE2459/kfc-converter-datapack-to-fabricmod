@@ -630,8 +630,12 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.fork = true
     options.forkOptions.memoryMaximumSize = '6g'
-    // 초대형(수만~십수만 클래스) 팩이면 증분분석이 메모리만 쓰므로 아래 주석 해제:
-    // options.incremental = false
+    // 초대형(수만~십수만 클래스) 생성 트리 최적화:
+    //  · 증분 컴파일 분석은 '재빌드' 시 변경분만 다시 컴파일하려는 용도라, 매번 새로
+    //    생성되는 클린 트리에선 ABI 의존 그래프 구축에 시간·메모리만 쓰고 이득이 없다 → 끈다.
+    //  · 이 생성 코드엔 애너테이션 프로세서가 없으므로 프로세싱 스캔도 생략(-proc:none).
+    options.incremental = false
+    options.compilerArgs += ['-proc:none']
 }
 """
 

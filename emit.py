@@ -6791,6 +6791,19 @@ def single_entity_expr(raw: str) -> str | None:
             guards.append(f'executor.getCommandTags().contains({jstr(t)})')
         for t in sel.tags_neg:
             guards.append(f'!executor.getCommandTags().contains({jstr(t)})')
+        # scores={obj=N..M} 가드 - 이전엔 @s 분기에서 통째로 누락되어
+        # `rotated as @s[...,scores=...]` / `facing entity @s[...]` 등에서 점수 필터가
+        # 사라지고 모든 분기가 무조건 실행됐다(예: loop-main=0/1 동시 실행 -> rightspeed 상쇄).
+        # 다른 셀렉터 분기(@p/@e)와 동일하게 scoreMatches 가드를 적용해 바닐라 무결성 회복.
+        for o2, (slo2, shi2) in (sel.scores or {}).items():
+            slo_j = _scbound(slo2, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi2, "Integer.MAX_VALUE")
+            guards.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
+                          f'{jstr(o2)}, {slo_j}, {shi_j})')
+        # gamemode= 가드 (@s 가 플레이어일 때) - 마찬가지로 누락되어 있던 제약 복원.
+        if sel.gamemode is not None:
+            ge = f'KfcGen.gamemodeIs(executor, {jstr(sel.gamemode)})'
+            guards.append(f'!({ge})' if sel.gamemode_neg else ge)
         if sel.type_id and not sel.type_is_tag:
             jt = entity_type_java(sel.type_id)
             if not jt:

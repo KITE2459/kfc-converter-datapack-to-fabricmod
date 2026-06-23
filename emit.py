@@ -5017,6 +5017,37 @@ def _emit_store_cond(head, em) -> bool:
         hi_j = _scbound(shi, "Integer.MAX_VALUE")
         basec = f"KfcGen.scoreMatches(sb, {shg}, {jstr(so)}, {lo_j}, {hi_j})"
         valexpr = f"(!({basec}) ? 1 : 0)" if negate else f"({basec} ? 1 : 0)"
+    elif ctype == "data":
+        # store result ... if data <entity|storage> <path> (run 없음) -> 매칭 원소 수 저장
+        # (unless 면 0개일 때 1 else 0). 바닐라 if data 의 result = NbtPath.count.
+        kind3 = vnn[ci + 2] if ci + 2 < len(vnn) else None
+        pth = first_arg(vargs, "path")
+        if not pth:
+            em.reason = "store if data 경로 없음"
+            return False
+        if kind3 == "entity":
+            ent = first_arg(vargs, "source") or first_arg(vargs, "target")
+            if not ent:
+                em.reason = "store if data entity 대상 없음"
+                return False
+            if ent == "@s":
+                cexpr = f'KfcGen.entityPathCount(executor, {jstr(pth)})'
+            else:
+                eexpr = single_entity_expr(ent)
+                if eexpr is None:
+                    em.reason = f"store if data entity 셀렉터({ent[:20]}) 미해소"
+                    return False
+                cexpr = f'KfcGen.entityPathCount({eexpr}, {jstr(pth)})'
+        elif kind3 == "storage":
+            sid = first_arg(vargs, "source") or first_arg(vargs, "target")
+            if not sid:
+                em.reason = "store if data storage id 없음"
+                return False
+            cexpr = f'KfcGen.storagePathCount(server, {jstr(sid)}, {jstr(pth)})'
+        else:
+            em.reason = f"store if data {kind3 or '?'} 미지원"
+            return False
+        valexpr = f"({cexpr} == 0 ? 1 : 0)" if negate else cexpr
     else:
         em.reason = f"store if {ctype} <조건> 미지원"
         return False
@@ -6241,10 +6272,12 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             if lim:
                 out.append("{ int _lim = 0;")
             # 틱 단위 스냅샷 사용: 한 틱 안 다수의 as @e 루프가 world.iterateEntities() 를
-            # 매번 재순회하던 비용 제거(enemy:tick 등 매 틱 수십 회). 스냅샷은 '루프 시작 시점
-            # 1회 해소' 라 바닐라 as @e 시맨틱(순회 중 스폰 미포함)에 오히려 더 정확하다.
-            # 태그/점수/위치 필터는 참조에서 라이브로 읽으므로 고증 영향 없음.
-            out.append("for (Entity e : KfcGen.entitiesSnapshot(ctx)) {")
+            # 매번 재순회하던 비용 제거(enemy:tick 등 매 틱 수십 회).
+            # 단, 본문이 임의 명령(summon/kill/run function)이라 순회 중 엔티티 집합이 바뀔 수 있다.
+            # 바닐라 as @e 는 '선택 시점에 고정된 집합' 을 순회(루프 중 스폰/킬 무관)하므로,
+            # 공유 스냅샷을 '복사' 해서 돈다 → 고증 정확 + ConcurrentModificationException 방지.
+            # (복사는 얕은 참조 복사라 저렴; 필터/태그/위치는 참조에서 라이브로 읽어 영향 없음.)
+            out.append("for (Entity e : new java.util.ArrayList<>(KfcGen.entitiesSnapshot(ctx))) {")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
             out.append("    " + src_line)
             out.extend(mr1)

@@ -3030,6 +3030,24 @@ public final class KfcGen {
         return nbtGetStorage(server, id, path) != null;
     }
 
+    /** store result ... if data <entity|storage> <path> (run 없음) 의 값 = 경로 매칭 원소 수.
+     *  바닐라는 if data 의 result 로 NbtPath.count(매칭 개수)를 쓴다. unless 면 0개일 때 1 else 0. */
+    public static int entityPathCount(net.minecraft.entity.Entity e, String path) {
+        if (e == null) return 0;
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
+        if (p == null) return 0;
+        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
+        e.writeNbt(nbt);
+        try { return p.count(nbt); } catch (Exception ex) { return 0; }
+    }
+    public static int storagePathCount(net.minecraft.server.MinecraftServer server, String id, String path) {
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
+        if (p == null) return 0;
+        net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+        if (root == null) return 0;
+        try { return p.count(root); } catch (Exception ex) { return 0; }
+    }
+
     public static net.minecraft.nbt.NbtElement nbtGetBlock(net.minecraft.server.world.ServerWorld world,
                                                            net.minecraft.util.math.Vec3d pos, String path) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);

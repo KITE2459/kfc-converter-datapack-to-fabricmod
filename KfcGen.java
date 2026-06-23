@@ -116,6 +116,31 @@ public final class KfcGen {
         SNAP_GEN = ENTITY_GEN;
     }
 
+    // ── 틱 단위 타입→엔티티 버킷 (nearestEntity 등 타입 셀렉터 핫패스용) ──
+    // 기존 nearestEntity 는 매 호출 world.getEntitiesByType(type, predicate) 로 '전 엔티티'를
+    // 순회(EntityIndex.forEach + TypeFilter.downcast + 람다 + 리스트 생성)했다. TD 류는 타워마다
+    // 매 틱 nearest 를 구해 O(타워×전체엔티티)로 폭증(spark 55%). 타입은 런타임 불변이므로,
+    // 스냅샷을 타입별로 1회 버킷팅해두면 타워는 자기 타입 버킷만 순회하면 된다.
+    // 고증 안전: 무효화는 스냅샷과 동일(틱 경계 + ENTITY_GEN=추가/제거)만 필요하고,
+    // 태그/거리는 호출 시 버킷 원소에서 라이브로 읽어 필터하므로 태그 변경(브릿지 포함)도 정확.
+    // 최악(틱 내 잦은 스폰으로 재빌드)에도 '매 호출 전수 스캔'인 기존보다 절대 나쁘지 않다.
+    private static int  TYPEIDX_TICK = Integer.MIN_VALUE;
+    private static long TYPEIDX_GEN  = -1;
+    private static net.minecraft.server.MinecraftServer TYPEIDX_SERVER;
+    private static java.util.Map<net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>> TYPE_INDEX;
+    static java.util.List<net.minecraft.entity.Entity> typeBucket(GameContext ctx, net.minecraft.entity.EntityType<?> t) {
+        int tk = ctx.server.getTicks();
+        if (TYPE_INDEX == null || TYPEIDX_SERVER != ctx.server || TYPEIDX_TICK != tk || TYPEIDX_GEN != ENTITY_GEN) {
+            java.util.IdentityHashMap<net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>> m =
+                    new java.util.IdentityHashMap<>();
+            for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx))
+                m.computeIfAbsent(e.getType(), k -> new java.util.ArrayList<>()).add(e);
+            TYPE_INDEX = m; TYPEIDX_SERVER = ctx.server; TYPEIDX_TICK = tk; TYPEIDX_GEN = ENTITY_GEN;
+        }
+        java.util.List<net.minecraft.entity.Entity> b = TYPE_INDEX.get(t);
+        return b == null ? java.util.Collections.emptyList() : b;
+    }
+
     /** 네이티브화하지 못한 명령을 런타임에 1회 파싱·실행하는 브릿지 폴백. */
     /** caret(^) 로컬좌표 → 절대좌표. 마크 LocalCoordinates 공식 그대로.
      *  rot: Vec2f(x=pitch, y=yaw). (x,y,z) = (^left, ^up, ^forward). */
@@ -2398,13 +2423,9 @@ public final class KfcGen {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
         for (net.minecraft.entity.EntityType<?> t : types) {
-            java.util.List<? extends net.minecraft.entity.Entity> found =
-                    (origin != null && maxDist >= 0)
-                    ? ctx.world.getEntitiesByType(t, rangeBox(origin, maxDist),
-                            en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))
-                    : ctx.world.getEntitiesByType(t,
-                            en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
-            for (net.minecraft.entity.Entity e : found) {
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
+                if (!matchTags(e, tagsPos, tagsNeg)) continue;
+                if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
                 if (d < bestD) { bestD = d; best = e; }
             }
@@ -2681,14 +2702,9 @@ public final class KfcGen {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
         for (net.minecraft.entity.EntityType<?> t : types) {
-            java.util.List<? extends net.minecraft.entity.Entity> found =
-                    (origin != null && maxDist >= 0)
-                    ? ctx.world.getEntitiesByType(t, rangeBox(origin.getPos(), maxDist),
-                            en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))
-                    : ctx.world.getEntitiesByType(t,
-                            en -> matchTags(en, tagsPos, tagsNeg)
-                                  && (origin == null || inRange(origin, en, minDist, maxDist)));
-            for (net.minecraft.entity.Entity e : found) {
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
+                if (!matchTags(e, tagsPos, tagsNeg)) continue;
+                if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : origin.squaredDistanceTo(e);
                 if (d < bestD) { bestD = d; best = e; }
             }
@@ -3223,7 +3239,13 @@ public final class KfcGen {
 
     /** NbtElement → double(숫자형 아니면 0). */
     private static double nbtNum(net.minecraft.nbt.NbtElement el) {
-        return (el instanceof net.minecraft.nbt.AbstractNbtNumber n) ? n.doubleValue() : 0.0;
+        if (el instanceof net.minecraft.nbt.AbstractNbtNumber n) return n.doubleValue();
+        // 바닐라 data get <path> <scale>: 비숫자는 '크기'에 scale 적용(MathHelper.floor).
+        //   리스트/배열(CollectionTag)=원소 수, 컴파운드=키 수, 문자열=길이. (DataCommand.getData)
+        if (el instanceof net.minecraft.nbt.AbstractNbtList l) return l.size();
+        if (el instanceof net.minecraft.nbt.NbtCompound c) return c.getSize();
+        if (el instanceof net.minecraft.nbt.NbtString s) return s.value().length();
+        return 0.0;
     }
     /** data get <entity|storage> <path> 의 값(double). getAtPath 라 리스트 인덱스(Rotation[0]) 지원. */
     public static double entityGetDouble(net.minecraft.entity.Entity e, String path) {

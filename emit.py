@@ -1284,9 +1284,10 @@ class SimpleRule:
 
 SIMPLE_RULES: dict[tuple, SimpleRule] = {
     # ride <@s> mount <단일셀렉터> - 카트 탑승. 바닐라는 항상 탑승(다른 탈것이면 내린 뒤 탑승).
+    # rideMount 가 자기탑승/순환을 차단(없으면 addPassengersDeep 무한재귀 → StackOverflow).
     ("ride", "target", "mount", "vehicle"): SimpleRule(
         args={"target": "self", "vehicle": "single"},
-        java="if (executor != null && {vehicle} != null && executor.getVehicle() != {vehicle}) {{ executor.stopRiding(); executor.startRiding({vehicle}, true); }}",
+        java="KfcGen.rideMount(executor, {vehicle});",
         kind="native",
     ),
     # ride <@s> dismount
@@ -1608,10 +1609,16 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         val = first_arg(args, "value")
         rv = "0"
         if val is not None:
-            try:
-                rv = str(int(val))
-            except ValueError:
-                rv = "1"  # 비정수 값은 보수적으로 1(참)
+            # 매크로 변수 반환($return $(lap) 등): 런타임에 정수 파싱.
+            #   기존엔 int(val) 실패 → "1" 상수로 뭉개져 '최대 랩 1 고정' 류 버그를 유발했다.
+            _mi = _jnum(val, "Double.parseDouble") if "MACROVAR_" in str(val) else None
+            if _mi is not None:
+                rv = f"((int) {_mi})"        # 후처리에서 MACROVAR_i -> macroArgs.get(var) 환원
+            else:
+                try:
+                    rv = str(int(val))
+                except ValueError:
+                    rv = "1"  # 비정수·비매크로 값은 보수적으로 1(참)
         em.java.append(f"return {rv};")
         em.terminal = True
         return True
@@ -5892,8 +5899,9 @@ def parse_clear_item(pred: str):
 
 def parse_item_predicate(pred: str):
     """아이템 술어 -> (item_id, custom_data_snbt|None). 미지원 형태면 None.
-       지원: `*`, `<id>`, `<id>[<ns:>custom_data~{...}]`, `*[<ns:>custom_data~{...}]`"""
-    m = re.match(r'^(\*|[a-z0-9_.:-]+)(?:\[(.*)\])?$', pred.strip())
+       지원: `*`, `<id>`, `#<tag>`, `<id>[<ns:>custom_data~{...}]`, `*[<ns:>custom_data~{...}]`
+       (#tag 은 런타임 stackMatches 가 stack.isIn(TagKey) 로 평가)."""
+    m = re.match(r'^(\*|#?[a-z0-9_.:/-]+)(?:\[(.*)\])?$', pred.strip())
     if not m:
         return None
     item_id, comp = m.group(1), m.group(2)

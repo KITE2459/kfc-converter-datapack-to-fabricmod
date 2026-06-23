@@ -174,6 +174,102 @@ def _mp_convert_local(item, group):
             jc.native_lines, jc.gated_lines, jc.bridge_lines, jc.fully_converted)
 
 
+# ───────────────────────────── 대용량 가속(raw 워커) ─────────────────────────────
+# 기존엔 메인 스레드가 trees(700MB+) 를 json.loads 로 2패스(pass-1 + pass-2 _gen_items)
+# 했다 → 그 자체로 단일코어 ~수십초. 워커는 emit 만 병렬이고 파싱은 메인 직렬 병목.
+# 개선: 메인은 raw 문자열만 함수 경계로 묶고(json.loads 안 함), 워커가 json.loads + emit 을
+# 모두 수행 → 파싱까지 코어 수만큼 병렬화. (출력은 기존 경로와 바이트 동일.)
+
+def _scan_fid(line: str):
+    """JSONL 한 줄에서 function 값만 싸게 추출(json.loads 회피).
+       형식: ...,"function":"ns:path"}  — fid 에는 따옴표/역슬래시가 없다."""
+    i = line.rfind('"function":"')
+    if i < 0:
+        return None
+    j = i + len('"function":"')
+    k = line.find('"', j)
+    return None if k < 0 else line[j:k]
+
+
+def _scan_macro_and_fids(trees_path: str):
+    """[pass-1 대체, JSONL 전용] json.loads 없이 raw 스캔으로 (macro_fns, all_fids) 수집.
+       called(호출대상)는 pass-2 워커가 파싱하며 모은다(메인 단일스레드 절감)."""
+    macro_fns, all_fids = set(), set()
+    cur_fid, cur_macro = None, False
+    with open(trees_path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            fid = _scan_fid(line)
+            if fid is None:
+                continue
+            all_fids.add(fid)
+            if fid != cur_fid:
+                if cur_fid is not None and cur_macro:
+                    macro_fns.add(cur_fid)
+                cur_fid, cur_macro = fid, False
+            if not cur_macro and '"macro":true' in line:
+                cur_macro = True
+        if cur_fid is not None and cur_macro:
+            macro_fns.add(cur_fid)
+    return macro_fns, all_fids
+
+
+def _gen_items_raw(trees_path: str):
+    """[pass-2 입력, JSONL] (fid, [raw_json_line,...]) 스트리밍 — 메인은 json.loads 안 함."""
+    cur_fid, cur_lines = None, []
+    with open(trees_path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            fid = _scan_fid(s)
+            if fid is None:
+                continue
+            if fid != cur_fid:
+                if cur_fid is not None:
+                    yield (cur_fid, cur_lines)
+                cur_fid, cur_lines = fid, []
+            cur_lines.append(s)
+        if cur_fid is not None:
+            yield (cur_fid, cur_lines)
+
+
+def _collect_called(objs):
+    """파스트리에서 외부 호출 대상(ns:path) 집합 수집(pass-1 called 와 동일 기준)."""
+    called = set()
+    for obj in objs:
+        for step in obj.get("chain", []):
+            v = step.get("value", {})
+            if isinstance(v, dict) and v.get("kind") == "" and ":" in str(v.get("raw", "")):
+                called.add(v["raw"])
+    return called
+
+
+def _mp_convert_raw(item):
+    """워커(raw 입력): (fid, [raw_line,...]) -> (..., called). json.loads 를 워커에서 수행."""
+    import json as _json
+    from assemble import function_to_class as _f2c
+    fid, raws = item
+    objs = [_json.loads(r) for r in raws]
+    jc = _f2c(fid, objs, group=_W_GROUP)
+    return (fid, jc.package, jc.cls, jc.code,
+            jc.native_lines, jc.gated_lines, jc.bridge_lines, jc.fully_converted,
+            _collect_called(objs))
+
+
+def _mp_convert_local_raw(item, group):
+    """단일 프로세스 raw 변환(_mp_convert_raw 와 동일 반환)."""
+    import json as _json
+    from assemble import function_to_class as _f2c
+    fid, raws = item
+    objs = [_json.loads(r) for r in raws]
+    jc = _f2c(fid, objs, group=group)
+    return (fid, jc.package, jc.cls, jc.code,
+            jc.native_lines, jc.gated_lines, jc.bridge_lines, jc.fully_converted,
+            _collect_called(objs))
+
+
 def _trees_is_jsonl(trees_path: str) -> bool:
     """trees 가 JSONL(줄당 객체)인지 판별. 첫 비공백 글자가 '[' 면 JSON 배열, 아니면 JSONL."""
     with open(trees_path, encoding="utf-8") as f:
@@ -237,34 +333,39 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     # ── [pass-1] 스트리밍: macro_fns + called(호출 대상) 만 수집 (가벼움) ──
     # trees 전체를 메모리에 올리지 않고 한 객체씩 훑는다. 동시 메모리는 객체 1개분.
     # macro_fns 는 함수 변환 전에 알아야 하므로(emit 의 호출부 Map 인자 결정) 선행 패스로 분리.
+    # ── [pass-1] macro_fns + all_fids 수집 ──
+    # JSONL(신규 ParseDumper): json.loads 없이 raw 스캔(~12s/패스 → ~0.5s). called 는 pass-2
+    # 워커가 파싱하며 모은다. 배열형(소형 구버전)만 기존 파싱 패스 사용.
+    _jsonl = _trees_is_jsonl(trees_path)
     macro_fns = set()
     called = set()
     all_fids = set()
-    any_fn = False
-    any_obj = False
-    cur_fid = None
-    cur_has_macro = False
-    for obj in _iter_trees(trees_path):
-        any_obj = True
-        fid = obj.get("function")
-        if fid is not None:
-            any_fn = True
-            all_fids.add(fid)
-        # 호출 대상 수집
-        for step in obj.get("chain", []):
-            v = step.get("value", {})
-            if isinstance(v, dict) and v.get("kind") == "" and ":" in str(v.get("raw", "")):
-                called.add(v["raw"])
-        # 함수 경계에서 macro 여부 확정
-        if fid != cur_fid:
-            if cur_fid is not None and cur_has_macro:
-                macro_fns.add(cur_fid)
-            cur_fid = fid
-            cur_has_macro = False
-        if obj.get("macro"):
-            cur_has_macro = True
-    if cur_fid is not None and cur_has_macro:
-        macro_fns.add(cur_fid)
+    if _jsonl:
+        macro_fns, all_fids = _scan_macro_and_fids(trees_path)
+        any_fn = any_obj = bool(all_fids)
+    else:
+        any_fn = any_obj = False
+        cur_fid = None
+        cur_has_macro = False
+        for obj in _iter_trees(trees_path):
+            any_obj = True
+            fid = obj.get("function")
+            if fid is not None:
+                any_fn = True
+                all_fids.add(fid)
+            for step in obj.get("chain", []):
+                v = step.get("value", {})
+                if isinstance(v, dict) and v.get("kind") == "" and ":" in str(v.get("raw", "")):
+                    called.add(v["raw"])
+            if fid != cur_fid:
+                if cur_fid is not None and cur_has_macro:
+                    macro_fns.add(cur_fid)
+                cur_fid = fid
+                cur_has_macro = False
+            if obj.get("macro"):
+                cur_has_macro = True
+        if cur_fid is not None and cur_has_macro:
+            macro_fns.add(cur_fid)
 
     if any_obj and not any_fn:
         print("[!]  trees.json has no 'function' field. Looks like it was produced by an old ParseDumper.")
@@ -317,7 +418,9 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
 
     def _write_result(res):
         nonlocal fn_count
-        fid, pkg, cls, code, nat, gat, br, full = res
+        fid, pkg, cls, code, nat, gat, br, full = res[:8]
+        if len(res) > 8 and res[8]:
+            called.update(res[8])          # raw 워커가 모은 호출대상 합치기
         pkg_dir = src_root / Path(*pkg.split("."))
         pkg_dir.mkdir(parents=True, exist_ok=True)
         (pkg_dir / f"{cls}.java").write_text(code, encoding="utf-8")
@@ -354,12 +457,19 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             for fid, objs in by_fn.items():
                 yield (fid, objs)
 
+    # 입력 생성기/워커 선택: JSONL → raw 문자열 그룹(워커가 json.loads, called 수집).
+    #                        배열형(소형) → 기존 파싱 그룹(called 는 pass-1 에서 수집됨).
+    if _jsonl:
+        _items, _conv_local, _conv_worker = _gen_items_raw(trees_path), _mp_convert_local_raw, _mp_convert_raw
+    else:
+        _items, _conv_local, _conv_worker = _gen_items(), _mp_convert_local, _mp_convert
+
     if jobs <= 1:
         # 단일 프로세스 (작은 팩 / 디버깅): 워커 없이 직접.
         emit.set_macro_fns(macro_fns)
         emit.set_all_fids(all_fids)
-        for item in _gen_items():
-            _write_result(_mp_convert_local(item, group))
+        for item in _items:
+            _write_result(_conv_local(item, group))
     else:
         # 멀티프로세싱: imap_unordered 로 스트리밍 분배(결과 도착 순 처리).
         import multiprocessing as _mp
@@ -372,7 +482,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
                       initargs=(datapack_root, macro_fns, group, all_fids,
                                 _force_prefixes, _trace_prefixes)) as pool:
             # chunksize 로 IPC 오버헤드 감소. 함수가 많을수록 크게.
-            for res in pool.imap_unordered(_mp_convert, _gen_items(), chunksize=64):
+            for res in pool.imap_unordered(_conv_worker, _items, chunksize=64):
                 _write_result(res)
         _src = "explicit KFC_JOBS" if _jobs_env > 0 else "auto (max usable cores)"
         print(f"[generate] pass-2: parallel convert with {jobs} workers [{_src}]")
@@ -780,6 +890,7 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
     if dp_src is not None and dp_src.exists():
         dst_data = res / "data"
         copied = skipped_ticks = 0
+        _seen_dirs = set()   # 생성한 부모 디렉터리 캐시 — 188k 파일에서 mkdir 중복 syscall 제거
         # data/ 이하 전 파일을 메모리에서 읽어 그대로 기록 (zip 도 디스크 전개 없이).
         for rel, blob in dp_src.iter_files(under="data"):
             relposix = rel[len("data/"):]   # data/ 제거한 내부 상대경로
@@ -791,7 +902,10 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
                 skipped_ticks += 1
                 continue
             dst = dst_data / relposix
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            parent = dst.parent
+            if parent not in _seen_dirs:        # 같은 디렉터리는 한 번만 mkdir
+                parent.mkdir(parents=True, exist_ok=True)
+                _seen_dirs.add(parent)
             dst.write_bytes(blob)
             copied += 1
         # pack.mcmeta 도 복사 (있으면)

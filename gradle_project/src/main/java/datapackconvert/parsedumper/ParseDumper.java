@@ -67,6 +67,7 @@ public final class ParseDumper implements ModInitializer {
                 if (outPath.getParent() != null) Files.createDirectories(outPath.getParent());
 
                 long lineCount = 0;
+                int threads = parseThreads();
                 // 출력 형식: JSONL (줄당 객체 1개). 입력 lines.json 이 {fid:[lines]} 맵이라
                 // 함수별로 순서 처리되어, 같은 함수 객체가 연속으로 나온다 → generate 가
                 // 함수 경계에서 변환 후 메모리를 비울 수 있어 700MB+ trees 도 메모리 일정.
@@ -75,6 +76,12 @@ public final class ParseDumper implements ModInitializer {
 
                     jr.setStrictness(Strictness.LENIENT);
 
+                    if (threads > 1) {
+                        // 병렬 파싱: dispatcher/src 는 파싱 중 읽기 전용이라 줄 단위로 병렬화 가능.
+                        // 배치 스트리밍이라 메모리는 배치 크기로 한정. -Dkfc.parse.threads=1 로 비활성(순차).
+                        lineCount = dumpBatchedParallel(dispatcher, src, jr, out, threads);
+                        System.out.println("[ParseDumper] parallel parse with " + threads + " threads");
+                    } else {
                     switch (jr.peek()) {
                         case BEGIN_ARRAY -> {                // 구버전: 줄 배열
                             jr.beginArray();
@@ -101,6 +108,7 @@ public final class ParseDumper implements ModInitializer {
                         }
                     }
                     out.flush();
+                    }
                 }
                 System.out.println("[ParseDumper] " + lineCount + " lines -> " + outPath
                         + " (unique cached: " + BODY_CACHE.size()
@@ -120,6 +128,100 @@ public final class ParseDumper implements ModInitializer {
         return (v == null || v.isBlank()) ? null : v;
     }
 
+    /** 파싱 스레드 수: -Dkfc.parse.threads / KFC_PARSE_THREADS, 기본 = 가용 코어. 1 이면 순차(안전 폴백). */
+    private static int parseThreads() {
+        String v = prop("kfc.parse.threads");
+        if (v != null) {
+            try { int n = Integer.parseInt(v.trim()); if (n > 0) return n; } catch (NumberFormatException ignored) {}
+        }
+        return Math.max(1, Runtime.getRuntime().availableProcessors());
+    }
+
+    // ── 배치 스트리밍 병렬 파싱 ──
+    // 입력을 BATCH 단위로 모아, 배치 내 '캐시에 없는 고유 줄'을 스레드풀로 병렬 파싱한 뒤
+    // 원래 순서대로 기록한다. dispatcher/src 는 파싱 중 읽기 전용이라 줄 단위 병렬이 안전.
+    // 메모리는 BATCH(기본 2만) 분량으로 한정 → 700MB+ trees 도 메모리 일정.
+    private static final int PARSE_BATCH = 20_000;
+
+    private static long dumpBatchedParallel(CommandDispatcher<ServerCommandSource> dispatcher,
+                                            ServerCommandSource src, JsonReader jr,
+                                            java.io.BufferedWriter out, int threads) throws IOException {
+        java.util.concurrent.ExecutorService pool =
+                java.util.concurrent.Executors.newFixedThreadPool(threads);
+        long count = 0;
+        try {
+            java.util.List<String[]> batch = new java.util.ArrayList<>(PARSE_BATCH);
+            switch (jr.peek()) {
+                case BEGIN_ARRAY -> {
+                    jr.beginArray();
+                    while (jr.hasNext()) {
+                        batch.add(new String[]{null, jr.nextString()});
+                        if (batch.size() >= PARSE_BATCH) { count += flushBatch(pool, dispatcher, src, batch, out, threads); batch.clear(); }
+                    }
+                    jr.endArray();
+                }
+                default -> {
+                    jr.beginObject();
+                    while (jr.hasNext()) {
+                        String fid = jr.nextName();
+                        jr.beginArray();
+                        while (jr.hasNext()) {
+                            batch.add(new String[]{fid, jr.nextString()});
+                            if (batch.size() >= PARSE_BATCH) { count += flushBatch(pool, dispatcher, src, batch, out, threads); batch.clear(); }
+                        }
+                        jr.endArray();
+                    }
+                    jr.endObject();
+                }
+            }
+            if (!batch.isEmpty()) count += flushBatch(pool, dispatcher, src, batch, out, threads);
+            out.flush();
+        } finally {
+            pool.shutdown();
+        }
+        return count;
+    }
+
+    private static long flushBatch(java.util.concurrent.ExecutorService pool,
+                                   CommandDispatcher<ServerCommandSource> dispatcher,
+                                   ServerCommandSource src, java.util.List<String[]> batch,
+                                   java.io.BufferedWriter out, int threads) throws IOException {
+        // 1) 이 배치에서 아직 캐시에 없는 고유 줄 수집
+        java.util.LinkedHashSet<String> todoSet = new java.util.LinkedHashSet<>();
+        for (String[] b : batch) if (!BODY_CACHE.containsKey(b[1])) todoSet.add(b[1]);
+        // 2) 병렬 파싱 → local 에 본문 적재(캐시 가득이어도 이 배치 출력은 재파싱 없이 처리)
+        final java.util.concurrent.ConcurrentHashMap<String, String> local =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        if (!todoSet.isEmpty()) {
+            final java.util.List<String> list = new java.util.ArrayList<>(todoSet);
+            int n = list.size();
+            int per = (n + threads - 1) / threads;
+            java.util.List<java.util.concurrent.Future<?>> fs = new java.util.ArrayList<>();
+            for (int t = 0; t < n; t += per) {
+                final int s0 = t, e0 = Math.min(n, t + per);
+                fs.add(pool.submit(() -> {
+                    for (int i = s0; i < e0; i++) {
+                        String ln = list.get(i);
+                        try { local.put(ln, bodyOf(dispatcher, src, ln)); }
+                        catch (Throwable ex) { /* 한 줄 파싱 예외는 격리: 순차 경로에서 보정 */ }
+                    }
+                    return null;
+                }));
+            }
+            for (java.util.concurrent.Future<?> f : fs) {
+                try { f.get(); } catch (Exception ex) { throw new IOException("parallel parse failed", ex); }
+            }
+        }
+        // 3) 원래 순서대로 기록 (local → 캐시 → 최후 순차 파싱)
+        for (String[] b : batch) {
+            String body = local.get(b[1]);
+            if (body == null) body = bodyOf(dispatcher, src, b[1]);
+            out.write(injectFid(body, b[0]));
+            out.write('\n');
+        }
+        return batch.size();
+    }
+
     // ────────────────────────────────────────────────────────────────────
     //  한 줄 → JsonWriter 에 객체 직접 기록 (중간 Map 없음)
     //  스키마(필드 순서 보존): line, macro, [매크로면 macroVars/reparsed/...],
@@ -131,29 +233,41 @@ public final class ParseDumper implements ModInitializer {
     // 캐싱해 재사용한다. 출력 시 function 만 '}' 앞에 끼워 넣는다.
     // 메모리 보호: 고유 줄 수가 매우 많을 수 있으므로 상한을 두고 넘으면 캐시를 비활성.
     private static final int CACHE_MAX = 200_000;
-    private static final java.util.HashMap<String, String> BODY_CACHE = new java.util.HashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> BODY_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private static com.google.gson.Gson GSON_COMPACT;
 
-    /** 한 줄 → 완성된 객체 JSON 문자열(function 포함). JSONL 출력용. 캐시 활용. */
-    private static String dumpLineToString(CommandDispatcher<ServerCommandSource> dispatcher,
-                                           ServerCommandSource src, String rawLine,
-                                           String fid) throws IOException {
+    /** rawLine → 본문 객체 JSON(function 미포함). 캐시 활용. 스레드 안전(ConcurrentHashMap). */
+    private static String bodyOf(CommandDispatcher<ServerCommandSource> dispatcher,
+                                 ServerCommandSource src, String rawLine) throws IOException {
         String body = BODY_CACHE.get(rawLine);
         if (body == null) {
             java.io.StringWriter sw = new java.io.StringWriter(128);
             JsonWriter bw = new JsonWriter(sw);
             bw.setStrictness(Strictness.LENIENT);
             bw.setIndent("");
-            buildBody(dispatcher, src, rawLine, bw);
+            buildBody(dispatcher, src, rawLine, bw);   // dispatcher/src 는 파싱 중 읽기 전용 → 병렬 안전
             bw.flush();
             body = sw.toString();
             if (BODY_CACHE.size() < CACHE_MAX) BODY_CACHE.put(rawLine, body);
         }
+        return body;
+    }
+
+    /** 본문 JSON 의 '}' 앞에 function 필드를 끼워 넣는다(JSONL 한 줄 완성). */
+    private static String injectFid(String body, String fid) {
         if (fid == null) return body;
         int close = body.lastIndexOf('}');
         String fjson = gsonCompact().toJson(fid);
         boolean empty = body.substring(0, close).trim().endsWith("{");
         return body.substring(0, close) + (empty ? "" : ",") + "\"function\":" + fjson + "}";
+    }
+
+    /** 한 줄 → 완성된 객체 JSON 문자열(function 포함). JSONL 출력용. 캐시 활용. */
+    private static String dumpLineToString(CommandDispatcher<ServerCommandSource> dispatcher,
+                                           ServerCommandSource src, String rawLine,
+                                           String fid) throws IOException {
+        return injectFid(bodyOf(dispatcher, src, rawLine), fid);
     }
 
     private static com.google.gson.Gson gsonCompact() {
@@ -392,9 +506,28 @@ public final class ParseDumper implements ModInitializer {
             "#minecraft:skeletons", "#minecraft:raiders", "#minecraft:arrows",
             "#minecraft:zombies", "#minecraft:undead", "#minecraft:illager"
     };
-    // 유효한 LootCondition inline. predicate 인자(ResourceOrId)는 inline JSON 을 허용한다.
-    private static final String PREDICATE_INLINE =
-            "{\"condition\":\"minecraft:random_chance\",\"chance\":1.0}";
+    // 유효한 바닐라 '아이템' 태그 풀(파싱 통과용 placeholder). 런타임 stackMatches 가
+    // stack.isIn(TagKey) 로 실제 태그를 평가하므로 placeholder 는 파싱에만 쓰인다.
+    private static final String[] ITEM_TAG_POOL = {
+            "#minecraft:anvil", "#minecraft:arrows", "#minecraft:axes", "#minecraft:banners",
+            "#minecraft:beds", "#minecraft:boats", "#minecraft:buttons", "#minecraft:candles",
+            "#minecraft:chest_boats", "#minecraft:coals", "#minecraft:compasses", "#minecraft:bundles",
+            "#minecraft:beacon_payment_items", "#minecraft:bookshelf_books", "#minecraft:bamboo_blocks",
+            "#minecraft:brewing_fuel"
+    };
+    // 유효한 LootCondition inline 풀. predicate 인자(ResourceOrId)는 inline JSON 을 허용한다.
+    // 한 줄에 미등록 predicate 가 여러 개면(예: if predicate A if predicate B) 서로 다른
+    // placeholder 가 필요하므로 chance 값을 달리한 distinct inline 들을 둔다.
+    private static final String[] PREDICATE_INLINE_POOL = {
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":1.0}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.9}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.8}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.7}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.6}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.5}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.4}",
+            "{\"condition\":\"minecraft:random_chance\",\"chance\":0.3}"
+    };
 
     /** 회복 시도. 성공 시 jw 에 ok/command/chain 을 쓰고 true(호출자가 endObject). 실패 시 false. */
     private static boolean recover(CommandDispatcher<ServerCommandSource> dispatcher,
@@ -445,12 +578,18 @@ public final class ParseDumper implements ModInitializer {
             String ph = pickPool(ENTITY_TAG_POOL, work, used);
             return ph == null ? null : new String[]{"#" + m.group(1), ph};
         }
+        m = java.util.regex.Pattern.compile("Unknown item tag '([^']+)'").matcher(err);
+        if (m.find()) {
+            String ph = pickPool(ITEM_TAG_POOL, work, used);
+            return ph == null ? null : new String[]{"#" + m.group(1), ph};
+        }
         // predicate 미등록: ResourceKey[minecraft:predicate / ns:path]
         m = java.util.regex.Pattern.compile("ResourceKey\\[minecraft:predicate / ([^\\]]+)\\]").matcher(err);
         if (m.find()) {
             String token = m.group(1).trim();
-            if (work.indexOf(token) < 0 || used.contains(PREDICATE_INLINE)) return null;
-            return new String[]{token, PREDICATE_INLINE};
+            if (work.indexOf(token) < 0) return null;
+            String ph = pickPool(PREDICATE_INLINE_POOL, work, used);   // 다중 predicate → 서로 다른 inline
+            return ph == null ? null : new String[]{token, ph};
         }
         return null;
     }

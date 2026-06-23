@@ -1891,9 +1891,17 @@ public final class KfcGen {
         return ref.isPresent() && le.hasStatusEffect(ref.get());
     }
 
-    /** ride <who> mount <vehicle> / ride <who> dismount. */
+    /** ride <who> mount <vehicle> / ride <who> dismount.
+     *  바닐라 RideCommand 처럼 자기탑승·순환(누가 자기 탈것의 조상이 됨)을 차단한다.
+     *  순환을 만들면 startRiding 후 addPassengersDeep 가 무한 재귀 → StackOverflow(서버 사망)이므로
+     *  반드시 막아야 한다. 바닐라도 이 경우 명령을 실패(무탑승)시키므로 거부가 고증에 맞다. */
     public static void rideMount(net.minecraft.entity.Entity who, net.minecraft.entity.Entity vehicle) {
         if (who == null || vehicle == null) return;
+        if (who == vehicle) return;                                  // 자기 자신엔 못 탐
+        for (net.minecraft.entity.Entity v = vehicle; v != null; v = v.getVehicle())
+            if (v == who) return;                                    // who 가 vehicle 체인에 있음 → 순환, 거부
+        if (who.getVehicle() == vehicle) return;                     // 이미 그 탈것에 타고 있음
+        who.stopRiding();
         who.startRiding(vehicle, true);   // force=true (커맨드 강제 탑승)
     }
     public static void rideDismount(net.minecraft.entity.Entity who) {
@@ -2052,6 +2060,20 @@ public final class KfcGen {
         instantExecuteFunction(source, functionId, null);
     }
 
+    /** 단일 바닐라 명령을 서버 디스패처로 그대로 실행(100% 바닐라 동작).
+     *  깔끔한 네이티브 API 가 없거나(예: datapack enable/disable - 리소스 리로드 동반) 드물게만
+     *  실행되는 관리 명령용. 함수의 나머지 줄은 네이티브로 유지하면서, 이 한 줄만 디스패처에
+     *  위임한다(예전엔 이런 줄 하나가 함수 전체를 브릿지로 끌어내렸다 - 맵 uninstall 등).
+     *  source 를 그대로 써서 같은 함수 내 다른 명령과 피드백/권한 동작을 일치시킨다. */
+    public static void runCommand(net.minecraft.server.command.ServerCommandSource source, String command) {
+        try {
+            source.getServer().getCommandManager().executeWithPrefix(source, command);
+            ENTITY_GEN++;   // 디스패처 실행이 summon/kill 했을 수 있으므로 스냅샷 무효화
+        } catch (Exception ex) {
+            System.err.println("[KFC-CMD] '" + command + "' : " + ex);
+        }
+    }
+
     /** 함수 폴백 + 반환값 캡처 — 폴백 함수의 executeReturn 이 mcfunction return 값을
      *  if function 분기에 전달할 수 있게 한다. 실패/미실행 시 0. */
     public static int instantExecuteFunctionReturn(net.minecraft.server.command.ServerCommandSource source,
@@ -2085,6 +2107,11 @@ public final class KfcGen {
                         context, procedure, source, consumer);
                 context.run();
             });
+            // 브릿지는 바닐라 엔진으로 실행되어 엔티티를 summon/kill 할 수 있으나 snapAdd/snapRemove 를
+            // 거치지 않는다. 이후 스냅샷 기반 셀렉터(@e 루프/태그 제거 등)가 그 엔티티를 놓치면
+            // (예: 브릿지로 소환된 모델의 임시태그 제거 실패 → 다음 소환이 이전 모델 간섭) 고증이 깨진다.
+            // 따라서 브릿지 직후 스냅샷/타입버킷을 무효화해 다음 접근 때 live 월드에서 재빌드시킨다.
+            ENTITY_GEN++;
         } catch (Exception ex) {
             // 폴백 실행 실패는 조용히 삼키지 않는다 — 원본이라면 함수가 '실행'됐을 상황이므로
             // 실패는 변환기/환경 문제다. 진단 가능하도록 로그를 남긴다.
@@ -2130,6 +2157,7 @@ public final class KfcGen {
                         net.minecraft.command.ReturnValueConsumer.EMPTY);
                 context.run();
             });
+            ENTITY_GEN++;   // 브릿지가 summon/kill 했을 수 있으므로 스냅샷/타입버킷 무효화(위 설명 참조)
         } catch (Exception ex) {
             System.err.println("[KFC-BRIDGE-ERROR] " + functionId + ": " + ex);
         }

@@ -160,6 +160,15 @@ tasks.named('runServer') {
         //   (예: kartmobil:ignoreblock 같은 block tag)를 레지스트리에 로드시킨다.
         //   이게 없으면 ParseDumper 파서가 커스텀 태그를 'Unknown' 으로 보고 파싱 실패→폴백
         //   처리하여 변환률이 떨어진다.
+        //
+        // ── [파싱 가속] 함수 본문(.mcfunction)은 staging 에서 제외한다 ──
+        //   데이터팩 '전체'를 datapacks/ 에 올리면 서버 리로드 때 바닐라 FunctionLoader 가
+        //   모든 함수(수십만)를 다시 파싱한다 → ParseDumper 와 '이중 파싱'이라 파싱 단계의
+        //   주 병목. recover() 가 미등록 태그를 placeholder 로 처리하므로, 실제로 레지스트리에
+        //   등록돼야 하는 건 block/item/entity_type 태그와 predicate 뿐이다.
+        //   따라서 ① 함수 본문(**/function/**)과 ② '함수 태그'(tags/function/** — 이제 없는
+        //   함수를 가리켜 리로드 경고만 유발)는 빼고 staging 한다.
+        //   (tick/load 태그는 어차피 Python extract 단계가 원본 데이터팩에서 따로 뽑으므로 불필요.)
         def datapack = project.findProperty('datapack')
         if (datapack) {
             def dpFile = project.file(datapack)
@@ -167,14 +176,20 @@ tasks.named('runServer') {
             dpDir.mkdirs()
             // 기존 복사본 제거(최신 보장)
             delete fileTree(dir: dpDir, includes: ['kfc_input/**', 'kfc_input.zip'])
-            if (dpFile.name.toLowerCase().endsWith(".zip")) {
-                // zip 은 그대로 datapacks 에 두면 서버가 읽는다.
-                copy { from dpFile; into dpDir; rename { "kfc_input.zip" } }
-            } else {
-                // 디렉터리는 폴더째 복사.
-                copy { from dpFile; into new File(dpDir, "kfc_input") }
+            def stripDir = new File(dpDir, "kfc_input")
+            def stripExcludes = [
+                '**/function/**', '**/functions/**',           // 함수 본문 (이중 파싱 제거)
+                '**/tags/function/**', '**/tags/functions/**',  // 없는 함수 참조 → 경고 방지
+            ]
+            // zip 이든 디렉터리든 '함수 빠진' 폴더형 데이터팩(kfc_input/)으로 통일 전개.
+            // zip 은 zipTree 로 읽되, exclude 된 파일은 애초에 풀지 않으므로 188K 함수 전개 비용도 없음.
+            def dpSrc = dpFile.name.toLowerCase().endsWith(".zip") ? zipTree(dpFile) : dpFile
+            copy {
+                from dpSrc
+                into stripDir
+                exclude stripExcludes
             }
-            println "[runServer] datapack staged into world/datapacks for tag/predicate loading"
+            println "[runServer] datapack staged WITHOUT functions (tags/predicate only) for fast parse"
         }
     }
 }

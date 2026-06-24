@@ -1877,13 +1877,15 @@ public final class KfcGen {
         // NBT 라운드트립(writeNbt → item 교체 → readNbt)으로 표시 아이템을 직접 설정한다.
         // (contents 슬롯은 단일 아이템이므로 loot 첫 스택만 사용; 빈 loot 면 item 제거.)
         if (e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) {
+            // item_display 의 표시 아이템은 getStackReference(0) 으로 접근한다(= setItemStack 백킹 →
+            // DataTracker 갱신 + 클라 동기화). 기존 경로의 resolveSlotBase("contents") 가
+            // ItemDisplayEntity 가 기대하는 인덱스(0)와 달라 getStackReference 가 EMPTY 를 반환 →
+            // 적용이 스킵돼 머리가 안 박혔다. writeNbt/readNbt 폴백은 DisplayEntity 트래커를
+            // 갱신하지 못하므로(brightness 와 동일 이유) 쓰지 않고, 인덱스 0 에 직접 set 한다.
             net.minecraft.item.ItemStack st = loot.isEmpty()
                     ? net.minecraft.item.ItemStack.EMPTY : loot.get(0).copy();
-            net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(n);
-            if (st.isEmpty()) n.remove("item");
-            else n.put("item", st.toNbt(e.getRegistryManager()));
-            e.readNbt(n);
+            net.minecraft.inventory.StackReference ref = e.getStackReference(0);
+            if (ref != net.minecraft.inventory.StackReference.EMPTY) ref.set(st);
             return;
         }
         int base = resolveSlotBase(slotName);

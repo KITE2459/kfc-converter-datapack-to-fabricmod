@@ -1793,11 +1793,15 @@ public final class KfcGen {
                                     net.minecraft.registry.RegistryKeys.LOOT_TABLE,
                                     idOf(tableId)));
             if (entry.isEmpty()) return java.util.List.of();
+            // COMMAND 타입: ORIGIN 필수 + THIS_ENTITY 허용. (/loot ... loot <table> 와 동일 의미.)
+            // CHEST 타입은 THIS_ENTITY 를 허용하지 않아 addOptional(THIS_ENTITY) 가 조용히 무시되고,
+            // entity 루트테이블의 fill_player_head{entity:"this"} 가 플레이어를 못 읽어
+            // 프로필이 안 박힌 기본 스티브 player_head 가 나왔다. COMMAND 로 THIS_ENTITY 를 살린다.
             net.minecraft.loot.context.LootWorldContext lc =
                     new net.minecraft.loot.context.LootWorldContext.Builder(source.getWorld())
                             .addOptional(net.minecraft.loot.context.LootContextParameters.THIS_ENTITY, source.getEntity())
                             .add(net.minecraft.loot.context.LootContextParameters.ORIGIN, source.getPosition())
-                            .build(net.minecraft.loot.context.LootContextTypes.CHEST);
+                            .build(net.minecraft.loot.context.LootContextTypes.COMMAND);
             return entry.get().value().generateLoot(lc);
         } catch (Exception e) { return java.util.List.of(); }
     }
@@ -2047,12 +2051,14 @@ public final class KfcGen {
     private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
                                                double dx, double dy, double dz) {
         for (net.minecraft.entity.Entity ps : vehicle.getPassengerList()) {
-            if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
-                sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
-                        sp.getYaw(), sp.getPitch());
-            } else {
-                ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
-            }
+            // 승객(플레이어 포함)은 서버측 updatePosition 으로만 옮긴다(텔레포트 패킷 미발송).
+            // 라이딩 플레이어의 클라 위치는 탈것 엔티티트래킹 + 라이딩 부착으로 따라가므로
+            // 별도 requestTeleport 가 불필요하고(바닐라 /tp <탈것> 도 플레이어를 개별 텔레포트하지 않음),
+            // 오히려 매 tp 마다 보내던 위치 requestTeleport 가 같은 틱 player-yaw 의 회전 텔레포트와
+            // 경쟁해 라이딩 플레이어의 시점 고정(카메라 잠금)을 깨뜨렸다. 서버측 위치만 갱신하면
+            // 소리/속도계/체크포인트(서버 @a[distance]·playsound 판정)는 그대로 맞고,
+            // 1틱당 플레이어 텔레포트 패킷은 회전 1회뿐이라 바닐라처럼 카메라가 잠긴다.
+            ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
             if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
         }
     }

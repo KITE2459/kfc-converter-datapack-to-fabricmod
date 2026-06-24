@@ -1354,22 +1354,25 @@ public final class KfcGen {
         else p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(t));
     }
 
-    /** facing <target> — src 위치에서 target 지점을 바라보는 회전으로 재바인딩.
-     *  바닐라 execute facing <pos> 와 **비트 일치**하도록 ServerCommandSource.withLookingAt 에 위임한다.
-     *  (수제 atan2*57.2957795 + getPosition 원점은: ① double 상수(바닐라는 float 57.2957763671875),
-     *   ② 소스 anchor 무시, ③ wrapDegrees 누락 으로 yaw 가 미세하게 달라져 기록 영향이 있었다.) */
+    /** facing <target> — src 위치에서 target 지점을 바라보는 회전으로 재바인딩. */
     public static net.minecraft.server.command.ServerCommandSource facing(
             net.minecraft.server.command.ServerCommandSource src, double tx, double ty, double tz) {
-        return src.withLookingAt(new net.minecraft.util.math.Vec3d(tx, ty, tz));
+        net.minecraft.util.math.Vec3d o = src.getPosition();
+        double dx = tx - o.x, dy = ty - o.y, dz = tz - o.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) (net.minecraft.util.math.MathHelper.atan2(dz, dx) * 57.2957795 - 90.0);
+        float pitch = (float) (-(net.minecraft.util.math.MathHelper.atan2(dy, horiz) * 57.2957795));
+        return src.withRotation(new net.minecraft.util.math.Vec2f(pitch, yaw));
     }
 
-    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함.
-     *  EntityAnchor.EYES/FEET.positionAt(e) 는 각각 getEyePos()/getPos() 와 동일. withLookingAt 위임. */
+    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함. */
     public static net.minecraft.server.command.ServerCommandSource facingEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e, boolean eyes) {
         if (e == null) return src;
-        net.minecraft.util.math.Vec3d t = eyes ? e.getEyePos() : e.getPos();
-        return src.withLookingAt(t);
+        net.minecraft.util.math.Vec3d t = eyes
+                ? e.getEyePos()
+                : e.getPos();
+        return facing(src, t.x, t.y, t.z);
     }
 
     /** anchored eyes — caret(^) 원점을 실행자 눈 위치로(소스 위치 리바인드). */
@@ -1992,10 +1995,37 @@ public final class KfcGen {
      *  기존 teleportTo(풀 텔레포트)를 그대로 사용할 것. */
     public static void movePosition(net.minecraft.entity.Entity e, double x, double y, double z) {
         if (e == null) return;
+        // 이동 변위(delta)를 먼저 계산 — 승객 동반 이동에 사용.
+        double _dx = x - e.getX();
+        double _dy = y - e.getY();
+        double _dz = z - e.getZ();
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
             p.networkHandler.requestTeleport(x, y, z, p.getYaw(), p.getPitch());
         } else {
             e.updatePosition(x, y, z);
+        }
+        // 바닐라 /tp <탈것> 은 승객 전체를 좌석 오프셋 유지한 채 함께 옮긴다.
+        // updatePosition/requestTeleport 는 본체만 옮기고 승객을 데려가지 않아,
+        // 루프처럼 매 틱 큰 거리를 연속 텔레포트하면 플레이어 서버 위치가 카트와 벌어져
+        // @a[distance=..N] 속도계, playsound 가청, 체크포인트 위치판정이 모두 어긋났다
+        // (정차 시 다음 틱 승객 동기화로 수렴 -> 소리/속도계 동시 복구 증상).
+        // 좌석 오프셋은 (passengerPos - vehiclePos) 로 보존되므로 동일 delta 평행이동이 정확하다.
+        if (e.hasPassengers() && (_dx != 0.0 || _dy != 0.0 || _dz != 0.0)) {
+            _movePassengersByDelta(e, _dx, _dy, _dz);
+        }
+    }
+
+    /** movePosition 보조: 탈것 이동 변위만큼 승객(및 중첩 승객)을 평행이동해 좌석을 유지한다. */
+    private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
+                                               double dx, double dy, double dz) {
+        for (net.minecraft.entity.Entity ps : vehicle.getPassengerList()) {
+            if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
+                sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
+                        sp.getYaw(), sp.getPitch());
+            } else {
+                ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
+            }
+            if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
         }
     }
 

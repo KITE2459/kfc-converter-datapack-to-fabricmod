@@ -1560,15 +1560,33 @@ public final class KfcGen {
         e.setPitch(pitch);
         e.setHeadYaw(yaw);
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
-            p.networkHandler.requestTeleport(e.getX(), e.getY(), e.getZ(), yaw, pitch);
+            playerRotateOnly(p, yaw, pitch);
         }
+    }
+
+    /** 플레이어 회전만 클라에 강제(위치는 상대=불변). 바닐라 /rotate <player> 와 동일.
+     *  기존 절대좌표 requestTeleport 는 라이딩 중(@s 가 탈것 승객일 때) 탈것 위치
+     *  동기화와 충돌해 회전 패킷이 클라 카메라에 안 먹혔다(루프 시점 고정 미작동).
+     *  Entity.teleport 는 라이딩 플레이어를 하차시키므로 쓰지 않고, 위치 X/Y/Z 를
+     *  상대(델타 0)로 둔 채 yaw/pitch 만 절대로 전송한다. */
+    private static void playerRotateOnly(net.minecraft.server.network.ServerPlayerEntity p,
+                                         float yaw, float pitch) {
+        // 1.21.5: requestTeleport(PlayerPosition, Set<PositionFlag>).
+        // 위치 X/Y/Z 를 '상대'(델타 0 → 불변)로, 속도는 현재값 유지, yaw/pitch 만 '절대'로 전송.
+        // (PositionFlag 에 든 성분 = 상대. X/Y/Z 만 넣고 회전 플래그는 빼서 회전은 절대 적용.)
+        p.networkHandler.requestTeleport(
+                new net.minecraft.entity.player.PlayerPosition(
+                        net.minecraft.util.math.Vec3d.ZERO, p.getVelocity(), yaw, pitch),
+                java.util.Set.of(net.minecraft.network.packet.s2c.play.PositionFlag.X,
+                                 net.minecraft.network.packet.s2c.play.PositionFlag.Y,
+                                 net.minecraft.network.packet.s2c.play.PositionFlag.Z));
     }
 
     /** lookAt(FEET, target) 후 headYaw/플레이어 동기화 — rotate facing 공통 마무리. */
     private static void rotateFinish(net.minecraft.entity.Entity e) {
         e.setHeadYaw(e.getYaw());
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
-            p.networkHandler.requestTeleport(e.getX(), e.getY(), e.getZ(), e.getYaw(), e.getPitch());
+            playerRotateOnly(p, e.getYaw(), e.getPitch());
         }
     }
 
@@ -1853,6 +1871,21 @@ public final class KfcGen {
     public static void lootReplaceEntity(net.minecraft.entity.Entity e, String slotName, int count,
                                          java.util.List<net.minecraft.item.ItemStack> loot) {
         if (e == null || loot == null) return;
+        // item_display 특수 처리: 표시 아이템은 인벤토리 슬롯이 아니라 'item' 데이터 필드라
+        // e.getStackReference(...) 가 StackReference.EMPTY 를 반환 → 아래 슬롯 경로로는 적용이
+        // 스킵된다(생성된 player_head 가 디스플레이에 안 박혀 기존/기본 머리로 보임).
+        // NBT 라운드트립(writeNbt → item 교체 → readNbt)으로 표시 아이템을 직접 설정한다.
+        // (contents 슬롯은 단일 아이템이므로 loot 첫 스택만 사용; 빈 loot 면 item 제거.)
+        if (e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) {
+            net.minecraft.item.ItemStack st = loot.isEmpty()
+                    ? net.minecraft.item.ItemStack.EMPTY : loot.get(0).copy();
+            net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(n);
+            if (st.isEmpty()) n.remove("item");
+            else n.put("item", st.toNbt(e.getRegistryManager()));
+            e.readNbt(n);
+            return;
+        }
         int base = resolveSlotBase(slotName);
         if (base < 0) return;
         int n = (count < 0) ? loot.size() : count;

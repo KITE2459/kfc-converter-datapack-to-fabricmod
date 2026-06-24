@@ -1354,25 +1354,18 @@ public final class KfcGen {
         else p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(t));
     }
 
-    /** facing <target> — src 위치에서 target 지점을 바라보는 회전으로 재바인딩. */
     public static net.minecraft.server.command.ServerCommandSource facing(
             net.minecraft.server.command.ServerCommandSource src, double tx, double ty, double tz) {
-        net.minecraft.util.math.Vec3d o = src.getPosition();
-        double dx = tx - o.x, dy = ty - o.y, dz = tz - o.z;
-        double horiz = Math.sqrt(dx * dx + dz * dz);
-        float yaw = (float) (net.minecraft.util.math.MathHelper.atan2(dz, dx) * 57.2957795 - 90.0);
-        float pitch = (float) (-(net.minecraft.util.math.MathHelper.atan2(dy, horiz) * 57.2957795));
-        return src.withRotation(new net.minecraft.util.math.Vec2f(pitch, yaw));
+        return src.withLookingAt(new net.minecraft.util.math.Vec3d(tx, ty, tz));
     }
 
-    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함. */
+    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함.
+     *  EntityAnchor.EYES/FEET.positionAt(e) 는 각각 getEyePos()/getPos() 와 동일. withLookingAt 위임. */
     public static net.minecraft.server.command.ServerCommandSource facingEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e, boolean eyes) {
         if (e == null) return src;
-        net.minecraft.util.math.Vec3d t = eyes
-                ? e.getEyePos()
-                : e.getPos();
-        return facing(src, t.x, t.y, t.z);
+        net.minecraft.util.math.Vec3d t = eyes ? e.getEyePos() : e.getPos();
+        return src.withLookingAt(t);
     }
 
     /** anchored eyes — caret(^) 원점을 실행자 눈 위치로(소스 위치 리바인드). */

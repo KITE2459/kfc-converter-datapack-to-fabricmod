@@ -1501,6 +1501,7 @@ public final class KfcGen {
     /** summon <type> <pos> <nbt> — NBT 에 id 주입 후 위치 설정해 스폰. */
     public static void summon(net.minecraft.server.world.ServerWorld world, String type,
                               double x, double y, double z, String nbtSnbt) {
+        boolean dbgHead = nbtSnbt != null && nbtSnbt.contains("loop-player-head");
         try {
             net.minecraft.nbt.NbtCompound nbt;
             if (nbtSnbt != null && !nbtSnbt.isEmpty()) {
@@ -1514,8 +1515,16 @@ public final class KfcGen {
                         ent.refreshPositionAndAngles(x, y, z, ent.getYaw(), ent.getPitch());
                         return ent;
                     });
-            if (e != null) { world.spawnNewEntityAndPassengers(e); snapAdd(e); }
-        } catch (Exception ignored) {}
+            if (e != null) {
+                world.spawnNewEntityAndPassengers(e); snapAdd(e);
+                if (dbgHead) System.out.println("[KFC-HEAD] summon player-model OK type=" + type
+                        + " passengers=" + e.getPassengerList().size() + " pos=" + e.getPos());
+            } else if (dbgHead) {
+                System.out.println("[KFC-HEAD] summon player-model: loadEntityWithPassengers returned NULL");
+            }
+        } catch (Exception ex) {
+            if (dbgHead) { System.out.println("[KFC-HEAD] summon player-model THREW: " + ex); ex.printStackTrace(); }
+        }
     }
 
     /** tp <e> <pos> — 엔티티를 좌표로 이동(회전 유지). */
@@ -1789,6 +1798,8 @@ public final class KfcGen {
     /** source: loot <table> — CHEST 컨텍스트(ORIGIN + THIS_ENTITY optional). executeLoot 그대로. */
     public static java.util.List<net.minecraft.item.ItemStack> lootFromTable(
             net.minecraft.server.command.ServerCommandSource source, String tableId) {
+        if (tableId != null && tableId.contains("playerhead"))
+            System.out.println("[KFC-HEAD] lootFromTable CALLED table=" + tableId);
         try {
             java.util.Optional<net.minecraft.registry.entry.RegistryEntry.Reference<net.minecraft.loot.LootTable>> entry =
                     source.getServer().getReloadableRegistries().createRegistryLookup()
@@ -2508,13 +2519,33 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
+        boolean dbg = false;
+        for (String tg : tagsPos) if ("loop-player-head".equals(tg)) dbg = true;
+        int total = 0, hasHead = 0, both = 0, inRng = 0;
         for (net.minecraft.entity.EntityType<?> t : types) {
             for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
+                if (dbg) {
+                    total++;
+                    if (e.getCommandTags().contains("loop-player-head")) hasHead++;
+                    if (matchTags(e, tagsPos, tagsNeg)) { both++; if (inRange(origin, e, minDist, maxDist)) inRng++; }
+                }
                 if (!matchTags(e, tagsPos, tagsNeg)) continue;
                 if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
                 if (d < bestD) { bestD = d; best = e; }
             }
+        }
+        if (dbg) {
+            int worldHead = 0, worldDisp = 0;
+            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+                if (e instanceof net.minecraft.entity.decoration.DisplayEntity) worldDisp++;
+                if (e.getCommandTags().contains("loop-player-head")) worldHead++;
+            }
+            System.out.println("[KFC-HEAD] nearestEntity(loop-player-head) origin=" + origin
+                    + " typeBucketTotal=" + total + " hasHeadTag=" + hasHead + " matchBothTags=" + both
+                    + " inRange=" + inRng + " min=" + minDist + " max=" + maxDist
+                    + " | WORLD-DIRECT: displayEntities=" + worldDisp + " loopPlayerHead=" + worldHead
+                    + " -> " + (best == null ? "NULL" : best.getType()));
         }
         return best;
     }

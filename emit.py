@@ -587,7 +587,7 @@ def resolve_entity_types(sel: "Selector") -> list[str] | None:
 
 def java_str_array(items: list[str]) -> str:
     if not items:
-        return "new String[0]"
+        return "KfcGen.NO_TAGS"   # 공유 빈 배열 — 호출당 new String[0] 할당 제거
     return "new String[]{" + ", ".join(jstr(t) for t in items) + "}"
 
 
@@ -6954,7 +6954,7 @@ def rotation_conds(sel, evar: str):
 def jarr_tags(tags: list) -> str:
     """태그 리스트 -> 자바 String[] 리터럴."""
     if not tags:
-        return "new String[0]"
+        return "KfcGen.NO_TAGS"   # 공유 빈 배열 — 호출당 new String[0] 할당 제거
     return "new String[]{" + ", ".join(jstr(t) for t in tags) + "}"
 
 

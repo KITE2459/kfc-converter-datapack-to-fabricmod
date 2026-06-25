@@ -388,6 +388,19 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     if _is_traced(fid):
         body = f'KfcGen.trace("{fid}", source);\n' + body
 
+    # ── peephole 최적화: 틱 내 불변값 캐싱 ──
+    # executor(=source.getEntity(), 한 번 대입·불변)와 source(메서드 파라미터·불변, ServerCommandSource
+    # 는 immutable)에서 반복 추출하는 값을 1회만 계산해 재사용한다. 핫패스(per-entity per-tick)에서
+    # executor.getNameForScoreboard() 는 비-플레이어의 경우 매번 UUID.toString() 을 할당하므로
+    # 함수당 수십 회 → 1 회로 줄이면 할당/CPU 가 크게 준다. 루프-로컬 엔티티(_onEntN/_pp 등)는
+    # 'executor.' 가 아니므로 치환되지 않아 고증 안전(반복마다 바뀌는 값은 캐시하지 않음).
+    cache_exname = body.count("executor.getNameForScoreboard()") >= 2
+    if cache_exname:
+        body = body.replace("executor.getNameForScoreboard()", "_exName")
+    cache_pos = body.count("source.getPosition()") >= 2
+    if cache_pos:
+        body = body.replace("source.getPosition()", "_pos")
+
     # 필요한 prelude/import 결정 (본문 토큰 스캔; 주석 줄은 제외)
     scan_src = "\n".join(l for l in body.split("\n") if not l.lstrip().startswith("//"))
     used = set(re.findall(r'\b[A-Za-z_]\w*\b', scan_src))
@@ -395,7 +408,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
 
     prelude_stmts = []
     # executor 는 거의 항상 필요(태그/스코어 @s/data). ctx/sb 는 쓰일 때만.
-    need_executor = "executor" in used
+    need_executor = "executor" in used or cache_exname  # _exName 선언이 executor 를 참조
     need_ctx = "ctx" in used
     need_sb = "sb" in used
     need_server = "server" in used
@@ -403,6 +416,10 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         need_ctx = True
     if need_executor:
         d, imps = PRELUDE["executor"]; prelude_stmts.append(d); imports.update(imps)
+    if cache_exname:
+        prelude_stmts.append("String _exName = executor == null ? null : executor.getNameForScoreboard();")
+    if cache_pos:
+        prelude_stmts.append("net.minecraft.util.math.Vec3d _pos = source.getPosition();")
     if need_ctx:
         d, imps = PRELUDE["ctx"]; prelude_stmts.append(d); imports.update(imps)
     if need_sb:

@@ -13,7 +13,6 @@ import net.minecraft.scoreboard.ServerScoreboard;
  * 모두 홀더 NAME(String) 으로 동작 — '@s' 는 executor.getNameForScoreboard(), '#foo' 는 리터럴.
  */
 public final class KfcGen {
-    public static final boolean DBG_SCORECMP = Boolean.getBoolean("kfc.dbg.scorecmp");
 
     // ── 핫패스 캐시 ──────────────────────────────────────────────
     // 변환 출력은 상수 문자열(홀더명/사운드id/태그id/SNBT/텍스트 컴포넌트)을 매 틱 반복
@@ -104,14 +103,24 @@ public final class KfcGen {
     static void snapAdd(net.minecraft.entity.Entity e) {
         ENTITY_GEN++;                        // gen 은 단조 증가 유지(다른 캐시/판정과 일관)
         if (e == null || SNAP_ENTITIES == null) return;
-        if (e.hasPassengers()) return;       // 탑승자 동반 스폰(드묾) → SNAP_GEN 미갱신 = 전체 재수집 폴백
+        // 엔티티 + 모든 탑승자(재귀) 를 스냅샷에 반영한다.
+        // spawnNewEntityAndPassengers 는 차량과 탑승자를 같은 틱에 함께 월드에 추가하므로,
+        // parent 만 넣으면 탑승자(예: player_head item_display = loop-player-head)가 같은 틱
+        // 셀렉터 / typeBucket 에서 누락된다.
+        // [버그 이력] 과거 'if (e.hasPassengers()) return;' 폴백은 SNAP_GEN 을 갱신하지 않아
+        // 다음 entitiesSnapshot 에서 전체 재수집을 의도했으나, 그 직후의 '탑승자 없는' 다른 단일
+        // snapAdd 가 SNAP_GEN = ENTITY_GEN 으로 스냅샷을 다시 '유효' 표시 → 모델(block_display +
+        // N item_display)이 빠진 스냅샷이 그 틱 내내 굳어 loop-player-head 가 0개로 관측됐다.
         SNAP_ENTITIES.add(e);
-        SNAP_GEN = ENTITY_GEN;               // 증분 반영했으므로 현재 gen 으로 '유효' 표시
+        for (net.minecraft.entity.Entity p : e.getPassengersDeep()) SNAP_ENTITIES.add(p);
+        SNAP_GEN = ENTITY_GEN;               // 엔티티+탑승자 전부 반영 → 현재 gen 으로 '유효' 표시
     }
     static void snapRemove(net.minecraft.entity.Entity e) {
         ENTITY_GEN++;
         if (e == null || SNAP_ENTITIES == null) return;
-        if (e.hasPassengers()) return;       // 탑승자 동반 제거 → 전체 재수집 폴백
+        // 단일 제거. discard 된 차량의 탑승자는 분리(dismount)되어 월드에 남으므로 스냅샷에서 빼지 않는다.
+        // 탑승자도 함께 kill 되는 경우엔 각 엔티티가 자기 snapRemove 호출을 받는다.
+        // (과거 'if (e.hasPassengers()) return;' 은 SNAP_GEN 을 stale 로 남겨 snapAdd 와 동일한 버그를 유발.)
         SNAP_ENTITIES.remove(e);
         SNAP_GEN = ENTITY_GEN;
     }
@@ -1501,7 +1510,6 @@ public final class KfcGen {
     /** summon <type> <pos> <nbt> — NBT 에 id 주입 후 위치 설정해 스폰. */
     public static void summon(net.minecraft.server.world.ServerWorld world, String type,
                               double x, double y, double z, String nbtSnbt) {
-        boolean dbgHead = nbtSnbt != null && nbtSnbt.contains("loop-player-head");
         try {
             net.minecraft.nbt.NbtCompound nbt;
             if (nbtSnbt != null && !nbtSnbt.isEmpty()) {
@@ -1517,13 +1525,10 @@ public final class KfcGen {
                     });
             if (e != null) {
                 world.spawnNewEntityAndPassengers(e); snapAdd(e);
-                if (dbgHead) System.out.println("[KFC-HEAD] summon player-model OK type=" + type
-                        + " passengers=" + e.getPassengerList().size() + " pos=" + e.getPos());
-            } else if (dbgHead) {
-                System.out.println("[KFC-HEAD] summon player-model: loadEntityWithPassengers returned NULL");
             }
         } catch (Exception ex) {
-            if (dbgHead) { System.out.println("[KFC-HEAD] summon player-model THREW: " + ex); ex.printStackTrace(); }
+            // 소환 실패(SNBT 파싱/로드 등)는 곧 '엔티티 없음'이므로 무음 삼키지 않고 한 줄로 보고한다.
+            System.err.println("[KFC] summon failed type=" + type + " : " + ex);
         }
     }
 
@@ -1580,7 +1585,6 @@ public final class KfcGen {
      *  상대(델타 0)로 둔 채 yaw/pitch 만 절대로 전송한다. */
     private static void playerRotateOnly(net.minecraft.server.network.ServerPlayerEntity p,
                                          float yaw, float pitch) {
-        System.out.println("[KFC-VER] head-fix-v4-rotate playerRotateOnly yaw=" + yaw + " riding=" + p.hasVehicle());
         // 바닐라 /rotate 와 동일: ServerPlayerEntity.rotate(yaw,pitch) → PlayerRotationS2CPacket 전송.
         // requestTeleport 는 탑승 중인 플레이어의 시점을 못 돌리지만(서버 위치텔포는 라이딩 클라가 무시),
         // 이 회전 전용 패킷(1.21.2+)은 탑승 중에도 클라 시점을 강제 회전시킨다 = 카메라 락.
@@ -1798,8 +1802,6 @@ public final class KfcGen {
     /** source: loot <table> — CHEST 컨텍스트(ORIGIN + THIS_ENTITY optional). executeLoot 그대로. */
     public static java.util.List<net.minecraft.item.ItemStack> lootFromTable(
             net.minecraft.server.command.ServerCommandSource source, String tableId) {
-        if (tableId != null && tableId.contains("playerhead"))
-            System.out.println("[KFC-HEAD] lootFromTable CALLED table=" + tableId);
         try {
             java.util.Optional<net.minecraft.registry.entry.RegistryEntry.Reference<net.minecraft.loot.LootTable>> entry =
                     source.getServer().getReloadableRegistries().createRegistryLookup()
@@ -1878,21 +1880,13 @@ public final class KfcGen {
     public static void lootReplaceEntity(net.minecraft.entity.Entity e, String slotName, int count,
                                          java.util.List<net.minecraft.item.ItemStack> loot) {
         if (e == null || loot == null) return;
-        // [진단] 이 줄이 로그에 안 보이면 = 이 KfcGen 이 실제 빌드에 배포되지 않은 것(convert.py 가
-        // convert.py 옆 KfcGen.java 로 출력을 덮어쓰므로, 패치본은 반드시 그 위치에 둬야 함).
-        System.out.println("[KFC-VER] head-fix-v3 lootReplaceEntity e=" + e.getType()
-                + " slot=" + slotName + " lootN=" + loot.size());
         // item_display 의 표시 아이템은 getStackReference(0) 으로 접근한다(= setItemStack 백킹 →
         // DataTracker 갱신 + 클라 동기화). 인덱스 0 이 item ref(바이트코드로 확인), 그 외 EMPTY.
         if (e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) {
             net.minecraft.item.ItemStack st = loot.isEmpty()
                     ? net.minecraft.item.ItemStack.EMPTY : loot.get(0).copy();
             net.minecraft.inventory.StackReference ref = e.getStackReference(0);
-            boolean empty = (ref == net.minecraft.inventory.StackReference.EMPTY);
-            System.out.println("[KFC-HEAD] item_display: refEmpty=" + empty
-                    + " before=" + (empty ? "-" : ref.get()) + " setTo=" + st);
-            if (!empty) ref.set(st);
-            System.out.println("[KFC-HEAD] item_display after: " + (empty ? "-" : ref.get()));
+            if (ref != net.minecraft.inventory.StackReference.EMPTY) ref.set(st);
             return;
         }
         int base = resolveSlotBase(slotName);
@@ -2391,8 +2385,6 @@ public final class KfcGen {
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, String hb, String ob) {
         Integer a = read(sb, ha, oa), b = read(sb, hb, ob);
-        if (DBG_SCORECMP) System.out.println("[KFC-CMP] " + ha + "." + oa + "(" + a + ") "
-                + op + " " + hb + "." + ob + "(" + b + ")");
         if (a == null || b == null) return false;
         switch (op) {
             case "<":  return a < b;
@@ -2434,8 +2426,6 @@ public final class KfcGen {
     }
     public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                    String op, net.minecraft.entity.Entity eb, String ob, boolean neg) {
-        if (DBG_SCORECMP) System.out.println("[KFC-CMP-E] ea=" + (ea==null?"null":ea.getNameForScoreboard()+"@"+ea.getPos())
-                + " eb=" + (eb==null?"null":eb.getNameForScoreboard()+"@"+eb.getPos()));
         if (ea == null || eb == null) return false;
         return neg ^ scoreCmp(sb, ea.getNameForScoreboard(), oa, op, eb.getNameForScoreboard(), ob);
     }
@@ -2519,33 +2509,13 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
-        boolean dbg = false;
-        for (String tg : tagsPos) if ("loop-player-head".equals(tg)) dbg = true;
-        int total = 0, hasHead = 0, both = 0, inRng = 0;
         for (net.minecraft.entity.EntityType<?> t : types) {
             for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
-                if (dbg) {
-                    total++;
-                    if (e.getCommandTags().contains("loop-player-head")) hasHead++;
-                    if (matchTags(e, tagsPos, tagsNeg)) { both++; if (inRange(origin, e, minDist, maxDist)) inRng++; }
-                }
                 if (!matchTags(e, tagsPos, tagsNeg)) continue;
                 if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
                 if (d < bestD) { bestD = d; best = e; }
             }
-        }
-        if (dbg) {
-            int worldHead = 0, worldDisp = 0;
-            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
-                if (e instanceof net.minecraft.entity.decoration.DisplayEntity) worldDisp++;
-                if (e.getCommandTags().contains("loop-player-head")) worldHead++;
-            }
-            System.out.println("[KFC-HEAD] nearestEntity(loop-player-head) origin=" + origin
-                    + " typeBucketTotal=" + total + " hasHeadTag=" + hasHead + " matchBothTags=" + both
-                    + " inRange=" + inRng + " min=" + minDist + " max=" + maxDist
-                    + " | WORLD-DIRECT: displayEntities=" + worldDisp + " loopPlayerHead=" + worldHead
-                    + " -> " + (best == null ? "NULL" : best.getType()));
         }
         return best;
     }

@@ -3050,6 +3050,41 @@ public final class KfcGen {
         catch (Exception e) { return false; }
     }
 
+    // ──────────────── 엔티티 NBT 읽기 스냅샷 캐시 ────────────────
+    //  같은 틱 안에서 같은 엔티티를 여러 번 읽을 때 writeNbt(엔티티 전체 직렬화) 반복을 제거한다.
+    //  불변식(원본과 관측 동등): 엔티티가 항상 진실의 원천 — 캐시는 '현재 틱·미변경' 상태에서만 재사용된다.
+    //   · e.age (엔티티가 틱하면 +1) 가 바뀌면 무효 → 틱 경계에서 자동 갱신(엔티티 자체 틱 변화 반영).
+    //   · ENTITY_GEN (소환/킬/브릿지 디스패치 시 증가) 이 바뀌면 무효 → 외부 변경 반영.
+    //   · 우리 쓰기 경로(set/put/append/merge/remove)는 invalidateSnapshot 로 즉시 무효(write-through).
+    //  명령 함수는 엔티티 틱 페이즈와 분리되어 동기 실행되므로, 한 실행 내 다중 읽기는 동일 age 로 안전하다.
+    private static final boolean ENTITY_READ_CACHE = true;
+    private static final class NbtSnap {
+        final net.minecraft.nbt.NbtCompound nbt; final int age; final long gen;
+        NbtSnap(net.minecraft.nbt.NbtCompound n, int a, long g) { nbt = n; age = a; gen = g; }
+    }
+    private static final java.util.Map<net.minecraft.entity.Entity, NbtSnap> ENTITY_NBT_SNAP =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<net.minecraft.entity.Entity, NbtSnap>());
+
+    /** 엔티티 writeNbt 스냅샷(현재 틱·미변경이면 재사용). 읽기 전용으로만 사용 — 변형 금지. */
+    private static net.minecraft.nbt.NbtCompound entitySnapshot(net.minecraft.entity.Entity e) {
+        if (ENTITY_READ_CACHE) {
+            NbtSnap s = ENTITY_NBT_SNAP.get(e);
+            if (s != null && s.age == e.age && s.gen == ENTITY_GEN) return s.nbt;
+            net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(n);
+            ENTITY_NBT_SNAP.put(e, new NbtSnap(n, e.age, ENTITY_GEN));
+            return n;
+        }
+        net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
+        e.writeNbt(n);
+        return n;
+    }
+
+    /** 엔티티 NBT 를 바꾸는 쓰기 직후 스냅샷 무효화(write-through). */
+    private static void invalidateSnapshot(net.minecraft.entity.Entity e) {
+        if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.remove(e);
+    }
+
     // ── source 읽기 ──
     public static net.minecraft.nbt.NbtElement nbtGetEntity(net.minecraft.entity.Entity e, String path) {
         if (e == null) return null;
@@ -3060,9 +3095,10 @@ public final class KfcGen {
         if (f != null) return f;
         net.minecraft.nbt.NbtElement slot = slotAccessorNbt(e, pt0);   // weapon/equipment/armor/container 슬롯 접근자
         if (slot != null) return slot;
-        net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(n);
-        return getAtPath(n, path);
+        // 캐시된 스냅샷(현재 상태)에서 읽되, 캐시 내부 객체가 호출부로 새지 않도록 copy 해 반환
+        // (원본은 throwaway writeNbt 버퍼를 반환했으므로 copy 가 소유권 의미상 동일·더 안전).
+        net.minecraft.nbt.NbtElement r = getAtPath(entitySnapshot(e), path);
+        return r == null ? null : r.copy();
     }
 
     /** writeNbt 라운드트립 없이 라이브 게터로 동일한 NbtElement 를 구성하는 fast-path.
@@ -3121,9 +3157,7 @@ public final class KfcGen {
         if (e == null) return 0;
         net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
         if (p == null) return 0;
-        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(nbt);
-        try { return p.count(nbt); } catch (Exception ex) { return 0; }
+        try { return p.count(entitySnapshot(e)); } catch (Exception ex) { return 0; }
     }
     public static int storagePathCount(net.minecraft.server.MinecraftServer server, String id, String path) {
         net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
@@ -3221,6 +3255,7 @@ public final class KfcGen {
 
     public static void nbtSetEntity(net.minecraft.entity.Entity e, String path, net.minecraft.nbt.NbtElement v) {
         if (e == null || v == null) return;
+        invalidateSnapshot(e);
         String pt = path.replace(" ", "");
         if (displaySetFast(e, pt, v)) return;
         net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
@@ -3284,6 +3319,7 @@ public final class KfcGen {
     public static void nbtAppendEntity(net.minecraft.entity.Entity e, String path,
                                        net.minecraft.nbt.NbtElement elem, boolean prepend) {
         if (e == null || elem == null) return;
+        invalidateSnapshot(e);
         net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(root);
         if (appendAtPath(root, path, elem, prepend)) e.readNbt(root);
@@ -3303,6 +3339,7 @@ public final class KfcGen {
     /** store result entity <sel> <path> <type> <scale> — 타입 숫자를 임의 NBT 경로에 기록. */
     public static void entityPutNumberPath(net.minecraft.entity.Entity e, String path, String type, double value) {
         if (e == null) return;
+        invalidateSnapshot(e);
         // 회전(Rotation[0]=yaw, Rotation[1]=pitch)은 NBT 라운드트립 대신 직접 적용 —
         // 디스플레이 엔티티 등에서 writeNbt/readNbt 로는 라이브 회전이 확실히 갱신되지 않을 수 있다.
         if (path.equals("Rotation[0]")) {
@@ -3450,9 +3487,7 @@ public final class KfcGen {
     // 엔티티 NBT 는 writeNbt 로 스냅샷 → 수정 → readNbt 로 반영. 비싸므로 gated.
 
     public static int entityGetNumber(net.minecraft.entity.Entity e, String path) {
-        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(nbt);
-        return (int) nbtNum(getAtPath(nbt, path));   // NbtPath: 인덱스/필터 경로 정확
+        return (int) nbtNum(getAtPath(entitySnapshot(e), path));   // NbtPath: 인덱스/필터 경로 정확
     }
 
     /** null-safe 버전 — 셀렉터 대상이 없으면 0. */
@@ -3462,6 +3497,7 @@ public final class KfcGen {
     }
 
     public static void entityPutNumber(net.minecraft.entity.Entity e, String path, double value) {
+        invalidateSnapshot(e);
         net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(nbt);
         if (putAtPath(nbt, path, net.minecraft.nbt.NbtInt.of((int) value))) e.readNbt(nbt);   // NbtPath
@@ -3487,6 +3523,7 @@ public final class KfcGen {
 
     public static void entityPutSnbt(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return;
+        invalidateSnapshot(e);
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -3526,6 +3563,7 @@ public final class KfcGen {
 
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {
         if (e == null) return;
+        invalidateSnapshot(e);
         try {
             // SNBT 리터럴은 변환 시점 상수 — 캐시된 템플릿을 copy (storagePutSnbt 와 동일 패턴).
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -3545,6 +3583,7 @@ public final class KfcGen {
     }
 
     public static void entityRemovePath(net.minecraft.entity.Entity e, String path) {
+        invalidateSnapshot(e);
         // DisplayEntity 의 brightness 는 DataTracker 필드 — writeNbt/readNbt 폴백으로는
         // 트래커가 갱신되지 않아 라이트가 꺼지지 않는다. setBrightness(null) 로 직접 제거(기본값 복귀).
         if ("brightness".equals(path.replace(" ", ""))
@@ -3603,11 +3642,47 @@ public final class KfcGen {
         return e.toString();
     }
 
+    /** 매크로 인자 Map — 원본(즉시 전 키 문자열화)과 관측 동등하되, 비싼 값(컴파운드/리스트의 SNBT
+     *  toString, 스파크상 nbtToMacroString 22.5k ms)을 실제 참조될 때까지 미룬다.
+     *  바인드 시점 스냅샷 보존: 스칼라는 즉시 문자열화, 비스칼라는 그 자리에서 copy(깊은 복사)해 둔다.
+     *  → 소스가 호출 도중 제자리 변형돼도 바인드 시점 값으로 해소(바닐라 `with` 스냅샷 시맨틱과 동일).
+     *  참조되지 않은 비스칼라 키는 toString 을 영영 수행하지 않아 그만큼 절약된다. */
+    private static final class SnapMacroArgs extends java.util.AbstractMap<String, String> {
+        private final java.util.HashMap<String, String> resolved = new java.util.HashMap<>();
+        private final java.util.HashMap<String, net.minecraft.nbt.NbtElement> pending = new java.util.HashMap<>();
+        SnapMacroArgs(net.minecraft.nbt.NbtCompound c) {
+            for (String k : c.getKeys()) {
+                net.minecraft.nbt.NbtElement el = c.get(k);
+                if (el == null) continue;
+                if (el instanceof net.minecraft.nbt.NbtString
+                        || el instanceof net.minecraft.nbt.AbstractNbtNumber) {
+                    resolved.put(k, nbtToMacroString(el));     // 스칼라: 즉시 스냅샷(원본과 동일)
+                } else {
+                    pending.put(k, el.copy());                 // 비스칼라: 바인드 시점 깊은 복사 스냅샷, toString 지연
+                }
+            }
+        }
+        @Override public boolean containsKey(Object k) {
+            return resolved.containsKey(k) || pending.containsKey(k);
+        }
+        @Override public String get(Object k) {
+            if (resolved.containsKey(k)) return resolved.get(k);
+            net.minecraft.nbt.NbtElement el = pending.get(k);
+            if (el == null) return null;
+            String v = nbtToMacroString(el);                   // 최초 참조 시 1회만 직렬화
+            resolved.put((String) k, v); pending.remove(k);
+            return v;
+        }
+        @Override public String put(String k, String v) { pending.remove(k); return resolved.put(k, v); }
+        @Override public java.util.Set<Entry<String, String>> entrySet() {
+            for (String k : new java.util.ArrayList<>(pending.keySet())) get(k);   // 남은 비스칼라 해소
+            return resolved.entrySet();
+        }
+    }
+
     private static java.util.Map<String, String> compoundToMacroArgs(net.minecraft.nbt.NbtCompound c) {
-        java.util.Map<String, String> m = new java.util.HashMap<>();
-        if (c == null) return m;
-        for (String k : c.getKeys()) m.put(k, nbtToMacroString(c.get(k)));
-        return m;
+        if (c == null) return new java.util.HashMap<>();
+        return new SnapMacroArgs(c);
     }
 
     /** function X with storage <id> — 스토리지 루트 컴파운드의 각 필드 → 매크로 인자. */
@@ -3627,8 +3702,7 @@ public final class KfcGen {
     public static java.util.Map<String, String> entityMacroArgs(
             net.minecraft.entity.Entity e, String path) {
         if (e == null) return new java.util.HashMap<>();
-        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(nbt);
+        net.minecraft.nbt.NbtCompound nbt = entitySnapshot(e);
         if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt);
         return compoundToMacroArgs(compoundAt(nbt, path));
     }

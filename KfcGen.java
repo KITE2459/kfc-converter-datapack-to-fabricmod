@@ -1354,18 +1354,25 @@ public final class KfcGen {
         else p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.TitleS2CPacket(t));
     }
 
+    /** facing <target> — src 위치에서 target 지점을 바라보는 회전으로 재바인딩. */
     public static net.minecraft.server.command.ServerCommandSource facing(
             net.minecraft.server.command.ServerCommandSource src, double tx, double ty, double tz) {
-        return src.withLookingAt(new net.minecraft.util.math.Vec3d(tx, ty, tz));
+        net.minecraft.util.math.Vec3d o = src.getPosition();
+        double dx = tx - o.x, dy = ty - o.y, dz = tz - o.z;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) (net.minecraft.util.math.MathHelper.atan2(dz, dx) * 57.2957795 - 90.0);
+        float pitch = (float) (-(net.minecraft.util.math.MathHelper.atan2(dy, horiz) * 57.2957795));
+        return src.withRotation(new net.minecraft.util.math.Vec2f(pitch, yaw));
     }
 
-    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함.
-     *  EntityAnchor.EYES/FEET.positionAt(e) 는 각각 getEyePos()/getPos() 와 동일. withLookingAt 위임. */
+    /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함. */
     public static net.minecraft.server.command.ServerCommandSource facingEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e, boolean eyes) {
         if (e == null) return src;
-        net.minecraft.util.math.Vec3d t = eyes ? e.getEyePos() : e.getPos();
-        return src.withLookingAt(t);
+        net.minecraft.util.math.Vec3d t = eyes
+                ? e.getEyePos()
+                : e.getPos();
+        return facing(src, t.x, t.y, t.z);
     }
 
     /** anchored eyes — caret(^) 원점을 실행자 눈 위치로(소스 위치 리바인드). */
@@ -1564,15 +1571,11 @@ public final class KfcGen {
      *  상대(델타 0)로 둔 채 yaw/pitch 만 절대로 전송한다. */
     private static void playerRotateOnly(net.minecraft.server.network.ServerPlayerEntity p,
                                          float yaw, float pitch) {
-        // 1.21.5: requestTeleport(PlayerPosition, Set<PositionFlag>).
-        // 위치 X/Y/Z 를 '상대'(델타 0 → 불변)로, 속도는 현재값 유지, yaw/pitch 만 '절대'로 전송.
-        // (PositionFlag 에 든 성분 = 상대. X/Y/Z 만 넣고 회전 플래그는 빼서 회전은 절대 적용.)
-        p.networkHandler.requestTeleport(
-                new net.minecraft.entity.player.PlayerPosition(
-                        net.minecraft.util.math.Vec3d.ZERO, p.getVelocity(), yaw, pitch),
-                java.util.Set.of(net.minecraft.network.packet.s2c.play.PositionFlag.X,
-                                 net.minecraft.network.packet.s2c.play.PositionFlag.Y,
-                                 net.minecraft.network.packet.s2c.play.PositionFlag.Z));
+        System.out.println("[KFC-VER] head-fix-v4-rotate playerRotateOnly yaw=" + yaw + " riding=" + p.hasVehicle());
+        // 바닐라 /rotate 와 동일: ServerPlayerEntity.rotate(yaw,pitch) → PlayerRotationS2CPacket 전송.
+        // requestTeleport 는 탑승 중인 플레이어의 시점을 못 돌리지만(서버 위치텔포는 라이딩 클라가 무시),
+        // 이 회전 전용 패킷(1.21.2+)은 탑승 중에도 클라 시점을 강제 회전시킨다 = 카메라 락.
+        p.rotate(yaw, pitch);
     }
 
     /** lookAt(FEET, target) 후 headYaw/플레이어 동기화 — rotate facing 공통 마무리. */
@@ -1793,15 +1796,11 @@ public final class KfcGen {
                                     net.minecraft.registry.RegistryKeys.LOOT_TABLE,
                                     idOf(tableId)));
             if (entry.isEmpty()) return java.util.List.of();
-            // COMMAND 타입: ORIGIN 필수 + THIS_ENTITY 허용. (/loot ... loot <table> 와 동일 의미.)
-            // CHEST 타입은 THIS_ENTITY 를 허용하지 않아 addOptional(THIS_ENTITY) 가 조용히 무시되고,
-            // entity 루트테이블의 fill_player_head{entity:"this"} 가 플레이어를 못 읽어
-            // 프로필이 안 박힌 기본 스티브 player_head 가 나왔다. COMMAND 로 THIS_ENTITY 를 살린다.
             net.minecraft.loot.context.LootWorldContext lc =
                     new net.minecraft.loot.context.LootWorldContext.Builder(source.getWorld())
                             .addOptional(net.minecraft.loot.context.LootContextParameters.THIS_ENTITY, source.getEntity())
                             .add(net.minecraft.loot.context.LootContextParameters.ORIGIN, source.getPosition())
-                            .build(net.minecraft.loot.context.LootContextTypes.COMMAND);
+                            .build(net.minecraft.loot.context.LootContextTypes.CHEST);
             return entry.get().value().generateLoot(lc);
         } catch (Exception e) { return java.util.List.of(); }
     }
@@ -1868,21 +1867,21 @@ public final class KfcGen {
     public static void lootReplaceEntity(net.minecraft.entity.Entity e, String slotName, int count,
                                          java.util.List<net.minecraft.item.ItemStack> loot) {
         if (e == null || loot == null) return;
-        // item_display 특수 처리: 표시 아이템은 인벤토리 슬롯이 아니라 'item' 데이터 필드라
-        // e.getStackReference(...) 가 StackReference.EMPTY 를 반환 → 아래 슬롯 경로로는 적용이
-        // 스킵된다(생성된 player_head 가 디스플레이에 안 박혀 기존/기본 머리로 보임).
-        // NBT 라운드트립(writeNbt → item 교체 → readNbt)으로 표시 아이템을 직접 설정한다.
-        // (contents 슬롯은 단일 아이템이므로 loot 첫 스택만 사용; 빈 loot 면 item 제거.)
+        // [진단] 이 줄이 로그에 안 보이면 = 이 KfcGen 이 실제 빌드에 배포되지 않은 것(convert.py 가
+        // convert.py 옆 KfcGen.java 로 출력을 덮어쓰므로, 패치본은 반드시 그 위치에 둬야 함).
+        System.out.println("[KFC-VER] head-fix-v3 lootReplaceEntity e=" + e.getType()
+                + " slot=" + slotName + " lootN=" + loot.size());
+        // item_display 의 표시 아이템은 getStackReference(0) 으로 접근한다(= setItemStack 백킹 →
+        // DataTracker 갱신 + 클라 동기화). 인덱스 0 이 item ref(바이트코드로 확인), 그 외 EMPTY.
         if (e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) {
-            // item_display 의 표시 아이템은 getStackReference(0) 으로 접근한다(= setItemStack 백킹 →
-            // DataTracker 갱신 + 클라 동기화). 기존 경로의 resolveSlotBase("contents") 가
-            // ItemDisplayEntity 가 기대하는 인덱스(0)와 달라 getStackReference 가 EMPTY 를 반환 →
-            // 적용이 스킵돼 머리가 안 박혔다. writeNbt/readNbt 폴백은 DisplayEntity 트래커를
-            // 갱신하지 못하므로(brightness 와 동일 이유) 쓰지 않고, 인덱스 0 에 직접 set 한다.
             net.minecraft.item.ItemStack st = loot.isEmpty()
                     ? net.minecraft.item.ItemStack.EMPTY : loot.get(0).copy();
             net.minecraft.inventory.StackReference ref = e.getStackReference(0);
-            if (ref != net.minecraft.inventory.StackReference.EMPTY) ref.set(st);
+            boolean empty = (ref == net.minecraft.inventory.StackReference.EMPTY);
+            System.out.println("[KFC-HEAD] item_display: refEmpty=" + empty
+                    + " before=" + (empty ? "-" : ref.get()) + " setTo=" + st);
+            if (!empty) ref.set(st);
+            System.out.println("[KFC-HEAD] item_display after: " + (empty ? "-" : ref.get()));
             return;
         }
         int base = resolveSlotBase(slotName);
@@ -2051,14 +2050,12 @@ public final class KfcGen {
     private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
                                                double dx, double dy, double dz) {
         for (net.minecraft.entity.Entity ps : vehicle.getPassengerList()) {
-            // 승객(플레이어 포함)은 서버측 updatePosition 으로만 옮긴다(텔레포트 패킷 미발송).
-            // 라이딩 플레이어의 클라 위치는 탈것 엔티티트래킹 + 라이딩 부착으로 따라가므로
-            // 별도 requestTeleport 가 불필요하고(바닐라 /tp <탈것> 도 플레이어를 개별 텔레포트하지 않음),
-            // 오히려 매 tp 마다 보내던 위치 requestTeleport 가 같은 틱 player-yaw 의 회전 텔레포트와
-            // 경쟁해 라이딩 플레이어의 시점 고정(카메라 잠금)을 깨뜨렸다. 서버측 위치만 갱신하면
-            // 소리/속도계/체크포인트(서버 @a[distance]·playsound 판정)는 그대로 맞고,
-            // 1틱당 플레이어 텔레포트 패킷은 회전 1회뿐이라 바닐라처럼 카메라가 잠긴다.
-            ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
+            if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
+                sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
+                        sp.getYaw(), sp.getPitch());
+            } else {
+                ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
+            }
             if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
         }
     }

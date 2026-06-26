@@ -224,10 +224,10 @@ tasks.register('convert') {
     dependsOn 'kfcGenerate'
 }
 
-tasks.named('jar') {
-    entryCompression = ZipEntryCompression.STORED
-}
+// tasks.named('jar') {
+//     entryCompression = ZipEntryCompression.STORED
+// }
 
-tasks.named('remapJar') {
-    entryCompression = ZipEntryCompression.STORED
-}
+// tasks.named('remapJar') {
+//     entryCompression = ZipEntryCompression.STORED
+// }

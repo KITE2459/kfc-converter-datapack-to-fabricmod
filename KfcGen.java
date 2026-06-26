@@ -1505,6 +1505,17 @@ public final class KfcGen {
         }
     }
 
+    /** 명령 좌표 리터럴 파싱(바닐라 WorldCoordinate.parseDouble 의 centerIntegers 규칙).
+     *  center=true(x/z 축)이고 토큰이 정수 리터럴(소수점 '.' 없음)이면 블록 중심으로 +0.5.
+     *  (매크로 변수 좌표처럼 확장 문자열을 런타임에 받는 경우에 사용; 리터럴은 코드젠 시점에 처리된다.) */
+    public static double coord(String tok, boolean center) {
+        if (tok == null) return 0.0;
+        String t = tok.trim();
+        double v = Double.parseDouble(t);
+        if (center && t.indexOf('.') < 0) v += 0.5;   // 정수 리터럴만 센터링(소수점 있으면 정확값)
+        return v;
+    }
+
     /** summon <type> <pos> <nbt> — NBT 에 id 주입 후 위치 설정해 스폰. */
     public static void summon(net.minecraft.server.world.ServerWorld world, String type,
                               double x, double y, double z, String nbtSnbt) {
@@ -1544,8 +1555,13 @@ public final class KfcGen {
     public static void teleportToWithRot(net.minecraft.entity.Entity e, double x, double y, double z,
                                          float yaw, float pitch) {
         if (e == null) return;
+        // 바닐라 TeleportCommand 와 동일: yaw/pitch 를 wrapDegrees 로 정규화 후 전체 teleport.
+        // teleport 은 내부적으로 resetPosition→updateLastAngles 를 호출하므로 디스플레이 엔티티
+        // 회전도 정상 동기화된다(소환 후 tp @s ~ ~ ~ ~rot 패턴).
         e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
-                java.util.Set.of(), yaw, pitch, true);
+                java.util.Set.of(),
+                net.minecraft.util.math.MathHelper.wrapDegrees(yaw),
+                net.minecraft.util.math.MathHelper.wrapDegrees(pitch), true);
     }
 
     /** tp <대상> <좌표> facing <좌표> — 위치 이동 후 좌표를 바라보게(바닐라 Entity.lookAt). */
@@ -1568,12 +1584,15 @@ public final class KfcGen {
     /** rotate <e> <yaw> <pitch> — 엔티티 회전 설정. */
     public static void rotateTo(net.minecraft.entity.Entity e, float yaw, float pitch) {
         if (e == null) return;
-        e.setYaw(yaw);
-        e.setPitch(pitch);
-        e.setHeadYaw(yaw);
-        if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
-            playerRotateOnly(p, yaw, pitch);
-        }
+        // 바닐라 RotateCommand.rotateToPos 와 동일: entity.rotate(yaw, pitch).
+        // Entity.rotate = setYaw + setHeadYaw + setPitch + updateLastAngles().
+        // 과거 구현은 updateLastAngles() 가 빠져, 디스플레이 엔티티(item_display 등)가
+        // 클라이언트 보간 시 lastYaw 갱신 누락으로 회전이 시각적으로 반영되지 않았다
+        // (소환 후 rotate @s ~ 가 안 먹히는 원인). tp 경로는 teleport→resetPosition→
+        // updateLastAngles 로 이미 처리되므로 정상이었다.
+        // ServerPlayerEntity.rotate 오버라이드는 PlayerRotationS2CPacket 을 전송하므로
+        // 플레이어 카메라 락(라이딩 중 포함)은 그대로 유지된다(기존 playerRotateOnly 와 동일).
+        e.rotate(yaw, pitch);
     }
 
     /** 플레이어 회전만 클라에 강제(위치는 상대=불변). 바닐라 /rotate <player> 와 동일.
@@ -1972,9 +1991,7 @@ public final class KfcGen {
         try {
             net.minecraft.nbt.NbtCompound expected =
                     net.minecraft.nbt.StringNbtReader.readCompound(compoundSnbt);
-            net.minecraft.nbt.NbtCompound actual = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(actual);
-            return net.minecraft.nbt.NbtHelper.matches(expected, actual, true);
+            return net.minecraft.nbt.NbtHelper.matches(expected, entitySnapshot(e), true);   // 캐시 스냅샷(읽기 전용)
         } catch (Exception ex) {
             return false;
         }
@@ -2004,8 +2021,7 @@ public final class KfcGen {
         // 슬롯 접근자(weapon/equipment/armor/container.*) — writeNbt 경로로는 안 잡히므로 우선 검사.
         if (slotAccessorNbt(e, path.replace(" ", "")) != null) return true;
         try {
-            net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(root);
+            net.minecraft.nbt.NbtCompound root = entitySnapshot(e);   // 캐시 스냅샷(읽기 전용 탐색)
             String[] parts = path.split("\\.");
             net.minecraft.nbt.NbtCompound cur = root;
             for (int i = 0; i < parts.length - 1; i++) {
@@ -2430,8 +2446,10 @@ public final class KfcGen {
 
     // ──────────────── if entity <selector> 존재 검사 ────────────────
     private static boolean matchTags(net.minecraft.entity.Entity e, String[] pos, String[] neg) {
-        for (String t : pos) if (!e.getCommandTags().contains(t)) return false;
-        for (String t : neg) if (e.getCommandTags().contains(t)) return false;
+        if (pos.length == 0 && neg.length == 0) return true;   // 태그 필터 없음 — getCommandTags 호출조차 생략
+        java.util.Set<String> tags = e.getCommandTags();        // 1회만 조회(매 태그마다 호출 안 함)
+        for (String t : pos) if (!tags.contains(t)) return false;
+        for (String t : neg) if (tags.contains(t)) return false;
         return true;
     }
 
@@ -3407,9 +3425,8 @@ public final class KfcGen {
             net.minecraft.nbt.NbtElement f = displayGetFast(e, pt);
             if (f != null) return nbtNum(f);
         }
-        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(nbt);
-        return nbtNum(getAtPath(nbt, path));
+        net.minecraft.nbt.NbtElement r = getAtPath(entitySnapshot(e), path);   // 캐시된 스냅샷 — data get 반복 시 writeNbt 회피
+        return nbtNum(r);
     }
     public static double storageGetDouble(net.minecraft.server.MinecraftServer server, String id, String path) {
         return nbtNum(getAtPath(storageRoot(server, id), path));

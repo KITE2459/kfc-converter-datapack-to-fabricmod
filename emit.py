@@ -4271,13 +4271,38 @@ KNOWN_ENTITY_PATHS = {
 
 # ───────────────────────── execute emit ─────────────────────────
 # execute 의 수정자를 의미별로 분해.
+def _coord_str_expr(tok):
+    """좌표 토큰을 자바 String 식으로(MACROVAR 포함 가능)."""
+    t = str(tok)
+    if "MACROVAR_" not in t:
+        return jstr(t)
+    parts = [p for p in re.split(r'(MACROVAR_\d+)', t) if p]
+    return " + ".join(p if p.startswith("MACROVAR_") else jstr(p) for p in parts)
+
+
+def _abs_coord_java(p, axis):
+    """절대 좌표 토큰(상대 ~ / 캐럿 ^ 아님) -> 자바 double 식.
+       바닐라 Vec3 인자(tp/positioned/summon/facing 등)의 centerIntegers 규칙:
+       x(0)/z(2) 축에서 '정수 리터럴'(소수점 없음)은 블록 중심으로 +0.5, y(1)축·소수점 리터럴은 그대로.
+       매크로 변수 좌표는 확장 문자열을 런타임(KfcGen.coord)에서 동일 규칙으로 처리한다."""
+    center = axis in (0, 2)
+    t = str(p)
+    if "MACROVAR_" in t:
+        return f'KfcGen.coord({_coord_str_expr(t)}, {"true" if center else "false"})'
+    v = float(t)
+    if center and '.' not in t:        # 정수 리터럴만 센터링
+        v += 0.5
+    return repr(v)
+
+
 def cond_pos_expr(raw: str, src_var: str = "source"):
-    """조건(if block/loaded)용 좌표 식 - src_var 소스 기준 절대/상대/caret -> Vec3d 식."""
+    """조건(if block/loaded)·tp·summon·facing 용 좌표 식 - src_var 기준 절대/상대/caret -> Vec3d 식.
+       절대 정수 x/z 는 바닐라 centerIntegers(+0.5) 적용(if block/loaded 는 floor 라 결과 불변)."""
     parts = raw.split()
     if len(parts) != 3:
         return None
     if all(p.startswith('^') for p in parts):
-        v = [jdouble(p[1:] or '0') for p in parts]
+        v = [jdouble(p[1:] or '0') for p in parts]   # 캐럿(로컬) 오프셋은 센터링 안 함
         return (f'KfcGen.localOffset({src_var}.getPosition(), {src_var}.getRotation(), '
                 f'{v[0]}, {v[1]}, {v[2]})')
     if any(p.startswith('^') for p in parts):
@@ -4285,7 +4310,7 @@ def cond_pos_expr(raw: str, src_var: str = "source"):
     comps = []
     for i, p in enumerate(parts):
         base = f'{src_var}.getPosition().' + ('x', 'y', 'z')[i]
-        comps.append(base if p == '~' else (f'({base} + {jdouble(p[1:])})' if p.startswith('~') else jdouble(p)))
+        comps.append(base if p == '~' else (f'({base} + {jdouble(p[1:])})' if p.startswith('~') else _abs_coord_java(p, i)))
     return f'new net.minecraft.util.math.Vec3d({", ".join(comps)})'
 
 
@@ -4308,7 +4333,7 @@ def pos_rebind_expr(raw: str, src_var: str):
         elif p.startswith('~'):
             comps.append(f'({base} + {jdouble(p[1:])})')
         else:
-            comps.append(jdouble(p))
+            comps.append(_abs_coord_java(p, i))   # positioned <pos> 도 centerIntegers 적용
     return f'{src_var}.withPosition(new net.minecraft.util.math.Vec3d({", ".join(comps)}))'
 
 

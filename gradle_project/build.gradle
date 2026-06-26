@@ -223,3 +223,11 @@ tasks.register('convert') {
     description 'datapack(.zip|dir) -> native Fabric mod java source (extract -> parse -> generate)'
     dependsOn 'kfcGenerate'
 }
+
+tasks.named('jar') {
+    entryCompression = ZipEntryCompression.STORED
+}
+
+tasks.named('remapJar') {
+    entryCompression = ZipEntryCompression.STORED
+}

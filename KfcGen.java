@@ -1663,6 +1663,35 @@ public final class KfcGen {
      *  (특히 플레이어 오프핸드는 Inventory[Slot:-106]에 저장돼 writeNbt 경로로는 안 잡힘 →
      *   반드시 슬롯으로 해소해야 `equipment.offhand.components.minecraft:custom_data` 등이 동작.)
      *  선행 1~2 세그먼트로 가장 긴 유효 단일 슬롯명을 찾고, 나머지는 아이템 NBT 내부 하위경로로 적용. */
+    /** ItemStack 의 sub 경로 NbtElement 읽기.
+     *  components.(minecraft:)custom_data[.X] 경로는 CUSTOM_DATA 컴포넌트를 직접 copyNbt 로 읽어
+     *  전체 stack.toNbt()(모든 컴포넌트 인코딩) 직렬화를 회피한다 — vanilla 동등 값.
+     *  카트 물리(speed/gauge/drift/boost 등)는 cod 오프핸드 custom_data 에 있어 매 틱 다수 읽혀
+     *  이 fast-path 가 read 측 핵심 부하를 줄인다. 그 외/빈 경로는 기존대로 toNbt 후 getAtPath. */
+    private static net.minecraft.nbt.NbtElement itemSubNbt(net.minecraft.entity.Entity e,
+                                                           net.minecraft.item.ItemStack stack, String sub) {
+        if (stack == null || stack.isEmpty()) return null;
+        if (sub != null && !sub.isEmpty()) {
+            String cdPrefix = null;
+            if (sub.equals("components.minecraft:custom_data")
+                    || sub.startsWith("components.minecraft:custom_data.")) cdPrefix = "components.minecraft:custom_data";
+            else if (sub.equals("components.custom_data")
+                    || sub.startsWith("components.custom_data."))           cdPrefix = "components.custom_data";
+            if (cdPrefix != null) {
+                net.minecraft.component.type.NbtComponent nc =
+                        stack.get(net.minecraft.component.DataComponentTypes.CUSTOM_DATA);
+                if (nc == null) return null;                       // 컴포넌트 부재 → 경로 부재(vanilla 동일)
+                net.minecraft.nbt.NbtCompound cd = nc.copyNbt();
+                if (sub.length() == cdPrefix.length()) return cd;  // 정확히 custom_data → 내부 compound 전체
+                return getAtPath(cd, sub.substring(cdPrefix.length() + 1));   // '.' 다음 잔여 경로
+            }
+        }
+        net.minecraft.nbt.NbtElement itemNbt;
+        try { itemNbt = stack.toNbt(e.getRegistryManager()); } catch (Exception ex) { return null; }
+        if (sub == null || sub.isEmpty()) return itemNbt;
+        return getAtPath(itemNbt, sub);
+    }
+
     private static net.minecraft.nbt.NbtElement slotAccessorNbt(net.minecraft.entity.Entity e, String path) {
         if (e == null || path == null || path.isEmpty()) return null;
         String[] segs = path.split("\\.");
@@ -1674,12 +1703,9 @@ public final class KfcGen {
             if (ref == net.minecraft.inventory.StackReference.EMPTY) return null;
             net.minecraft.item.ItemStack stack = ref.get();
             if (stack == null || stack.isEmpty()) return null;
-            net.minecraft.nbt.NbtElement itemNbt;
-            try { itemNbt = stack.toNbt(e.getRegistryManager()); } catch (Exception ex) { return null; }
-            if (segs.length == 1) return itemNbt;
             StringBuilder sub = new StringBuilder();
             for (int i = 1; i < segs.length; i++) { if (sub.length() > 0) sub.append('.'); sub.append(segs[i]); }
-            return getAtPath(itemNbt, sub.toString());
+            return itemSubNbt(e, stack, sub.toString());   // sub 비면 전체 itemNbt(=toNbt) 반환
         }
         int maxTake = Math.min(2, segs.length);
         for (int take = maxTake; take >= 1; take--) {
@@ -1691,13 +1717,9 @@ public final class KfcGen {
             if (ref == net.minecraft.inventory.StackReference.EMPTY) return null;
             net.minecraft.item.ItemStack stack = ref.get();
             if (stack == null || stack.isEmpty()) return null;  // 빈 슬롯 → 경로 부재(vanilla 동일)
-            net.minecraft.nbt.NbtElement itemNbt;
-            try { itemNbt = stack.toNbt(e.getRegistryManager()); }
-            catch (Exception ex) { return null; }
-            if (take >= segs.length) return itemNbt;
             StringBuilder sub = new StringBuilder();
             for (int i = take; i < segs.length; i++) { if (sub.length() > 0) sub.append('.'); sub.append(segs[i]); }
-            return getAtPath(itemNbt, sub.toString());
+            return itemSubNbt(e, stack, sub.toString());   // sub 비면 전체 itemNbt(=toNbt) 반환
         }
         return null;
     }
@@ -3103,16 +3125,86 @@ public final class KfcGen {
         if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.remove(e);
     }
 
+    // ── 구조적 no-op NBT 경로 자가검증/생략 (write/read 양쪽) ───────────────────────────────
+    //  배경: display/marker 엔티티에 `data.X`(예: data.interpolation_duration, data.loop-data.*)를
+    //   매 틱 쓰지만, 그 엔티티 클래스의 readNbt 는 스키마에 없는 최상위 키(`data`)를 버린다.
+    //   따라서 writeNbt→putAtPath→readNbt 는 '순수 no-op'(엔티티 상태 불변)인데도 매 틱 전체
+    //   엔티티를 직렬화/역직렬화한다(spark: entityPutNumberPath 핫). 읽기도 같은 경로를 snapshot
+    //   (writeNbt)으로 조회하나 항상 부재→0 이다.
+    //  최적화: 런타임 1회 자가검증으로 '(엔티티 클래스, 최상위 키)' 단위 droppable 여부를 판정·캐시한 뒤,
+    //   이후 해당 경로의 쓰기는 writeNbt 자체를 생략하고, 읽기는 snapshot 없이 0 을 반환한다.
+    //  정확성(원본 관측 동등): droppable 판정은 '쓰기 전·후 직렬화 모두에 최상위 키 부재'일 때만 한다.
+    //   값이 아니라 엔티티 스키마(클래스)에 그 키가 없다는 구조적 사실이므로 값-독립적으로 안전하다.
+    //   (실 필드 Pos/Rotation/Tags/attributes/Passengers/Health 등은 쓰기 전 직렬화에 키가 있어
+    //    절대 droppable 로 분류되지 않고 기존과 동일하게 round-trip 한다.)
+    //  보편성: 특정 데이터팩/경로 하드코딩 없음 — 어떤 엔티티·경로든 런타임 관측으로 판정한다.
+    private static final java.util.Map<String, Boolean> NBT_DROP =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static String topSeg(String path) {
+        int end = path.length();
+        int dot = path.indexOf('.'); if (dot >= 0 && dot < end) end = dot;
+        int br  = path.indexOf('['); if (br  >= 0 && br  < end) end = br;
+        return path.substring(0, end);
+    }
+    private static String dropKey(net.minecraft.entity.Entity e, String topKey) {
+        return e.getClass().getName() + '\u0000' + topKey;
+    }
+    /** 이 경로가 (엔티티 클래스 기준) 구조적으로 버려지는 no-op 경로로 이미 판정됐는가. */
+    private static boolean nbtPathDroppable(net.minecraft.entity.Entity e, String path) {
+        return NBT_DROP.get(dropKey(e, topSeg(path))) == Boolean.TRUE;
+    }
+
+    /** writeNbt→put→readNbt 엔티티 NBT 쓰기 공통 경로 + 구조적 no-op 자가검증/생략.
+     *  원본(writeNbt;putAtPath;readNbt)과 관측 동등하되, droppable 로 판정된 경로는 직렬화를 생략한다. */
+    private static void entityNbtRoundtrip(net.minecraft.entity.Entity e, String path,
+                                           net.minecraft.nbt.NbtElement v) {
+        if (e == null || v == null) return;
+        String top = topSeg(path.replace(" ", ""));
+        String k = dropKey(e, top);
+        Boolean known = NBT_DROP.get(k);
+        if (known != null) {
+            if (known) return;                       // 구조적 no-op — writeNbt 생략(엔티티 불변)
+            invalidateSnapshot(e);                   // effective — 기존과 동일 round-trip
+            net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(n);
+            if (putAtPath(n, path, v)) e.readNbt(n);
+            return;
+        }
+        // 첫 관측: 자가검증(추가 writeNbt 1회 — (클래스,키)당 1회만, 이후 캐시 hit)
+        invalidateSnapshot(e);
+        net.minecraft.nbt.NbtCompound before = new net.minecraft.nbt.NbtCompound();
+        e.writeNbt(before);
+        net.minecraft.nbt.NbtCompound mod = before.copy();
+        if (!putAtPath(mod, path, v)) return;        // 경로 적용 실패 → 변화 없음(분류 보류)
+        if (mod.equals(before)) return;              // put 이 NBT 를 안 바꿈(이미 동일값) → no-op(분류 보류)
+        e.readNbt(mod);
+        boolean beforeHas = before.contains(top);
+        net.minecraft.nbt.NbtCompound after = new net.minecraft.nbt.NbtCompound();
+        e.writeNbt(after);
+        boolean afterHas = after.contains(top);
+        // 전·후 모두 최상위 키 부재 = readNbt 가 버림 = 구조적 droppable(값-독립).
+        NBT_DROP.put(k, (!beforeHas && !afterHas) ? Boolean.TRUE : Boolean.FALSE);
+    }
+
     // ── source 읽기 ──
+    /** 엔티티 NBT 읽기 fast-path 체인(라이브 게터 → 디스플레이 → 슬롯 접근자).
+     *  해당되면 전체 엔티티 writeNbt 스냅샷 없이 직접 구성한 NbtElement, 아니면 null.
+     *  내부 숫자 읽기(entityGetDouble/Number)와 nbtGetEntity 가 공유해 동일 의미·일관성 보장. */
+    private static net.minecraft.nbt.NbtElement entityNbtFast(net.minecraft.entity.Entity e, String pt) {
+        net.minecraft.nbt.NbtElement lf = liveFieldNbt(e, pt);        // Pos/Rotation/Motion 라이브 게터
+        if (lf != null) return lf;
+        net.minecraft.nbt.NbtElement f = displayGetFast(e, pt);       // display transformation 등
+        if (f != null) return f;
+        return slotAccessorNbt(e, pt);                                // weapon/equipment/armor/container 슬롯
+    }
+
     public static net.minecraft.nbt.NbtElement nbtGetEntity(net.minecraft.entity.Entity e, String path) {
         if (e == null) return null;
         String pt0 = path.replace(" ", "");
-        net.minecraft.nbt.NbtElement lf = liveFieldNbt(e, pt0);   // Pos/Rotation/Motion 라이브 게터 fast-path
-        if (lf != null) return lf;
-        net.minecraft.nbt.NbtElement f = displayGetFast(e, pt0);
-        if (f != null) return f;
-        net.minecraft.nbt.NbtElement slot = slotAccessorNbt(e, pt0);   // weapon/equipment/armor/container 슬롯 접근자
-        if (slot != null) return slot;
+        net.minecraft.nbt.NbtElement fast = entityNbtFast(e, pt0);
+        if (fast != null) return fast;
+        if (nbtPathDroppable(e, pt0)) return null;   // 구조적 부재 경로 — snapshot writeNbt 회피
         // 캐시된 스냅샷(현재 상태)에서 읽되, 캐시 내부 객체가 호출부로 새지 않도록 copy 해 반환
         // (원본은 throwaway writeNbt 버퍼를 반환했으므로 copy 가 소유권 의미상 동일·더 안전).
         net.minecraft.nbt.NbtElement r = getAtPath(entitySnapshot(e), path);
@@ -3273,12 +3365,9 @@ public final class KfcGen {
 
     public static void nbtSetEntity(net.minecraft.entity.Entity e, String path, net.minecraft.nbt.NbtElement v) {
         if (e == null || v == null) return;
-        invalidateSnapshot(e);
         String pt = path.replace(" ", "");
-        if (displaySetFast(e, pt, v)) return;
-        net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(n);
-        if (putAtPath(n, path, v)) e.readNbt(n);
+        if (displaySetFast(e, pt, v)) { invalidateSnapshot(e); return; }
+        entityNbtRoundtrip(e, path, v);   // droppable(구조적 부재) 경로면 writeNbt·invalidate 생략
     }
 
     public static void nbtSetStorage(net.minecraft.server.MinecraftServer server, String id, String path,
@@ -3337,6 +3426,7 @@ public final class KfcGen {
     public static void nbtAppendEntity(net.minecraft.entity.Entity e, String path,
                                        net.minecraft.nbt.NbtElement elem, boolean prepend) {
         if (e == null || elem == null) return;
+        if (nbtPathDroppable(e, path.replace(" ", ""))) return;   // 구조적 부재 최상위 키 → readNbt 가 버림(no-op)
         invalidateSnapshot(e);
         net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(root);
@@ -3357,22 +3447,24 @@ public final class KfcGen {
     /** store result entity <sel> <path> <type> <scale> — 타입 숫자를 임의 NBT 경로에 기록. */
     public static void entityPutNumberPath(net.minecraft.entity.Entity e, String path, String type, double value) {
         if (e == null) return;
-        invalidateSnapshot(e);
         // 회전(Rotation[0]=yaw, Rotation[1]=pitch)은 NBT 라운드트립 대신 직접 적용 —
         // 디스플레이 엔티티 등에서 writeNbt/readNbt 로는 라이브 회전이 확실히 갱신되지 않을 수 있다.
         if (path.equals("Rotation[0]")) {
+            invalidateSnapshot(e);
             float y = (float) value;
             e.setYaw(y); e.setHeadYaw(y); e.setBodyYaw(y);
             return;
         }
         if (path.equals("Rotation[1]")) {
+            invalidateSnapshot(e);
             e.setPitch((float) value);
             return;
         }
-        if (displaySetFast(e, path.replace(" ", ""), numberNbt(type, value))) return;
-        net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(n);
-        if (putAtPath(n, path, numberNbt(type, value))) e.readNbt(n);
+        net.minecraft.nbt.NbtElement nv = numberNbt(type, value);
+        if (displaySetFast(e, path.replace(" ", ""), nv)) { invalidateSnapshot(e); return; }
+        // 구조적 부재 경로(예: item_display 의 data.interpolation_duration, data.loop-data.*)는
+        // readNbt 가 통째로 버리는 no-op — entityNbtRoundtrip 이 (클래스,키)당 1회 자가검증 후 writeNbt 생략.
+        entityNbtRoundtrip(e, path, nv);
     }
 
     /** 점 표기 경로를 따라 마지막 직전 컴파운드까지 내려가며, 없으면 생성. 반환: (부모, 마지막키). */
@@ -3421,10 +3513,11 @@ public final class KfcGen {
         if (pt.equals("Motion[0]")) return e.getVelocity().x;
         if (pt.equals("Motion[1]")) return e.getVelocity().y;
         if (pt.equals("Motion[2]")) return e.getVelocity().z;
-        if (pt.startsWith("transformation")) {
-            net.minecraft.nbt.NbtElement f = displayGetFast(e, pt);
-            if (f != null) return nbtNum(f);
-        }
+        // 라이브 게터/디스플레이/슬롯(equipment custom_data) fast-path — 전체 writeNbt 회피.
+        //   nbtGetEntity(정규 리더)와 동일 의미. kart 물리 custom_data 읽기가 여기서 직접 처리됨.
+        net.minecraft.nbt.NbtElement fast = entityNbtFast(e, pt);
+        if (fast != null) return nbtNum(fast);
+        if (nbtPathDroppable(e, pt)) return 0.0;     // 구조적 부재(no-op) 경로 → 스냅샷 writeNbt 회피
         net.minecraft.nbt.NbtElement r = getAtPath(entitySnapshot(e), path);   // 캐시된 스냅샷 — data get 반복 시 writeNbt 회피
         return nbtNum(r);
     }
@@ -3504,7 +3597,12 @@ public final class KfcGen {
     // 엔티티 NBT 는 writeNbt 로 스냅샷 → 수정 → readNbt 로 반영. 비싸므로 gated.
 
     public static int entityGetNumber(net.minecraft.entity.Entity e, String path) {
-        return (int) nbtNum(getAtPath(entitySnapshot(e), path));   // NbtPath: 인덱스/필터 경로 정확
+        if (e == null) return 0;
+        String pt = path.replace(" ", "");
+        net.minecraft.nbt.NbtElement fast = entityNbtFast(e, pt);   // 라이브/디스플레이/슬롯 fast-path(writeNbt 회피)
+        if (fast != null) return (int) nbtNum(fast);
+        if (nbtPathDroppable(e, pt)) return 0;                      // 구조적 부재 no-op → 스냅샷 회피
+        return (int) nbtNum(getAtPath(entitySnapshot(e), path));    // NbtPath: 인덱스/필터 경로 정확
     }
 
     /** null-safe 버전 — 셀렉터 대상이 없으면 0. */
@@ -3514,10 +3612,8 @@ public final class KfcGen {
     }
 
     public static void entityPutNumber(net.minecraft.entity.Entity e, String path, double value) {
-        invalidateSnapshot(e);
-        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(nbt);
-        if (putAtPath(nbt, path, net.minecraft.nbt.NbtInt.of((int) value))) e.readNbt(nbt);   // NbtPath
+        if (e == null) return;
+        entityNbtRoundtrip(e, path, net.minecraft.nbt.NbtInt.of((int) value));   // droppable no-op 자동 생략, NbtPath
     }
 
     /** data modify entity <e> <path> set value <snbt> — 임의 SNBT 값 기록. */

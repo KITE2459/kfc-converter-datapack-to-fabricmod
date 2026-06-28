@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_lavachicke=83360..83600,nbs_lavachicke_t=..1041}] run function lavachicken:notes/1042
-execute as @s[scores={nbs_lavachicke=83440..83680,nbs_lavachicke_t=..1042}] run function lavachicken:notes/1043

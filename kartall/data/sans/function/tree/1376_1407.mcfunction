@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_sans=110080..111520}] run function sans:tree/1376_1391
-execute as @s[scores={nbs_sans=111360..112880}] run function sans:tree/1392_1407

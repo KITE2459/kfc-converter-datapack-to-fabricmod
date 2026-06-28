@@ -1,3 +1,0 @@
-playsound minecraft:block.note_block.flute hostile @s ~ ~ ~ 1 1.189207 1
-playsound minecraft:block.note_block.harp hostile @s ~ ~ ~ 0.70 1.059463 1
-scoreboard players set @s nbs_end_t 700

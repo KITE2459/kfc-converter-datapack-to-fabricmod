@@ -1,1 +1,0 @@
-execute on passengers rotated as @s[tag=kartmodelsaddle,type=item_display] run run_kart_model rotate

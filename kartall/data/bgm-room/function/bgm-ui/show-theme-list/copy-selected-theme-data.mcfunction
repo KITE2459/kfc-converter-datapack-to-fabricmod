@@ -1,1 +1,0 @@
-$data modify storage bgm-room temp set from storage bgm-room bgms.$(key)

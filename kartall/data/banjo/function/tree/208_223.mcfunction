@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_banjo=16640..17440}] run function banjo:tree/208_215
-execute as @s[scores={nbs_banjo=17280..18160}] run function banjo:tree/216_223

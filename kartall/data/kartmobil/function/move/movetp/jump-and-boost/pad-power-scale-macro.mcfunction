@@ -1,1 +1,0 @@
-$function kartmobil:move/movetp/jump-and-boost/pad-power-scale-macro-double {jumppadscale:$(jumppadscale)}

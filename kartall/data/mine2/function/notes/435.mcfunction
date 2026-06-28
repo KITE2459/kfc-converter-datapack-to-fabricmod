@@ -1,4 +1,0 @@
-playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.74 1.414214 1
-playsound minecraft:block.note_block.pling record @s ~ ~ ~ 0.60 0.707107 1
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.74 0.707107 1
-scoreboard players set @s nbs_mine2_t 435

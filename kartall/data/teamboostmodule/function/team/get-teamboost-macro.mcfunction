@@ -1,3 +1,0 @@
-
-$loot give @s loot {type:"minecraft:block",pools:[{rolls:$(teamboostcount),bonus_rolls:0,entries:[{type:"minecraft:item",name:"soul_campfire",functions:[{function:"minecraft:set_components",components:{"minecraft:custom_name":[{translate:"TEAM NITRO",color:"aqua",italic:0b}]},conditions:[]}]}]}],functions:[]}
-#{"type":"minecraft:block","pools":[{"bonus_rolls":0,"entries":[{"type":"minecraft:item","name":"minecraft:soul_campfire","functions":[{"function":"minecraft:set_components","components":{"minecraft:custom_name":"{\"color\":\"aqua\",\"italic\":false,\"text\":\"TEAM NITRO\"}"}}]}],"rolls":$(teamboostcount)}]}

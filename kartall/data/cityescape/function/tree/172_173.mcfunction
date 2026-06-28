@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_cityescape=13760..14000,nbs_cityescape_t=..171}] run function cityescape:notes/172

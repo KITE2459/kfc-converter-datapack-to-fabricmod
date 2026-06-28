@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_factory2=22400..22880}] run function factory2:tree/280_283
-execute as @s[scores={nbs_factory2=22720..23280}] run function factory2:tree/284_287

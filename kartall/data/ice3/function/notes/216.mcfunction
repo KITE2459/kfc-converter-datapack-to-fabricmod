@@ -1,5 +1,0 @@
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.60 1.059463 1
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.60 1.781797 1
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.60 1.414214 1
-playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.60 0.594604 1
-scoreboard players set @s nbs_ice3_t 216

@@ -1,3 +1,0 @@
-$execute at @p[tag=kartpassenger] run playsound minecraft:block.note_block.didgeridoo neutral @a[tag=kart-listener] ~ ~ ~ 0.5 $(kartsound) 1
-$execute at @p[tag=kartpassenger] run playsound minecraft:block.note_block.bass neutral @a[tag=kart-listener] ~ ~ ~ 0.6 $(kartsound) 1
-$execute at @p[tag=kartpassenger] run playsound minecraft:block.note_block.bass neutral @a[tag=kart-listener] ~ ~ ~ 0.6 $(kartsound) 1

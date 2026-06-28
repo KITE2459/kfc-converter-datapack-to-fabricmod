@@ -1,2 +1,0 @@
-$execute as @n[tag=carAdirection] at @s run rotate @s[tag=!collision-cheat] $(directiona) $(kartAdefense)
-$execute as @n[tag=carBdirection] at @s run rotate @s[tag=!collision-cheat] $(directionb) $(kartBdefense)

@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_korea2=14080..14560}] run function korea2:tree/176_179
-execute as @s[scores={nbs_korea2=14400..14960}] run function korea2:tree/180_183

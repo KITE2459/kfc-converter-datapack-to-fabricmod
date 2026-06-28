@@ -1,1 +1,0 @@
-scoreboard players set #chago1total kartstevecut 1

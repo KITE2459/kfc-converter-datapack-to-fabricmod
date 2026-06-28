@@ -1,2 +1,0 @@
-tag @a[tag=kartpassenger] add kart-listener
-execute on passengers if entity @s[tag=kartsaddle] at @s on vehicle on passengers rotated as @s[tag=kartdirection,type=item_display] on vehicle positioned ^ ^ ^-1.5 run tag @a[gamemode=spectator,distance=..2] add kart-listener

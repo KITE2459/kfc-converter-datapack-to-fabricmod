@@ -1,1 +1,0 @@
-tp @e[tag=kart-vertex-all,limit=9,distance=..25,type=area_effect_cloud] 0 0 0

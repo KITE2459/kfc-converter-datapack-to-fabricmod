@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_wkcdrift=107520..108320}] run function wkcdrift:tree/1344_1351
-execute as @s[scores={nbs_wkcdrift=108160..109040}] run function wkcdrift:tree/1352_1359

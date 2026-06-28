@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_pirate4=70720..71040}] run function pirate4:tree/884_885
-execute as @s[scores={nbs_pirate4=70880..71280}] run function pirate4:tree/886_887

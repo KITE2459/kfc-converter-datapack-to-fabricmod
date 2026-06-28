@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_desert2=59200..59440,nbs_desert2_t=..739}] run function desert2:notes/740
-execute as @s[scores={nbs_desert2=59280..59520,nbs_desert2_t=..740}] run function desert2:notes/741

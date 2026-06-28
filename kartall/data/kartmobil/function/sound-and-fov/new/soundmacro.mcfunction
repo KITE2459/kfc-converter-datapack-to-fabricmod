@@ -1,1 +1,0 @@
-$execute at @p[tag=kartpassenger] run playsound minecraft:block.barrel.open neutral @a[tag=kart-listener] ~ ~ ~ 0.8 $(kartsound) 1

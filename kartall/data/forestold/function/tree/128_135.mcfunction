@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_forestold=10240..10720}] run function forestold:tree/128_131
-execute as @s[scores={nbs_forestold=10560..11120}] run function forestold:tree/132_135

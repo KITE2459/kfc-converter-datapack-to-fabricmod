@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_fengshen=25600..25920}] run function fengshen:tree/320_321
-execute as @s[scores={nbs_fengshen=25760..26160}] run function fengshen:tree/322_323

@@ -1,6 +1,0 @@
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.40 0.667420 1
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.40 1.587401 1
-playsound minecraft:block.note_block.guitar record @s ~ ~ ~ 0.38 2.000000 1
-playsound minecraft:block.note_block.hat record @s ~ ~ ~ 0.33 1.587401 1
-playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.18 1.781797 1
-scoreboard players set @s nbs_mkdsdelfin_t 44

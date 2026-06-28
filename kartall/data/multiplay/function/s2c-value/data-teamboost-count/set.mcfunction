@@ -1,2 +1,0 @@
-execute store result storage kartmain count byte 1 on passengers if entity @s[type=player] run clear @s minecraft:soul_campfire 0
-function multiplay:s2c-value/data-teamboost-count/macro with storage kartmain

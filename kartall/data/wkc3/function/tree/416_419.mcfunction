@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_wkc3=33280..33600}] run function wkc3:tree/416_417

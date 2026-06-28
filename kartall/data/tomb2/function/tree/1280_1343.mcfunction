@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_tomb2=102400..105120}] run function tomb2:tree/1280_1311
-execute as @s[scores={nbs_tomb2=104960..107760}] run function tomb2:tree/1312_1343

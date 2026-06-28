@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_dino1=11520..12320}] run function dino1:tree/144_151
-execute as @s[scores={nbs_dino1=12160..13040}] run function dino1:tree/152_159

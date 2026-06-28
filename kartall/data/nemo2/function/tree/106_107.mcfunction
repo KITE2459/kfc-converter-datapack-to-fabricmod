@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_nemo2=8480..8720,nbs_nemo2_t=..105}] run function nemo2:notes/106
-execute as @s[scores={nbs_nemo2=8560..8800,nbs_nemo2_t=..106}] run function nemo2:notes/107

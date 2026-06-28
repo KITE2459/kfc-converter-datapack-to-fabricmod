@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_lavachicke=72640..72960}] run function lavachicken:tree/908_909
-execute as @s[scores={nbs_lavachicke=72800..73200}] run function lavachicken:tree/910_911

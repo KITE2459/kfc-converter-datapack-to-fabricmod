@@ -1,1 +1,0 @@
-data modify entity @s brightness set value {sky:15,block:15}

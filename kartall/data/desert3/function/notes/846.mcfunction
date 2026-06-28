@@ -1,4 +1,0 @@
-playsound minecraft:block.note_block.hat record @s ~ ~ ~ 0.83 0.793701 1
-playsound minecraft:block.note_block.banjo record @s ~ ~ ~ 0.90 0.943874 1
-playsound minecraft:block.note_block.bit record @s ~ ~ ~ 0.90 1.887749 1
-scoreboard players set @s nbs_desert3_t 846

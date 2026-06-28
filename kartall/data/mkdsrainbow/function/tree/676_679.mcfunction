@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_mkdsrainbo=54080..54400}] run function mkdsrainbow:tree/676_677
-execute as @s[scores={nbs_mkdsrainbo=54240..54640}] run function mkdsrainbow:tree/678_679

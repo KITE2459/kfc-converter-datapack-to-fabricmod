@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_lapsound1=0..240,nbs_lapsound1_t=..-1}] run function lapsound1:notes/0

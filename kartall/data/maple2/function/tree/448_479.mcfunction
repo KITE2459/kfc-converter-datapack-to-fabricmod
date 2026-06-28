@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_maple2=35840..37280}] run function maple2:tree/448_463
-execute as @s[scores={nbs_maple2=37120..38640}] run function maple2:tree/464_479

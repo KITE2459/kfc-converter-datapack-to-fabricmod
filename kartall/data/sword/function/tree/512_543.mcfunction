@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_sword=40960..42400}] run function sword:tree/512_527

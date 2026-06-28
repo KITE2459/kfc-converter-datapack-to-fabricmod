@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_planet2=44800..45600}] run function planet2:tree/560_567
-execute as @s[scores={nbs_planet2=45440..46320}] run function planet2:tree/568_575

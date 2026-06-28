@@ -1,1 +1,0 @@
-execute if score @s trackselect-lap matches 1.. run tag @s add check-pass-last

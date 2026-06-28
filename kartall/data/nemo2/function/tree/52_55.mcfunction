@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_nemo2=4160..4480}] run function nemo2:tree/52_53
-execute as @s[scores={nbs_nemo2=4320..4720}] run function nemo2:tree/54_55

@@ -1,1 +1,0 @@
-tellraw @a {translate:"슈퍼방장이 활성화되었습니다.","color":"aqua"}

@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_factory3=39040..39280,nbs_factory3_t=..487}] run function factory3:notes/488

@@ -1,3 +1,0 @@
-tag @a[tag=kartpassenger-collision] add kart-listener-collision
-execute on passengers at @s[tag=kartdirection,type=item_display] on vehicle positioned ~ ~0.2 ~ positioned ^ ^ ^-1.5 run tag @a[gamemode=spectator,distance=..2] add kart-listener-collision
-execute as @e[tag=carB,limit=1,type=#kartmobil:kartmobil] on passengers at @s[tag=kartdirection,type=item_display] on vehicle positioned ~ ~0.2 ~ positioned ^ ^ ^-1.5 run tag @a[gamemode=spectator,distance=..2] add kart-listener-collision

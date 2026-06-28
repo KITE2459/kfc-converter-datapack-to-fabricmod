@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_korea2a=46240..46480,nbs_korea2a_t=..577}] run function korea2a:notes/578

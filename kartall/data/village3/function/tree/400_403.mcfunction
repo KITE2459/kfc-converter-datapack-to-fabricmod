@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_village3=32000..32320}] run function village3:tree/400_401
-execute as @s[scores={nbs_village3=32160..32560}] run function village3:tree/402_403

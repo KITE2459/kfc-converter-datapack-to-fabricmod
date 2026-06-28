@@ -1,1 +1,0 @@
-$data modify storage kartmain temp set value $(temp)

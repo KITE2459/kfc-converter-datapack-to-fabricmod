@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_run90=91200..91520}] run function run90:tree/1140_1141
-execute as @s[scores={nbs_run90=91360..91760}] run function run90:tree/1142_1143

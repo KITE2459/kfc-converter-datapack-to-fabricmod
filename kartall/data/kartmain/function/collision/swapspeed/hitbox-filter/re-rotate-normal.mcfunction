@@ -1,1 +1,0 @@
-$execute rotated as @e[tag=kart-vector-result-relative,limit=1,type=marker] run rotate @e[tag=kart-normal-line,limit=1,type=marker] ~$(kartrerotatenormal) ~

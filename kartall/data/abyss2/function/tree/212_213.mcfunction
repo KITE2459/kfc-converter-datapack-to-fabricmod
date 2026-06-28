@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_abyss2=17040..17280,nbs_abyss2_t=..212}] run function abyss2:notes/213

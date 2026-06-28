@@ -1,5 +1,0 @@
-playsound minecraft:block.note_block.bell record @s ^-0.01 ^ ^ 0.80 0.667420 1
-playsound minecraft:block.note_block.harp record @s ^-0.01 ^ ^ 0.80 0.667420 1
-playsound minecraft:block.note_block.chime record @s ^-0.01 ^ ^ 0.80 1.059463 1
-playsound minecraft:block.note_block.bit record @s ^-0.01 ^ ^ 0.80 1.587401 1
-scoreboard players set @s nbs_mkgbarainb_t 1757

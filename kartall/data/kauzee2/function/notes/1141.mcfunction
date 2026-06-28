@@ -1,7 +1,0 @@
-playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.67 1.781797 1
-playsound minecraft:block.note_block.harp record @s ~ ~ ~ 1 1.334840 1
-playsound minecraft:block.note_block.bit record @s ~ ~ ~ 0.30 0.890899 1
-playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.54 1.781797 1
-playsound minecraft:block.note_block.harp record @s ~ ~ ~ 1 1.334840 1
-playsound minecraft:block.note_block.bit record @s ~ ~ ~ 0.50 0.890899 1
-scoreboard players set @s nbs_kauzee2_t 1141

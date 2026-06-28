@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_rainbow2=60800..61280}] run function rainbow2:tree/760_763
-execute as @s[scores={nbs_rainbow2=61120..61680}] run function rainbow2:tree/764_767

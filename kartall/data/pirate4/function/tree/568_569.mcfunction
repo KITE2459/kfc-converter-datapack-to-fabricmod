@@ -1,1 +1,0 @@
-execute as @s[scores={nbs_pirate4=45440..45680,nbs_pirate4_t=..567}] run function pirate4:notes/568

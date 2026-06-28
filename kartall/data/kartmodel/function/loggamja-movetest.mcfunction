@@ -1,1 +1,0 @@
-summon block_display ~ ~ ~ {Passengers:[]}

@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_mkgbarainb=211200..211680}] run function mkgbarainbow:tree/2640_2643
-execute as @s[scores={nbs_mkgbarainb=211520..212080}] run function mkgbarainbow:tree/2644_2647

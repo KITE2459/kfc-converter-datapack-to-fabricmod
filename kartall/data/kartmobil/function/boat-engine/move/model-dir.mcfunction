@@ -1,1 +1,0 @@
-execute at @n[tag=kartdirection,type=item_display] on passengers if entity @s[tag=kartmodelsaddle] run rotate @s ~ ~

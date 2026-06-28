@@ -1,5 +1,0 @@
-kill @e[tag=track-theme-text]
-kill @e[tag=track-theme-marker]
-kill @e[tag=track-theme-icon]
-kill @e[tag=track-theme-interaction]
-kill @e[tag=track-theme-return-interaction]

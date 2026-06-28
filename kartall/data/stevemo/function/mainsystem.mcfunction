@@ -1,1 +1,0 @@
-execute if score #stevecut kartstevecut matches 1..1000 run function stevemo:frame

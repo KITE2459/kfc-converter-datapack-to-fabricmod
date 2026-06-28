@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_gold=115360..115600,nbs_gold_t=..1441}] run function gold:notes/1442
-execute as @s[scores={nbs_gold=115440..115680,nbs_gold_t=..1442}] run function gold:notes/1443

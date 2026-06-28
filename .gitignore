@@ -3,6 +3,7 @@
 .gradle/
 build/
 *.zip
+*.tar.gz
 openjdk-21-x86/
 testdatapack/
 *.json

@@ -1,1 +1,0 @@
-$execute at @n[tag=loop-player-translate,type=marker] run tp @n[tag=loop-player-translate,type=marker] ~ ~$(translateoffset) ~

@@ -1,1 +1,0 @@
-$execute store result storage temp selected_track int 1 run random value 0..$(selected_track)

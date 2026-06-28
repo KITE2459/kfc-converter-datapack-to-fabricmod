@@ -1,1 +1,0 @@
-execute on passengers at @s[tag=kart-old-velocity] rotated ~ 0 on vehicle run function kartmobil:move/steering/drift/skidparticle/skid-tree/second-tree/main

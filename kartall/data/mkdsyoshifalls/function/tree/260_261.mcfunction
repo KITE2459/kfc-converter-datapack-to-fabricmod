@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_mkdsyoshif=20800..21040,nbs_mkdsyoshif_t=..259}] run function mkdsyoshifalls:notes/260
-execute as @s[scores={nbs_mkdsyoshif=20880..21120,nbs_mkdsyoshif_t=..260}] run function mkdsyoshifalls:notes/261

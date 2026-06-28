@@ -1,1 +1,0 @@
-scoreboard players set #kfc-converted kartmain 1

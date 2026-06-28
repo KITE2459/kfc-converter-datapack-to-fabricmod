@@ -1,3 +1,0 @@
-playsound minecraft:block.note_block.basedrum record @s ~ ~ ~ 1 0.707107 1
-scoreboard players set @s nbs_tomb3 0
-scoreboard players set @s nbs_tomb3_t -1

@@ -1,8 +1,0 @@
-execute if score #water-skid kartdrift matches 0 if score #rally-frontskid kartdrift matches 0 if block ~ ~-0.5 ~ #kartmobil:blackblocks if score #floor-distance floor-distance matches ..1 run particle minecraft:dust{color:[0.8, 0.8, 0.8],scale:1.4} ~ ~0.1 ~ 0 0 0 0 1 force @a[tag=kartskidshow,distance=..15]
-execute if score #water-skid kartdrift matches 0 if score #rally-frontskid kartdrift matches 0 unless block ~ ~-0.5 ~ #kartmobil:blackblocks if score #floor-distance floor-distance matches ..1 run particle minecraft:dust{color:[0, 0, 0],scale:1.4} ~ ~0.1 ~ 0 0 0 0 1 force @a[tag=kartskidshow,distance=..15]
-
-execute if score #water-skid kartdrift matches 0 if score #rally-frontskid kartdrift matches 1 if block ~ ~-0.5 ~ #kartmobil:blackblocks if score #floor-distance floor-distance matches ..1 run particle minecraft:dust{color:[0.8, 0.8, 0.8],scale:1} ~ ~0.1 ~ 0 0 0 0 1 force @a[tag=kartskidshow,distance=..15]
-execute if score #water-skid kartdrift matches 0 if score #rally-frontskid kartdrift matches 1 unless block ~ ~-0.5 ~ #kartmobil:blackblocks if score #floor-distance floor-distance matches ..1 run particle minecraft:dust{color:[0, 0, 0],scale:1} ~ ~0.1 ~ 0 0 0 0 1 force @a[tag=kartskidshow,distance=..15]
-
-execute if score #water-skid kartdrift matches 1 if score #floor-distance floor-distance matches ..1 run particle minecraft:rain ~ ~0.1 ~ 0.1 0 0.1 1 5 force @a[tag=kartskidshow,distance=..15]
-execute if score #water-skid kartdrift matches 1 if score #floor-distance floor-distance matches ..1 run particle minecraft:bubble ~ ~0.1 ~ 0.1 0 0.1 1 5 force @a[tag=kartskidshow,distance=..15]

@@ -1,3 +1,0 @@
-
-#transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,1f,0f],scale:[2f,2f,2f]}
-summon item_display ~ ~ ~ {Tags:["kartentity","kartmodel","kartmodeltemp","xun-charger-shield"],billboard:"vertical",teleport_duration:1,start_interpolation:0,interpolation_duration:8,transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0f,0f],scale:[0f,0f,0f]},item:{id:"minecraft:light_blue_stained_glass",count:1}}

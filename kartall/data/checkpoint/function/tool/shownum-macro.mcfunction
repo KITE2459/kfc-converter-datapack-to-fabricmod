@@ -1,2 +1,0 @@
-$execute if entity @s[tag=!check-large] run summon area_effect_cloud ~ ~0.25 ~ {Radius:15f,Particle:{type:"block",block_state:"minecraft:air"},CustomNameVisible:1b,Duration:21,CustomName:'$(checknum)번'}
-$execute if entity @s[tag=check-large] run summon area_effect_cloud ~ ~0.25 ~ {Radius:30f,Particle:{type:"block",block_state:"minecraft:air"},CustomNameVisible:1b,Duration:21,CustomName:'$(checknum)번(대형)'}

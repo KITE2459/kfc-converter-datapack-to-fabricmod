@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_world=14720..15200}] run function world:tree/184_187
-execute as @s[scores={nbs_world=15040..15600}] run function world:tree/188_191

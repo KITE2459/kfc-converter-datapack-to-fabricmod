@@ -1,2 +1,0 @@
-execute as @s[scores={nbs_creditmusi=85760..86240}] run function creditmusic:tree/1072_1075
-execute as @s[scores={nbs_creditmusi=86080..86640}] run function creditmusic:tree/1076_1079

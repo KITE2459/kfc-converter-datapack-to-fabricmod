@@ -1,1 +1,0 @@
-execute if score #chago1total kartstevecut matches 1.. run function chagogo:ani1

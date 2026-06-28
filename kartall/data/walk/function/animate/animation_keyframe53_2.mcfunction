@@ -1,4 +1,0 @@
-# walk created via BDEngine
-
-
-schedule function walk:animate/animation_keyframe54_2 0.1s

@@ -1,1 +1,0 @@
-summon block_display ~ ~ ~ {Passengers:[{id:item_display,item:{id:oak_log},transformation:[-1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,-1f,-.625f,0f,0f,0f,1f],Tags:[kart-boost-move-start],data:{start_interpolation:10,boost-transform-start:[-1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,-1f,-.625f,0f,0f,0f,1f],boost-transform-end:[-1f,0f,0f,0f,0f,1f,0f,0f,0f,0f,-1f,1.6875f,0f,0f,0f,1f]}}]}

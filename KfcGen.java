@@ -172,12 +172,17 @@ public final class KfcGen {
         float i = net.minecraft.util.math.MathHelper.sin(-rot.x * 0.017453292F);
         float j = net.minecraft.util.math.MathHelper.cos((-rot.x + 90.0F) * 0.017453292F);
         float k = net.minecraft.util.math.MathHelper.sin((-rot.x + 90.0F) * 0.017453292F);
-        net.minecraft.util.math.Vec3d fwd = new net.minecraft.util.math.Vec3d(f * h, i, g * h);
-        net.minecraft.util.math.Vec3d up  = new net.minecraft.util.math.Vec3d(f * j, k, g * j);
-        net.minecraft.util.math.Vec3d left = fwd.crossProduct(up).multiply(-1.0);
-        double dx = fwd.x * z + up.x * y + left.x * x;
-        double dy = fwd.y * z + up.y * y + left.y * x;
-        double dz = fwd.z * z + up.z * y + left.z * x;
+        // fwd=(f*h,i,g*h), up=(f*j,k,g*j) 의 Vec3d 중간객체(fwd/up/cross/multiply)를 제거하고
+        // 동일 double 연산으로 직접 계산한다(관측 비트 동일). 결과 Vec3d 1개만 할당 — 핫패스
+        // (~6.6만 곳, 매 틱 ^ 좌표) 호출당 4개 할당 감소. trig 6회와 연산 순서는 그대로 보존.
+        double fwdX = f * h, fwdY = i, fwdZ = g * h;
+        double upX  = f * j, upY  = k, upZ  = g * j;
+        double leftX = (fwdY * upZ - fwdZ * upY) * -1.0;
+        double leftY = (fwdZ * upX - fwdX * upZ) * -1.0;
+        double leftZ = (fwdX * upY - fwdY * upX) * -1.0;
+        double dx = fwdX * z + upX * y + leftX * x;
+        double dy = fwdY * z + upY * y + leftY * x;
+        double dz = fwdZ * z + upZ * y + leftZ * x;
         return pos.add(dx, dy, dz);
     }
 

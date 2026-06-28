@@ -1,0 +1,1 @@
+$summon area_effect_cloud ~ ~ ~ {Tags:["kart-loop-course"],Particle:{type:"block",block_state:"minecraft:air"},Radius:15,Duration:-1,data:{startrotation:$(startrotation), anglespeed:$(anglespeed), speed:$(speed), rightspeed:$(rightspeed), endpitch:$(endpitch)}}

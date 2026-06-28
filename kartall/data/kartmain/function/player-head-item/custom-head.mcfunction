@@ -1,0 +1,4 @@
+# execute positioned ~ ~ ~ rotated as @s rotated ~ 0 positioned ^ ^ ^-1 run particle snowflake ~ ~0.1 ~ 0 0 0 0 1 force @a[distance=..50]
+# execute if block ~ ~-0.25 ~ #kartmobil:blackblocks run function kartmobil:move/steering/skidparticle/dust/bike-if-dust
+# execute unless block ~ ~-0.25 ~ #kartmobil:blackblocks run function kartmobil:move/steering/skidparticle/dust/bike-unless-dust
+execute positioned ~ ~ ~ on passengers rotated as @s[tag=kartdirection,type=item_display] rotated ~ 0 positioned ^ ^ ^-1.5 run particle minecraft:dust{color:[0.8, 0.8, 0.8],scale:1.4} ~ ~0.1 ~ 0 0 0 0 1 force @a[tag=kartskidshow,distance=..30]

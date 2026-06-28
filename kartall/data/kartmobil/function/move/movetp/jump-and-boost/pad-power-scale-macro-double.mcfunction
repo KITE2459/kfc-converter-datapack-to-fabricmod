@@ -1,0 +1,2 @@
+$execute store result storage minecraft:kartmain kartmoveytemp int $(jumppadscale) run scoreboard players get #pad-scale kartmovey
+execute store result score #pad-scale kartmovey run data get storage minecraft:kartmain kartmoveytemp

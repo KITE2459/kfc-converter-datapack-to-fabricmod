@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_korea3=56960..57280}] run function korea3:tree/712_713
+execute as @s[scores={nbs_korea3=57120..57520}] run function korea3:tree/714_715

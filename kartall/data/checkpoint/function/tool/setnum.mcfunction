@@ -1,0 +1,1 @@
+tellraw @s {"click_event":{"action":"suggest_command","command":"/scoreboard players set @n[distance=..10,tag=check-point] check-num 숫자"},translate:"클릭하여 체크포인트 수정 명령어 띄우기"}

@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_wind=67520..67840}] run function wind:tree/844_845
+execute as @s[scores={nbs_wind=67680..68080}] run function wind:tree/846_847

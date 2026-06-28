@@ -1,0 +1,14 @@
+execute positioned ~ ~ ~ run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~1 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~2 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~3 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~4 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~5 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~6 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~7 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~8 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~9 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~10 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~11 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~12 run function garage:custom-model-maker/scan-and-save/convert-current-position
+execute positioned ~ ~ ~13 run function garage:custom-model-maker/scan-and-save/convert-current-position

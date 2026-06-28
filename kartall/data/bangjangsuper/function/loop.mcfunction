@@ -1,0 +1,1 @@
+execute unless score #game multi-main matches 1 if entity @a[x=-31,y=-1,z=154,dx=28, dy=6, dz=9,tag=!bangjang] as @a[x=-31,y=-1,z=154,dx=28, dy=6, dz=9,tag=!bangjang] run function bangjangsuper:kicknonbangjang

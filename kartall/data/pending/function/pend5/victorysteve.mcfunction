@@ -1,0 +1,10 @@
+execute if score #victorysteve pendcredit matches 37 run function pending:pend5/f10
+execute if score #victorysteve pendcredit matches 1 run function pending:pend5/f1
+execute if score #victorysteve pendcredit matches 5 run function pending:pend5/f2
+execute if score #victorysteve pendcredit matches 9 run function pending:pend5/f3
+execute if score #victorysteve pendcredit matches 13 run function pending:pend5/f4
+execute if score #victorysteve pendcredit matches 17 run function pending:pend5/f5
+execute if score #victorysteve pendcredit matches 21 run function pending:pend5/f6
+execute if score #victorysteve pendcredit matches 25 run function pending:pend5/f7
+execute if score #victorysteve pendcredit matches 29 run function pending:pend5/f8
+execute if score #victorysteve pendcredit matches 33 run function pending:pend5/f9

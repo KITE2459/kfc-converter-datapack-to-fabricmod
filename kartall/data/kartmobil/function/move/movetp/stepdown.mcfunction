@@ -1,0 +1,1 @@
+execute positioned as @s if block ^ ^ ^-1 #kartmobil:ignoreblock if block ^ ^-1 ^ #kartmobil:ignoreblock unless block ^ ^-1 ^-1 #kartmobil:ignoreblock positioned ^ ^-1 ^ run function kartmobil:move/movetp/tp-bug-fix/tp

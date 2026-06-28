@@ -1,0 +1,1 @@
+$data modify storage timermain time set value {translate:"$(min):$(sec).$(milisec)","color":"aqua"}

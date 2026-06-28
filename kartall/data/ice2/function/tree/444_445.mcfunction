@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_ice2=35520..35760,nbs_ice2_t=..443}] run function ice2:notes/444

@@ -1,0 +1,1 @@
+execute facing entity @s eyes facing ^ ^ ^-1 positioned as @s run rotate @s ~ ~

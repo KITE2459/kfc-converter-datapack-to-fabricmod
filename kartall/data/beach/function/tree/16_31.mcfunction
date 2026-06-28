@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_beach=1280..2080}] run function beach:tree/16_23
+execute as @s[scores={nbs_beach=1920..2800}] run function beach:tree/24_31

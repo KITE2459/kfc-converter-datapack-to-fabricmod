@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_ice4=62720..63040}] run function ice4:tree/784_785
+execute as @s[scores={nbs_ice4=62880..63280}] run function ice4:tree/786_787

@@ -1,0 +1,1 @@
+scoreboard players set #stevecut kartstevecut 1

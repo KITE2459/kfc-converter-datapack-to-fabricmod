@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mk8rainbow=81280..81600}] run function mk8rainbow64:tree/1016_1017
+execute as @s[scores={nbs_mk8rainbow=81440..81840}] run function mk8rainbow64:tree/1018_1019

@@ -1,0 +1,27 @@
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.70 1.414214 1
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.70 0.707107 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 1 0.943874 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 0.54 0.943874 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 1 0.707107 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 0.54 0.707107 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 1 0.561231 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 0.10 0.561231 1
+playsound minecraft:block.note_block.bass record @s ~ ~ ~ 1 0.707107 1
+playsound minecraft:block.note_block.bass record @s ~ ~ ~ 0.94 0.707107 1
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 1 0.943874 1
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.20 0.943874 1
+playsound minecraft:block.note_block.bell record @s ~ ~ ~ 1 0.943874 1
+playsound minecraft:block.note_block.bell record @s ~ ~ ~ 0.20 0.943874 1
+playsound minecraft:block.note_block.bell record @s ~ ~ ~ 1 0.749154 1
+playsound minecraft:block.note_block.bell record @s ~ ~ ~ 0.20 0.749154 1
+playsound minecraft:block.note_block.iron_xylophone record @s ~ ~ ~ 0.75 1.122462 1
+playsound minecraft:block.note_block.iron_xylophone record @s ~ ~ ~ 0.75 0.943874 1
+playsound minecraft:block.note_block.iron_xylophone record @s ~ ~ ~ 0.75 0.749154 1
+playsound minecraft:block.note_block.iron_xylophone record @s ~ ~ ~ 0.75 0.707107 1
+playsound minecraft:block.note_block.bass record @s ~ ~ ~ 0.80 0.749154 1
+playsound minecraft:block.note_block.bass record @s ~ ~ ~ 0.75 0.749154 1
+playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.60 0.500000 1
+playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.06 0.500000 1
+playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.60 0.629961 1
+playsound minecraft:block.note_block.snare record @s ~ ~ ~ 0.06 0.629961 1
+scoreboard players set @s nbs_rainbow4_t 1428

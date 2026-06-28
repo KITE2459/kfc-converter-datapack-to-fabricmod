@@ -1,0 +1,1 @@
+tag @s remove nbs_village2a

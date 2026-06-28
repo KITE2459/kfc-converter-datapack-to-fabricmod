@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_beach2=40000..40320}] run function beach2:tree/500_501

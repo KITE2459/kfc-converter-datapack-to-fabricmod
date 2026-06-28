@@ -1,0 +1,21 @@
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"블랙 비틀"}, speed:515, accel:482, boost:302, corner:228, drift:480, gauge:10, boosttime:61, maxboostcount:2, defense:13, draft:0, item:"furnace_minecart", model:"lpeng-blackbeetle"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"아르테미스"}, speed:512, accel:501, boost:299, corner:235, drift:446, gauge:11, boosttime:61, maxboostcount:2, defense:14, draft:0, item:"furnace_minecart", model:"lpeng-artemis"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"히페리온"}, speed:515, accel:500, boost:286, corner:216, drift:473, gauge:10, boosttime:61, maxboostcount:2, defense:10, draft:0, item:"furnace_minecart", model:"lpeng-hiperion"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"크로노스"}, speed:515, accel:480, boost:304, corner:222, drift:470, gauge:12, boosttime:62, maxboostcount:2, defense:13, draft:0, item:"furnace_minecart", model:"ecyceeeee-chronos"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"골든 파라곤"}, speed:511, accel:494, boost:310, corner:210, drift:478, gauge:10, boosttime:61, maxboostcount:2, defense:12, draft:0, item:"furnace_minecart", model:"lpeng-golden-paragon"}
+
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"얼티밋 코튼"}, speed:511, accel:494, boost:310, corner:222, drift:460, gauge:11, boosttime:61, maxboostcount:2, defense:10, draft:0, item:"cottonsrx", model:"kite-cotton-srx9"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"썬더 버스트"}, speed:500, accel:580, boost:274, corner:192, drift:448, gauge:9, boosttime:58, maxboostcount:2, defense:8, draft:0, item:"burstv1", model:"lpeng-burst-thunder"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"아이언 솔리드"}, speed:522, accel:464, boost:300, corner:216, drift:472, gauge:12, boosttime:61, maxboostcount:2, defense:26, draft:0, item:"solidv1", model:"lpeng-iron-solid"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"파이어 마라톤"}, speed:514, accel:470, boost:328, corner:200, drift:452, gauge:8, boosttime:68, maxboostcount:2, defense:7, draft:0, item:"firemara", model:"lpeng-maraton-fire"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"세이버 엠퍼러"}, speed:510, accel:505, boost:300, corner:200, drift:495, gauge:10, boosttime:59, maxboostcount:2, defense:10, draft:9, item:"goldsaber", model:"lpeng-golden-saber"}
+
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"데드락 연카"}, speed:510, accel:500, boost:302, corner:210, drift:470, gauge:13, boosttime:60, maxboostcount:2, defense:10, draft:0, item:"practice-deadlock", model:"lpeng-practice-deadlock"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"프로토 바이크 [🔥]"}, speed:504, accel:530, boost:290, corner:200, drift:476, gauge:32, boosttime:54, maxboostcount:3, defense:6, draft:0, item:"chest_minecart", model:"lpeng-practice-bike"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"카오스"}, speed:512, accel:496, boost:292, corner:233, drift:485, gauge:7, boosttime:62, maxboostcount:2, defense:11, draft:0, item:"furnace_minecart", model:"lpeng-chaos"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"백기사 임페리움"}, speed:512, accel:500, boost:300, corner:212, drift:460, gauge:10, boosttime:65, maxboostcount:2, defense:12, draft:0, item:"furnace_minecart", model:"lpeng-imperium"}
+function kartmain:makekart {name:{color:"dark_red", bold:true, italic:false, translate:"세르케트 스토커"}, speed:512, accel:473, boost:330, corner:220, drift:460, gauge:11, boosttime:61, maxboostcount:2, defense:15, draft:0, item:"serket", model:"nekter-serket"}
+
+#[🔒] [🔥] [🚧] [♫]
+#2개 이상일 경우 왼쪽부터 오른쪽 순서로 적습니다.
+#ex) [🔒/♫]

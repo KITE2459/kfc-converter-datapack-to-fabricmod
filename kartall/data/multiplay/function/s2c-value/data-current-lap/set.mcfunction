@@ -1,0 +1,2 @@
+execute store result storage kartmain currentlap byte 1 on passengers if entity @s[type=player] run scoreboard players get @s trackselect-lap
+function multiplay:s2c-value/data-current-lap/macro with storage kartmain

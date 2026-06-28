@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mine3=53760..54240}] run function mine3:tree/672_675
+execute as @s[scores={nbs_mine3=54080..54640}] run function mine3:tree/676_679

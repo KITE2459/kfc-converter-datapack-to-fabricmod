@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_singleplay=320..560,nbs_singleplay_t=..3}] run function singleplayroom:notes/4

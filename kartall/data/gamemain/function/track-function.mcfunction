@@ -1,0 +1,1 @@
+execute if score iswork timermain matches 1 if score #map trackselect-map-id matches 142 run function etc:rainbow-boost

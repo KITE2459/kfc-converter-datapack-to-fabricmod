@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_forest3=47360..48160}] run function forest3:tree/592_599
+execute as @s[scores={nbs_forest3=48000..48880}] run function forest3:tree/600_607

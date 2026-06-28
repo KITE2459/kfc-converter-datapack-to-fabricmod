@@ -1,0 +1,1 @@
+item replace entity 7438-0-13-0-0 container.0 with player_head[profile={properties:[{name:"textures",value:"eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvNjc0M2MzYmIyZWU4NWI0ZTBkNTI5YmRlNjdjODI0YzM0OTA0NDQ5OGUzYTI4ZjE2ZjZjM2FiYWU3NDcwOTliOCJ9fX0="}]}]

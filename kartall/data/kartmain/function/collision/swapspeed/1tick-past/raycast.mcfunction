@@ -1,0 +1,1 @@
+$execute positioned ^ ^ ^-$(kartvector0) run function kartmobil:move/movetp/tp-bug-fix/tp

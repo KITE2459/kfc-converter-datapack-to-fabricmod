@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_tomb=66560..69280}] run function tomb:tree/832_863
+execute as @s[scores={nbs_tomb=69120..71920}] run function tomb:tree/864_895

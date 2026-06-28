@@ -1,0 +1,1 @@
+$function kartmobil:move/movetp/jump-and-boost/pad-direction-fix-macro-double {boostpaddirection:$(boostpaddirection)}

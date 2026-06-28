@@ -1,0 +1,1 @@
+function multiplay:system/game/gameend-log

@@ -1,0 +1,1 @@
+kill @e[tag=kartcste0,type=item_display]

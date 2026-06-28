@@ -1,0 +1,7 @@
+data merge entity 7438-0-8-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4632f,-0.1035f,0.0196f,0.5046f,0.0981f,-0.4897f,-0.2697f,1.4805f,0.0661f,-0.2167f,0.4175f,0.0464f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-9-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4632f,-0.1035f,0.0196f,0.556f,0.0981f,-0.4897f,-0.2697f,1.7234f,0.0661f,-0.2167f,0.4175f,0.1539f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-7-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4632f,-0.104f,0.017f,0.4534f,0.0981f,-0.4828f,-0.282f,1.2423f,0.0661f,-0.2272f,0.4119f,-0.0675f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-b-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4716f,-0.0008f,0.0564f,-0.1991f,-0.031f,-0.5004f,-0.2662f,1.5285f,0.0501f,-0.2243f,0.4157f,0.1591f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-c-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4716f,-0.0008f,0.0564f,-0.1987f,-0.031f,-0.5004f,-0.2662f,1.7767f,0.0501f,-0.2243f,0.4157f,0.2704f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-a-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.4716f,-0.0077f,0.0559f,-0.2029f,-0.031f,-0.464f,-0.3255f,1.3156f,0.0501f,-0.2735f,0.3851f,0.0284f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity 7438-0-13-0-0 {start_interpolation: 0, interpolation_duration: 1, transformation:[-0.948f,-0.0118f,-0.061f,0.1331f,0.0469f,0.7283f,-0.8696f,1.8857f,0.0481f,-0.7287f,-0.6077f,-0.3551f,0.0f,0.0f,0.0f,1.0f]}

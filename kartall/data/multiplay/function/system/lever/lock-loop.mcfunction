@@ -1,0 +1,2 @@
+execute as @e[tag=kite-lock,type=minecraft:interaction] at @s on attacker as @s run function multiplay:system/lever/lock-notify
+execute as @e[tag=kite-lock,type=minecraft:interaction] at @s on target as @s run function multiplay:system/lever/lock-notify

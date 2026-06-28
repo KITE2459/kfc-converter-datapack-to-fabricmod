@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_planet2=48800..49040,nbs_planet2_t=..609}] run function planet2:notes/610
+execute as @s[scores={nbs_planet2=48880..49120,nbs_planet2_t=..610}] run function planet2:notes/611

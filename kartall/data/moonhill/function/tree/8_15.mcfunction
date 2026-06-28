@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_moonhill=640..1120}] run function moonhill:tree/8_11
+execute as @s[scores={nbs_moonhill=960..1520}] run function moonhill:tree/12_15

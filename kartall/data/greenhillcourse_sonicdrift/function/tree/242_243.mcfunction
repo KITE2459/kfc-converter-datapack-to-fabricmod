@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_greenhillc=19360..19600,nbs_greenhillc_t=..241}] run function greenhillcourse_sonicdrift:notes/242
+execute as @s[scores={nbs_greenhillc=19440..19680,nbs_greenhillc_t=..242}] run function greenhillcourse_sonicdrift:notes/243

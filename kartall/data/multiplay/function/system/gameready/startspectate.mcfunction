@@ -1,0 +1,2 @@
+execute if score #game multi-main matches 1.. if score #retire-time multi-main matches 1.. as @p[distance=..100] run function multiplay:system/spectator/startspectate
+execute if score #game multi-main matches 1.. if score #time multi-main matches 1.. as @p[distance=..100] run function multiplay:system/spectator/startspectate

@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_pirate4=2560..3360}] run function pirate4:tree/32_39
+execute as @s[scores={nbs_pirate4=3200..4080}] run function pirate4:tree/40_47

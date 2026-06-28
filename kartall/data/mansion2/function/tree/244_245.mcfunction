@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mansion2=19520..19760,nbs_mansion2_t=..243}] run function mansion2:notes/244
+execute as @s[scores={nbs_mansion2=19600..19840,nbs_mansion2_t=..244}] run function mansion2:notes/245

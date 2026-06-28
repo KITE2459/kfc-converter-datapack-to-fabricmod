@@ -1,0 +1,3 @@
+data merge entity @e[limit=1,tag=psolidsteve57,type=item_display] {start_interpolation: 0, interpolation_duration: 7, transformation:[-0.7961f,-0.5293f,-0.1327f,-0.7164f,-0.2257f,0.5849f,-0.7381f,1.5725f,0.4667f,-0.6199f,-0.5832f,-0.2544f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity @e[limit=1,tag=psolidsteve67,type=item_display] {start_interpolation: 0, interpolation_duration: 7, transformation:[-0.0487f,0.0964f,-0.2225f,0.9133f,-0.0481f,-0.0699f,0.2346f,2.7082f,0.004f,0.3357f,0.1128f,-0.3063f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity @e[limit=1,tag=psolidsteve101,type=item_display] {start_interpolation: 0, interpolation_duration: 7, transformation:[-0.1012f,-0.0424f,-0.0229f,0.8769f,-0.1f,0.0454f,0.018f,2.6714f,0.0083f,0.0289f,-0.062f,-0.3034f,0.0f,0.0f,0.0f,1.0f]}

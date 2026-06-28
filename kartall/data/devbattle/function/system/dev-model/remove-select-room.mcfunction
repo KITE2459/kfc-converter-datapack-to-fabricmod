@@ -1,0 +1,10 @@
+execute positioned -31 5 244 run kill @e[distance=..0.1,type=!player]
+execute positioned -27 5 244 run kill @e[distance=..0.1,type=!player]
+execute positioned -23 5 244 run kill @e[distance=..0.1,type=!player]
+execute positioned -19 5 244 run kill @e[distance=..0.1,type=!player]
+execute positioned -15 5 244 run kill @e[distance=..0.1,type=!player]
+execute positioned -11 5 244 run kill @e[distance=..0.1,type=!player]
+
+execute positioned -10 5 253 run kill @e[distance=..0.1,type=!player]
+execute positioned -10 5 256 run kill @e[distance=..0.1,type=!player]
+execute positioned -10 5 259 run kill @e[distance=..0.1,type=!player]

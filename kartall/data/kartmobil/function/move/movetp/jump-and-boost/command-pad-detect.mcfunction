@@ -1,0 +1,2 @@
+execute positioned ~ ~-0.5 ~ if block ~ ~ ~ command_block run function kartmobil:move/movetp/jump-and-boost/command-pad
+execute positioned ~ ~-1.5 ~ if block ~ ~ ~ command_block run function kartmobil:move/movetp/jump-and-boost/command-pad

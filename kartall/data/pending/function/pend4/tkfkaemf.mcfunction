@@ -1,0 +1,16 @@
+execute if score #pendpeople pendcredit matches 85 run function pending:pend4/f17
+execute if score #pendpeople pendcredit matches 9 run function pending:pend4/f1
+execute if score #pendpeople pendcredit matches 29 run function pending:pend4/f2
+execute if score #pendpeople pendcredit matches 49 run function pending:pend4/f3
+execute if score #pendpeople pendcredit matches 52 run function pending:pend4/f4
+execute if score #pendpeople pendcredit matches 63 run function pending:pend4/f5
+execute if score #pendpeople pendcredit matches 65 run function pending:pend4/f6
+execute if score #pendpeople pendcredit matches 67 run function pending:pend4/f7
+execute if score #pendpeople pendcredit matches 69 run function pending:pend4/f8
+execute if score #pendpeople pendcredit matches 71 run function pending:pend4/f9
+execute if score #pendpeople pendcredit matches 73 run function pending:pend4/f10
+execute if score #pendpeople pendcredit matches 75 run function pending:pend4/f11
+execute if score #pendpeople pendcredit matches 77 run function pending:pend4/f12
+execute if score #pendpeople pendcredit matches 79 run function pending:pend4/f13
+execute if score #pendpeople pendcredit matches 81 run function pending:pend4/f15
+execute if score #pendpeople pendcredit matches 83 run function pending:pend4/f16

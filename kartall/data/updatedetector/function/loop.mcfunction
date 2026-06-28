@@ -1,0 +1,1 @@
+execute if score #update-exist kartmain matches 1 if entity @a run function updatedetector:on-update-detected

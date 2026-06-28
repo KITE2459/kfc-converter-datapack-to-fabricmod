@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_kauzee=27840..28080,nbs_kauzee_t=..347}] run function kauzee:notes/348
+execute as @s[scores={nbs_kauzee=27920..28160,nbs_kauzee_t=..348}] run function kauzee:notes/349

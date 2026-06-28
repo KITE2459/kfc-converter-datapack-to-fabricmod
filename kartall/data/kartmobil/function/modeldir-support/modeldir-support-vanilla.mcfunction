@@ -1,0 +1,2 @@
+execute on passengers rotated as @s[tag=kartmodelsaddle,type=item_display] on passengers run rotate @s ~ ~
+#execute on passengers rotated as @s[tag=kartmodelsaddle,type=item_display] run rotate @s ~ 0

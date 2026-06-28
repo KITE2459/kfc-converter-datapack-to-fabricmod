@@ -1,0 +1,20 @@
+particle minecraft:glow -10310 275 -10389 2 1 2 0 10 normal
+particle minecraft:trial_spawner_detection_ominous -10310 275 -10389 2 1 2 0 10 normal
+particle minecraft:glow -10384 274 -10372 2 1 2 0 10 normal
+particle minecraft:trial_spawner_detection_ominous -10384 274 -10372 2 1 2 0 10 normal
+particle minecraft:glow -10402 274 -10351 2 1 2 0 10 normal
+particle minecraft:trial_spawner_detection_ominous -10402 274 -10351 2 1 2 0 10 normal
+particle minecraft:glow -10279 274 -10303 3 1 3 0 15 normal
+particle minecraft:trial_spawner_detection_ominous -10279 274 -10303 3 1 3 0 15 normal
+particle minecraft:glow -10259 279 -10230 3 1 3 0 15 normal
+particle minecraft:trial_spawner_detection_ominous -10259 279 -10230 3 1 3 0 15 normal
+particle minecraft:glow -10317 284 -10111 2 1 2 0 5 normal
+particle minecraft:trial_spawner_detection_ominous -10317 284 -10111 2 1 2 0 5 normal
+execute as @e[x=-10092,y=279,z=-9835,dx=170,dy=32,dz=-200,tag=kartmobil,type=#kartmobil:kartmobil] at @s if block ~ ~-1 ~ minecraft:magenta_stained_glass run scoreboard players add @s kartmove 300
+particle minecraft:glow -10226 257 -10194 200 50 200 0 50 force
+particle minecraft:wax_off -10226 257 -10194 200 50 200 0 50 force
+particle minecraft:wax_on -10226 257 -10194 200 50 200 0 50 force
+particle minecraft:glow -9610 8 -10001 0 2 5 0 30 normal
+particle minecraft:trial_spawner_detection_ominous -9610 8 -10001 0 2 5 0 30 normal
+particle minecraft:glow -10151 213 -10367 3 1 2 0 10 normal
+particle minecraft:trial_spawner_detection_ominous -10151 213 -10367 3 1 2 0 10 normal

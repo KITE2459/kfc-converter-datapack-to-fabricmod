@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_ghz=50880..51200}] run function ghz:tree/636_637
+execute as @s[scores={nbs_ghz=51040..51440}] run function ghz:tree/638_639

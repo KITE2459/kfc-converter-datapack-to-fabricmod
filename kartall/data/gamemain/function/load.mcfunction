@@ -1,0 +1,10 @@
+function gamemain:startset
+function timeattack:startset
+function updown:startset
+function license:startset
+function master:startset
+function devbattle:startset
+function multiplay:startset
+function garage:startset
+function checkpoint:startset
+function teamboostmodule:startset

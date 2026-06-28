@@ -1,0 +1,1 @@
+$function $(bgm):play

@@ -1,0 +1,11 @@
+# Project created via BDEngine
+
+function project:animate/animation_keyframe0_1
+function project:animate/animation_keyframe0_2
+function project:animate/animation_keyframe0_3
+function project:animate/animation_keyframe0_4
+function project:animate/animation_keyframe0_5
+function project:animate/animation_keyframe0_6
+function project:animate/animation_keyframe0_7
+function project:animate/animation_keyframe0_8
+function project:animate/animation_keyframe0_9

@@ -1,0 +1,3 @@
+execute at @s if data entity @n[tag=kart-special-ability,distance=..1.39] data.bgm run function bgm-room:manage-bgm/playbgm-macro with entity @n[tag=kart-special-ability,distance=..1.39] data
+$execute at @s if entity @n[tag=kart-special-ability,distance=..1.39] unless data entity @n[tag=kart-special-ability,distance=..1.39] data.bgm run function bgm-room:manage-bgm/playbgm-macro {bgm:$(bgm)}
+$execute at @s unless entity @n[tag=kart-special-ability,distance=..1.39] run function bgm-room:manage-bgm/playbgm-macro {bgm:$(bgm)}

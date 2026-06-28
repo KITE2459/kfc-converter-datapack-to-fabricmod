@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_otherside=24640..24960}] run function otherside:tree/308_309
+execute as @s[scores={nbs_otherside=24800..25200}] run function otherside:tree/310_311

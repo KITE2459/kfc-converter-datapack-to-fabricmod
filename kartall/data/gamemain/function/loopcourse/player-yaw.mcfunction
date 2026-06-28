@@ -1,0 +1,1 @@
+$execute rotated $(loooprotation2) 0 run rotate @s ~$(loooprotation) ~

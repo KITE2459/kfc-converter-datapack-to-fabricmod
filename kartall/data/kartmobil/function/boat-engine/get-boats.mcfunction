@@ -1,0 +1,1 @@
+give @p iron_nugget[custom_name="a",custom_data={boatpack:1,type:1},minecraft:item_model="minecraft:oak_boat",minecraft:max_stack_size=1,minecraft:consumable={"animation":"block","consume_seconds":1000000.0,"has_consume_particles":false}] 1

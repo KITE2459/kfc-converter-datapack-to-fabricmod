@@ -1,0 +1,5 @@
+kill @e[tag=answkr0,type=block_display]
+summon block_display ~ ~ ~ {id:block_display,block_state:{Name:"spruce_door",Properties:{facing:"east",half:"lower",hinge:"left",open:"false"}},transformation:[0f,0f,-1f,1f,0f,1f,0f,0f,1f,0f,0f,-.1875f,0f,0f,0f,1f],Tags:[answkr0],UUID:[I;294871,1,0,0]}
+summon block_display ~ ~ ~ {id:block_display,block_state:{Name:"spruce_door",Properties:{facing:"east",half:"upper",hinge:"left",open:"false"}},transformation:[0f,0f,-1f,1f,0f,1f,0f,1f,1f,0f,0f,-.1875f,0f,0f,0f,1f],Tags:[answkr0],UUID:[I;294871,2,0,0]}
+summon block_display ~ ~ ~ {id:block_display,block_state:{Name:"spruce_door",Properties:{facing:"east",half:"lower",hinge:"left",open:"false"}},transformation:[0f,0f,1f,-1f,0f,1f,0f,0f,-1f,0f,0f,0f,0f,0f,0f,1f],Tags:[answkr0],UUID:[I;294871,3,0,0]}
+summon block_display ~ ~ ~ {id:block_display,block_state:{Name:"spruce_door",Properties:{facing:"east",half:"upper",hinge:"left",open:"false"}},transformation:[0f,0f,1f,-1f,0f,1f,0f,1f,-1f,0f,0f,0f,0f,0f,0f,1f],Tags:[answkr0],UUID:[I;294871,4,0,0]}

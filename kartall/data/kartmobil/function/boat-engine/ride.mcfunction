@@ -1,0 +1,1 @@
+ride @s mount @n[tag=boat-saddle]

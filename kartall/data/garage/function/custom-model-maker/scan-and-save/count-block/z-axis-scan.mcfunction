@@ -1,0 +1,14 @@
+execute positioned ~ ~ ~ if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~1 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~2 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~3 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~4 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~5 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~6 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~7 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~8 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~9 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~10 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~11 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~12 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1
+execute positioned ~ ~ ~13 if block ~ ~ ~ #garage:can-place-on run scoreboard players add #block-count garage-time 1

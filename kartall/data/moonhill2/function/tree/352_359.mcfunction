@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_moonhill2=28480..29040}] run function moonhill2:tree/356_359

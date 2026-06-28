@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_pretion2=20800..21040,nbs_pretion2_t=..259}] run function pretion2:notes/260

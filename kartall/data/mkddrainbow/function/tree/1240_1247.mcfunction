@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mkddrainbo=99200..99680}] run function mkddrainbow:tree/1240_1243
+execute as @s[scores={nbs_mkddrainbo=99520..100080}] run function mkddrainbow:tree/1244_1247

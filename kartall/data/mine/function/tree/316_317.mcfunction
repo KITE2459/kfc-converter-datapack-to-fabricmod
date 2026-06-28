@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mine=25280..25520,nbs_mine_t=..315}] run function mine:notes/316
+execute as @s[scores={nbs_mine=25360..25600,nbs_mine_t=..316}] run function mine:notes/317

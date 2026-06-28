@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_tomb2=312480..312720,nbs_tomb2_t=..3905}] run function tomb2:notes/3906

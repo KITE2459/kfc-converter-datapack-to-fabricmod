@@ -1,0 +1,2 @@
+execute as @a on vehicle on vehicle at @s if block ~ ~-1 ~ minecraft:magenta_wool run scoreboard players add @s kartmove 1000
+execute as @a on vehicle on vehicle at @s if block ~ ~-1 ~ minecraft:pink_concrete run scoreboard players add @s kartmove 300

@@ -1,0 +1,2 @@
+execute positioned ~ ~-1 ~ if block ~ ~ ~ #kartmobil:ignoreblock unless function kartmobil:is-water run scoreboard players add @s floor-distance 1
+execute positioned ~ ~-1 ~ if block ~ ~ ~ #kartmobil:ignoreblock unless function kartmobil:is-water if score @s floor-distance matches ..5 run function kartmobil:detect-floor-distance-water

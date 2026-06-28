@@ -1,0 +1,1 @@
+kill @e[tag=kite-lock,type=minecraft:interaction]

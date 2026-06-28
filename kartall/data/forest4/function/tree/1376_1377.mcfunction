@@ -1,0 +1,1 @@
+execute as @s[scores={nbs_forest4=110080..110320,nbs_forest4_t=..1375}] run function forest4:notes/1376

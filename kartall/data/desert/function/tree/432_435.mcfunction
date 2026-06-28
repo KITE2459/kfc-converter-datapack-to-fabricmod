@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_desert=34560..34880}] run function desert:tree/432_433
+execute as @s[scores={nbs_desert=34720..35120}] run function desert:tree/434_435

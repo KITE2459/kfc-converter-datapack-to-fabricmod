@@ -1,0 +1,3 @@
+playsound minecraft:block.note_block.chime record @s ~ ~ ~ 1 0.890899 1
+scoreboard players set @s nbs_driftgarag 0
+scoreboard players set @s nbs_driftgarag_t -1

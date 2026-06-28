@@ -1,0 +1,3 @@
+playsound minecraft:block.note_block.bit record @s ~ ~ ~ 1 0.594604 1
+playsound minecraft:block.note_block.basedrum record @s ~ ~ ~ 1 1.414214 1
+scoreboard players set @s nbs_moonhill2_t 884

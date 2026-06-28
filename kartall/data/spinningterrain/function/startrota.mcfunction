@@ -1,0 +1,1 @@
+scoreboard players set #rota nemo-spinning-terrain 1

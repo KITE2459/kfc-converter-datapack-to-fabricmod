@@ -1,0 +1,2 @@
+execute if score @s trackselect-lap > @a[tag=check-multi-temp,limit=1] trackselect-lap run tag @a[tag=check-multi-temp,limit=1] remove check-1st-lap-player
+execute if score @s trackselect-lap = @a[tag=check-multi-temp,limit=1] trackselect-lap run tag @s add check-same-lap-player

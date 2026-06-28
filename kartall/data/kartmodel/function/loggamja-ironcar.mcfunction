@@ -1,0 +1,3 @@
+summon block_display ~ ~ ~ {Passengers:[{id:block_display,block_state:{Name:"iron_block"},transformation:[0f,0f,-1.3125f,.656f,0f,.7813f,0f,0f,1.8125f,0f,0f,-.9065f,0f,0f,0f,1f]},{id:block_display,block_state:{Name:"green_stained_glass"},transformation:[0f,0f,-1.2879f,.6437f,-.2873f,.0126f,0f,1.0406f,.077f,.0471f,0f,.4504f,0f,0f,0f,1f]},{id:block_display,block_state:{Name:"gray_concrete"},transformation:[0f,0f,-1.3945f,.6972f,0f,.293f,0f,0f,.2973f,0f,0f,-.6489f,0f,0f,0f,1f]},{id:block_display,block_state:{Name:"gray_concrete"},transformation:[0f,0f,-1.3945f,.6972f,0f,.293f,0f,0f,.2973f,0f,0f,.3511f,0f,0f,0f,1f]}]}
+
+summon block_display ~ ~ ~ {Tags:["kart-special-ability"],data:{hitbox:{front:9, rear:9, left:7, right:7}}}

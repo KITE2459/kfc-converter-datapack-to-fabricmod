@@ -1,0 +1,6 @@
+playsound minecraft:block.note_block.banjo record @s ^0.01 ^ ^ 0.82 1.587401 1
+playsound minecraft:block.note_block.banjo record @s ^0.01 ^ ^ 0.82 1.334840 1
+playsound minecraft:block.note_block.banjo record @s ^0.01 ^ ^ 0.82 0.500000 1
+playsound minecraft:block.note_block.didgeridoo record @s ^0.01 ^ ^ 0.82 1.000000 1
+playsound minecraft:block.note_block.bell record @s ^0.01 ^ ^ 0.82 1.059463 1
+scoreboard players set @s nbs_mkgbarainb_t 322

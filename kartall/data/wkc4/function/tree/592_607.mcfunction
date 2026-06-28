@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_wkc4=47360..48160}] run function wkc4:tree/592_599
+execute as @s[scores={nbs_wkc4=48000..48880}] run function wkc4:tree/600_607

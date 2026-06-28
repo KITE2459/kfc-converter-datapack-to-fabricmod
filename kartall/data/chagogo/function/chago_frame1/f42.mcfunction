@@ -1,0 +1,1 @@
+data merge entity 7438-0-13-0-0 {start_interpolation: 0, interpolation_duration: 5, transformation:[-0.948f,0.0044f,-0.0619f,0.1371f,-0.0055f,0.938f,0.1507f,1.8785f,0.0618f,0.1507f,-0.9359f,0.1086f,0.0f,0.0f,0.0f,1.0f]}

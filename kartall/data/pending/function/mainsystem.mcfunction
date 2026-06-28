@@ -1,0 +1,1 @@
+execute if score #pendcredit pendcredit matches 1.. run function pending:endendend

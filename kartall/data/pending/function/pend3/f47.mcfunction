@@ -1,0 +1,2 @@
+data merge entity @e[limit=1,tag=psolidsteve67,type=item_display] {start_interpolation: 0, interpolation_duration: 7, transformation:[0.0096f,0.0144f,0.3388f,1.6215f,0.0505f,0.2363f,-0.0449f,3.1625f,-0.0453f,0.2662f,0.0216f,-0.5786f,0.0f,0.0f,0.0f,1.0f]}
+data merge entity @e[limit=1,tag=psolidsteve101,type=item_display] {start_interpolation: 0, interpolation_duration: 7, transformation:[0.0199f,0.0677f,0.004f,1.6282f,0.105f,-0.0044f,-0.0461f,3.2008f,-0.0943f,0.0094f,-0.0505f,-0.6129f,0.0f,0.0f,0.0f,1.0f]}

@@ -1,0 +1,4 @@
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.22 1.681793 1
+playsound minecraft:block.note_block.flute record @s ~ ~ ~ 0.22 0.840896 1
+playsound minecraft:block.note_block.harp record @s ~ ~ ~ 0.98 0.840896 1
+scoreboard players set @s nbs_rainbow4_t 1199

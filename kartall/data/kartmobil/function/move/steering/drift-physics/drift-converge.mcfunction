@@ -1,0 +1,2 @@
+execute unless score @s kart-engine matches 7 if score @s kartaccel matches 0.. on passengers as @s[tag=kartdirectiontemp,type=item_display] at @s anchored eyes rotated as @p[tag=kartpassenger] rotated ~ 35 positioned ^ ^ ^5 rotated as @s run function kartmobil:move/steering/drift-physics/drift-tree/main
+execute if score @s kartaccel matches ..-1 on passengers as @s[tag=kartdirectiontemp,type=item_display] at @s anchored eyes rotated as @p[tag=kartpassenger] rotated ~180 35 positioned ^ ^ ^5 rotated as @s run function kartmobil:move/steering/drift-physics/drift-tree/main

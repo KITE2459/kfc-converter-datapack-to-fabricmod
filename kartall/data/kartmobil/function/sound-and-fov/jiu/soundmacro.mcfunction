@@ -1,0 +1,1 @@
+$execute as @e[limit=2] at @p[tag=kartpassenger] run playsound minecraft:block.note_block.guitar neutral @a[tag=kart-listener] ~ ~ ~ 0.85 $(kartsound) 1

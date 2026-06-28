@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_maplenew=65280..65760}] run function maplenew:tree/816_819
+execute as @s[scores={nbs_maplenew=65600..66160}] run function maplenew:tree/820_823

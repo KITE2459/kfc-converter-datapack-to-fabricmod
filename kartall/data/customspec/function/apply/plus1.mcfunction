@@ -1,0 +1,9 @@
+execute if score @s customspec-active matches 1 run scoreboard players add @s customspec-speed 1
+execute if score @s customspec-active matches 2 run scoreboard players add @s customspec-accel 1
+execute if score @s customspec-active matches 3 run scoreboard players add @s customspec-boost 1
+execute if score @s customspec-active matches 4 run scoreboard players add @s customspec-corner 1
+execute if score @s customspec-active matches 5 run scoreboard players add @s customspec-drift 1
+execute if score @s customspec-active matches 6 run scoreboard players add @s customspec-gauge 1
+execute if score @s customspec-active matches 7 run scoreboard players add @s customspec-boosttime 1
+execute if score @s customspec-active matches 8 run scoreboard players add @s customspec-defense 1
+execute if score @s customspec-active matches 9 run scoreboard players add @s customspec-draft 1

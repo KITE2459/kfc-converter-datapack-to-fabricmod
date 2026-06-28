@@ -1,0 +1,2 @@
+execute if score @s kart-engine matches 1006 run function multiplay:system/game/pull-accel/f1-accel
+execute unless score @s kart-engine matches 1006 run function multiplay:system/game/pull-accel/normal-accel

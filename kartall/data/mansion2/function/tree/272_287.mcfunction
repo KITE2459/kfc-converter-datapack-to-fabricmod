@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_mansion2=21760..22560}] run function mansion2:tree/272_279
+execute as @s[scores={nbs_mansion2=22400..23280}] run function mansion2:tree/280_287

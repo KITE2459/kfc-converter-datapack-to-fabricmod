@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_rainbow4=75520..76000}] run function rainbow4:tree/944_947
+execute as @s[scores={nbs_rainbow4=75840..76400}] run function rainbow4:tree/948_951

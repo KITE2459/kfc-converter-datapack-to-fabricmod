@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_nemo2=3040..3280,nbs_nemo2_t=..37}] run function nemo2:notes/38
+execute as @s[scores={nbs_nemo2=3120..3360,nbs_nemo2_t=..38}] run function nemo2:notes/39

@@ -1,0 +1,2 @@
+$execute store result storage boatpack angle-speed float $(slip) run scoreboard players get @s boat-angle-speed
+execute store result score @s boat-angle-speed run data get storage boatpack angle-speed

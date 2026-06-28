@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_factory2=19520..19760,nbs_factory2_t=..243}] run function factory2:notes/244
+execute as @s[scores={nbs_factory2=19600..19840,nbs_factory2_t=..244}] run function factory2:notes/245

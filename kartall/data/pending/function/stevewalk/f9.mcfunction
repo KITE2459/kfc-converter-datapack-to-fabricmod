@@ -1,0 +1,1 @@
+data merge entity @e[limit=1,tag=pendsteve19,type=item_display] {start_interpolation: 0, interpolation_duration: 4, transformation:[-0.95f,0.0f,0.0f,0.0f,0.0f,0.8927f,-0.3251f,1.8934f,-0.0f,-0.3251f,-0.8927f,-0.1676f,0.0f,0.0f,0.0f,1.0f]}

@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_kauzee=30720..31040}] run function kauzee:tree/384_385
+execute as @s[scores={nbs_kauzee=30880..31280}] run function kauzee:tree/386_387

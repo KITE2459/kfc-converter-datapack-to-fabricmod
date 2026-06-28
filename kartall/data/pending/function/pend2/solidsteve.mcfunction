@@ -1,0 +1,9 @@
+execute if score #solidsteve pendcredit matches 27 run function pending:pend2/f3
+execute if score #solidsteve pendcredit matches 99 run function pending:pend2/f10
+execute if score #solidsteve pendcredit matches 3 run function pending:pend2/f1
+execute if score #solidsteve pendcredit matches 15 run function pending:pend2/f2
+execute if score #solidsteve pendcredit matches 39 run function pending:pend2/f4
+execute if score #solidsteve pendcredit matches 51 run function pending:pend2/f5
+execute if score #solidsteve pendcredit matches 63 run function pending:pend2/f6
+execute if score #solidsteve pendcredit matches 75 run function pending:pend2/f8
+execute if score #solidsteve pendcredit matches 87 run function pending:pend2/f9

@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_rainbow3=76960..77200,nbs_rainbow3_t=..961}] run function rainbow3:notes/962
+execute as @s[scores={nbs_rainbow3=77040..77280,nbs_rainbow3_t=..962}] run function rainbow3:notes/963

@@ -1,0 +1,5 @@
+kill @e[tag=bgm-theme-text]
+kill @e[tag=bgm-theme-marker]
+kill @e[tag=bgm-theme-icon]
+kill @e[tag=bgm-theme-interaction]
+kill @e[tag=bgm-theme-return-interaction]

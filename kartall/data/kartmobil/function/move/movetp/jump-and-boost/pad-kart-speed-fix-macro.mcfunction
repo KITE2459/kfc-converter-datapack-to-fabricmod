@@ -1,0 +1,1 @@
+$function kartmobil:move/movetp/jump-and-boost/pad-kart-speed-fix-macro-double {jumppadfixspeed:$(jumppadfixspeed)}

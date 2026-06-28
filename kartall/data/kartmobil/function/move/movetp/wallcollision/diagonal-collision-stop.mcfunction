@@ -1,0 +1,2 @@
+execute if score #wall-hitbox-mode kartcollisiontime matches 0 positioned as @s run function kartmobil:move/movetp/wallcollision/real-main
+execute if score #wall-hitbox-mode kartcollisiontime matches 1.. positioned as @s run function kartmobil:move/movetp/wallcollision/hitbox/main

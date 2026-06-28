@@ -1,0 +1,2 @@
+execute as @s[scores={nbs_china3=11520..12000}] run function china3:tree/144_147
+execute as @s[scores={nbs_china3=11840..12400}] run function china3:tree/148_151

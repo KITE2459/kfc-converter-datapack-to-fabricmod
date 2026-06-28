@@ -27,12 +27,6 @@ public final class KfcGen {
             BLOCK_TAG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.nbt.NbtElement>
             SNBT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    // display transformation 행렬형 리터럴의 파싱+TRS 분해(matrix→translation/rotation/scale)는
-    // setTransformation 이 매 호출 수행하는 핫 비용이다. AffineTransformation 은 불변이고 분해를
-    // 인스턴스 내부에 1회 memoize(initialized 플래그)하므로, NbtElement 값 기준으로 캐시해 동일
-    // 행렬의 재파싱·재분해를 제거한다(distinct 행렬당 1회). 캐시 인스턴스 공유는 불변이라 안전.
-    private static final java.util.concurrent.ConcurrentHashMap<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
-            TRANSFORM_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.text.Text>
             TEXT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static final net.minecraft.nbt.NbtElement SNBT_INVALID = new net.minecraft.nbt.NbtCompound();
@@ -125,6 +119,35 @@ public final class KfcGen {
         for (net.minecraft.entity.Entity p : e.getPassengersDeep()) SNAP_ENTITIES.add(p);
         SNAP_GEN = ENTITY_GEN;               // 엔티티+탑승자 전부 반영 → 현재 gen 으로 '유효' 표시
     }
+    /** 탑승 깊이(= 위에 쌓인 차량 수). 차량 0, 그 위 탑승자 1, 또 위 2 … */
+    private static int ridingDepth(net.minecraft.entity.Entity e) {
+        int d = 0;
+        net.minecraft.entity.Entity v = (e == null ? null : e.getVehicle());
+        while (v != null && d < 64) { d++; v = v.getVehicle(); }
+        return d;
+    }
+
+    /** 셀렉터 순회를 '탑승자 우선(riding-depth 내림차순)' 으로 안정 정렬해 새 리스트로 반환.
+     *  [이유] 바닐라에서 디스플레이 리그(block_display 차량 + item_display 탑승자)를
+     *  `as @e[...] at @s run tp @s ~ ~ ~ ~rot` 로 회전할 때, 차량을 먼저 처리하면
+     *  ① 차량 tp 가 탑승자에게 회전을 전파(Entity.getPassengerTeleportTarget)하고
+     *  ② 이어서 탑승자 자기 tp 가 또 회전 → 이중 회전(-90 → -180)이 된다.
+     *  탑승자를 먼저 처리하면, 탑승자 자기 tp 가 비탑승 텔포라 stopRiding(하차)을 거쳐
+     *  이후 차량 tp 의 전파 대상에서 빠지므로 각 엔티티가 정확히 1회만 회전한다.
+     *  바닐라가 이 패턴에서 안정적으로 -90(1회) 을 내는 동작과 일치한다.
+     *  (탑승 스택과 무관한 엔티티는 안정 정렬이라 원래 상대 순서를 유지 — 다른 명령 영향 최소.) */
+    public static java.util.List<net.minecraft.entity.Entity> passengerFirst(
+            java.util.Collection<? extends net.minecraft.entity.Entity> in) {
+        java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>(in);
+        // 탑승 스택이 없으면(대부분의 틱) 정렬 자체를 건너뛴다 — 기존 '얕은 복사'와 동일 비용.
+        boolean anyRider = false;
+        for (net.minecraft.entity.Entity e : list) {
+            if (e != null && e.hasVehicle()) { anyRider = true; break; }
+        }
+        if (anyRider) list.sort((a, b) -> Integer.compare(ridingDepth(b), ridingDepth(a)));
+        return list;
+    }
+
     static void snapRemove(net.minecraft.entity.Entity e) {
         ENTITY_GEN++;
         if (e == null || SNAP_ENTITIES == null) return;
@@ -172,17 +195,12 @@ public final class KfcGen {
         float i = net.minecraft.util.math.MathHelper.sin(-rot.x * 0.017453292F);
         float j = net.minecraft.util.math.MathHelper.cos((-rot.x + 90.0F) * 0.017453292F);
         float k = net.minecraft.util.math.MathHelper.sin((-rot.x + 90.0F) * 0.017453292F);
-        // fwd=(f*h,i,g*h), up=(f*j,k,g*j) 의 Vec3d 중간객체(fwd/up/cross/multiply)를 제거하고
-        // 동일 double 연산으로 직접 계산한다(관측 비트 동일). 결과 Vec3d 1개만 할당 — 핫패스
-        // (~6.6만 곳, 매 틱 ^ 좌표) 호출당 4개 할당 감소. trig 6회와 연산 순서는 그대로 보존.
-        double fwdX = f * h, fwdY = i, fwdZ = g * h;
-        double upX  = f * j, upY  = k, upZ  = g * j;
-        double leftX = (fwdY * upZ - fwdZ * upY) * -1.0;
-        double leftY = (fwdZ * upX - fwdX * upZ) * -1.0;
-        double leftZ = (fwdX * upY - fwdY * upX) * -1.0;
-        double dx = fwdX * z + upX * y + leftX * x;
-        double dy = fwdY * z + upY * y + leftY * x;
-        double dz = fwdZ * z + upZ * y + leftZ * x;
+        net.minecraft.util.math.Vec3d fwd = new net.minecraft.util.math.Vec3d(f * h, i, g * h);
+        net.minecraft.util.math.Vec3d up  = new net.minecraft.util.math.Vec3d(f * j, k, g * j);
+        net.minecraft.util.math.Vec3d left = fwd.crossProduct(up).multiply(-1.0);
+        double dx = fwd.x * z + up.x * y + left.x * x;
+        double dy = fwd.y * z + up.y * y + left.y * x;
+        double dz = fwd.z * z + up.z * y + left.z * x;
         return pos.add(dx, dy, dz);
     }
 
@@ -1553,45 +1571,48 @@ public final class KfcGen {
     }
 
     /** tp <e> <pos> — 엔티티를 좌표로 이동(회전 유지). */
-    /** 비-플레이어·무승객 leaf 엔티티 전용 경량 위치+회전 설정(풀 teleport() 관측 동등).
-     *  바닐라 Entity.teleport(world,x,y,z,Set.of(),yaw,pitch,true) 는 same-dimension 에서
-     *  setPos+setYaw+setHeadYaw+setPitch+resetPosition(updateLastPosition+updateLastAngles)
-     *  +refreshPosition+setVelocity(ZERO) 만 수행한다(merged jar 바이트코드 확인).
-     *  차원전환/승객 드래그/sendTeleportPacket 은 leaf 비-플레이어엔 불필요하며, 위치는 엔티티
-     *  트래커가 매 틱 EntityPositionSyncS2CPacket 으로 동기화한다(movePosition 비-플레이어 경로와 동일).
-     *  플레이어(카메라/하차 보정)·승객 동반(좌석 드래그)은 false → 호출부가 풀 teleport 로 폴백. */
-    private static boolean lightTeleport(net.minecraft.entity.Entity e,
-                                         double x, double y, double z, float yaw, float pitch) {
-        if (e instanceof net.minecraft.server.network.ServerPlayerEntity) return false;
-        if (e.hasPassengers()) return false;
-        e.refreshPositionAndAngles(x, y, z, yaw, pitch);   // setPos+setYaw+setPitch+resetPosition+refreshPosition
-        e.setHeadYaw(yaw);                                  // 풀 teleport 의 setHeadYaw 동등
-        e.setVelocity(net.minecraft.util.math.Vec3d.ZERO);  // 풀 teleport 의 속도 0 동등(바닐라 /tp 정지)
-        return true;
-    }
-
     public static void teleportTo(net.minecraft.entity.Entity e, double x, double y, double z) {
         if (e == null) return;
         // 플레이어도 비-플레이어와 동일하게 바닐라 /tp 의 풀 teleport() 를 쓴다.
         // requestTeleport 는 dismount 직후 같은 틱 tp 시 하차 위치 보정에 덮어써져
         // (retire: stopRiding -> tp -17.5 가 카트 위치로 끌려감) 위치 복귀가 실패한다.
-        if (lightTeleport(e, x, y, z, e.getYaw(), e.getPitch())) return;
         e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
                 java.util.Set.of(), e.getYaw(), e.getPitch(), true);
     }
 
-    /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
+    /** tp <대상> <좌표> <회전> — 위치+회전 설정. (relMask=0: 전부 절대) */
     public static void teleportToWithRot(net.minecraft.entity.Entity e, double x, double y, double z,
                                          float yaw, float pitch) {
+        teleportToWithRot(e, x, y, z, yaw, pitch, 0);
+    }
+
+    /** tp <대상> <좌표> <회전> — 위치+회전 설정.
+     *  relMask: 원본 명령에서 '~'(상대)였던 성분 비트마스크 (X=1,Y=2,Z=4,Y_ROT=8,X_ROT=16).
+     *  바닐라 TeleportCommand.teleport 를 그대로 재현한다: 상대 성분은 (절대값 − 대상 현재값) 델타로
+     *  바꾸고 movementFlags 를 Entity.teleport 에 전달한다. 이 플래그가 있어야 Entity.teleport 의
+     *  탑승자 전파(getPassengerTeleportTarget)가 바닐라와 동일하게 동작한다 — 상대 회전(~rot)일 때
+     *  탑승자 yaw 가 차량 yaw 로 덮어써지지 않고 보존되어, 디스플레이 리그(block_display + item_display
+     *  탑승자)가 '차량 텔포 1회 + 자기 셀렉터 1회'로 이중 회전(-90 → -180)되던 버그를 막는다.
+     *  relMask=0 이면 전부 절대(빈 플래그) — 기존 절대 tp 동작과 완전히 동일하다. */
+    public static void teleportToWithRot(net.minecraft.entity.Entity e, double x, double y, double z,
+                                         float yaw, float pitch, int relMask) {
         if (e == null) return;
-        // 바닐라 TeleportCommand 와 동일: yaw/pitch 를 wrapDegrees 로 정규화 후 전체 teleport.
-        // teleport 은 내부적으로 resetPosition→updateLastAngles 를 호출하므로 디스플레이 엔티티
-        // 회전도 정상 동기화된다(소환 후 tp @s ~ ~ ~ ~rot 패턴).
-        float _wy = net.minecraft.util.math.MathHelper.wrapDegrees(yaw);
-        float _wp = net.minecraft.util.math.MathHelper.wrapDegrees(pitch);
-        if (lightTeleport(e, x, y, z, _wy, _wp)) return;
-        e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
-                java.util.Set.of(), _wy, _wp, true);
+        java.util.EnumSet<net.minecraft.network.packet.s2c.play.PositionFlag> flags =
+                java.util.EnumSet.noneOf(net.minecraft.network.packet.s2c.play.PositionFlag.class);
+        if ((relMask & 1)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.X);
+        if ((relMask & 2)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Y);
+        if ((relMask & 4)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Z);
+        if ((relMask & 8)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Y_ROT);
+        if ((relMask & 16) != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.X_ROT);
+        // 바닐라 TeleportCommand.teleport 와 동일한 델타 변환.
+        double dx = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.X) ? x - e.getX() : x;
+        double dy = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.Y) ? y - e.getY() : y;
+        double dz = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.Z) ? z - e.getZ() : z;
+        float gy = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.Y_ROT) ? yaw - e.getYaw() : yaw;
+        float hp = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.X_ROT) ? pitch - e.getPitch() : pitch;
+        e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), dx, dy, dz, flags,
+                net.minecraft.util.math.MathHelper.wrapDegrees(gy),
+                net.minecraft.util.math.MathHelper.wrapDegrees(hp), true);
     }
 
     /** tp <대상> <좌표> facing <좌표> — 위치 이동 후 좌표를 바라보게(바닐라 Entity.lookAt). */
@@ -1667,7 +1688,6 @@ public final class KfcGen {
         if (who == null || dest == null) return;
         double x = dest.getX(), y = dest.getY(), z = dest.getZ();
         float yaw = dest.getYaw(), pitch = dest.getPitch();
-        if (lightTeleport(who, x, y, z, yaw, pitch)) return;
         who.teleport((net.minecraft.server.world.ServerWorld) who.getWorld(), x, y, z,
                 java.util.Set.of(), yaw, pitch, true);
     }
@@ -3319,61 +3339,24 @@ public final class KfcGen {
     // ── target 쓰기 ──
     // ── display 엔티티 fast-path: 엔티티 전체 NBT 라운드트립(writeNbt/readNbt) 없이 직접 setter ──
     //    run-anime/boost 가 매 틱 transformation·interpolation_duration 을 쓰므로 핵심 핫패스.
-    /** item_display 의 표시 아이템(item 키) fast-path 공통.
-     *  바닐라 ItemDisplayEntity write/readCustomDataToNbt 와 관측 동등:
-     *   write: nbt.put("item", ItemStack.CODEC, regOps, getItemStack())  (빈 스택이면 키 생략)
-     *   read : setItemStack(get("item", ItemStack.CODEC, regOps).orElse(EMPTY))
-     *  여기선 전체 엔티티 writeNbt/readNbt(transformation 행렬 codec 등) 없이 아이템 스택만 round-trip.
-     *  merge=true: 현재 표시 아이템 NBT 에 deep merge(/data merge 의미). false: itemNbt 로 대체(set).
-     *  카트 모델의 매 틱 {item:{components:{...}}} 머지가 이 경로로 풀 직렬화를 회피한다. */
-    private static boolean applyItemDisplayNbt(
-            net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity d,
-            net.minecraft.nbt.NbtCompound itemNbtIn, boolean merge) {
-        net.minecraft.registry.RegistryWrapper.WrapperLookup lookup = d.getRegistryManager();
-        net.minecraft.nbt.NbtCompound itemNbt;
-        if (merge) {
-            net.minecraft.item.ItemStack cur = d.getItemStack();
-            if (cur.isEmpty()) {
-                // 바닐라 writeNbt 는 빈 스택이면 "item" 키를 생략 → 병합 대상은 patch 단독.
-                itemNbt = new net.minecraft.nbt.NbtCompound();
-            } else {
-                net.minecraft.nbt.NbtElement enc = cur.toNbt(lookup);   // == ItemStack.CODEC encode
-                if (!(enc instanceof net.minecraft.nbt.NbtCompound c)) return false;
-                itemNbt = c;
-            }
-            itemNbt.copyFrom(itemNbtIn);   // deep merge (NbtCompound.copyFrom = /data merge 의미)
-        } else {
-            itemNbt = itemNbtIn;
-        }
-        net.minecraft.item.ItemStack ns =
-                net.minecraft.item.ItemStack.fromNbt(lookup, itemNbt)
-                        .orElse(net.minecraft.item.ItemStack.EMPTY);   // == readCustomDataFromNbt
-        d.setItemStack(ns);
-        return true;
-    }
-
     private static boolean displaySetFast(net.minecraft.entity.Entity e, String path,
                                           net.minecraft.nbt.NbtElement v) {
         if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity d)) return false;
         switch (path) {
             case "transformation": {
-                net.minecraft.util.math.AffineTransformation at = TRANSFORM_CACHE.get(v);
-                if (at == null) {
-                    java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
-                            net.minecraft.util.math.AffineTransformation.ANY_CODEC
-                                    .parse(net.minecraft.nbt.NbtOps.INSTANCE, v).result();
-                    if (r.isEmpty()) return false;
-                    at = r.get();
-                    // 동적값 폭주 대비 소프트 캡(이 팩의 transformation 은 전부 상수 리터럴이라 distinct 유한).
-                    if (TRANSFORM_CACHE.size() < 8192) TRANSFORM_CACHE.put(v.copy(), at);
+                java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
+                        net.minecraft.util.math.AffineTransformation.ANY_CODEC
+                                .parse(net.minecraft.nbt.NbtOps.INSTANCE, v).result();
+                if (r.isPresent()) {
+                    d.setTransformation(r.get());
+                    // 바닐라 /data modify 는 readNbt 를 거쳐 setStartInterpolation(force=true)을
+                    // 호출하므로 보간이 매번 재트리거된다. setTransformation 만으로는
+                    // START_INTERPOLATION 트래커가 갱신되지 않아(값 동일 시 dirty 스킵) 클라가
+                    // 보간을 시작하지 않는다. 현재 start_interpolation 값으로 강제 재설정해 트리거.
+                    d.setStartInterpolation(d.getStartInterpolation());
+                    return true;
                 }
-                d.setTransformation(at);
-                // 바닐라 /data modify 는 readNbt 를 거쳐 setStartInterpolation(force=true)을
-                // 호출하므로 보간이 매번 재트리거된다. setTransformation 만으로는
-                // START_INTERPOLATION 트래커가 갱신되지 않아(값 동일 시 dirty 스킵) 클라가
-                // 보간을 시작하지 않는다. 현재 start_interpolation 값으로 강제 재설정해 트리거.
-                d.setStartInterpolation(d.getStartInterpolation());
-                return true;
+                return false;
             }
             case "interpolation_duration": d.setInterpolationDuration((int) nbtNum(v)); return true;
             case "start_interpolation":    d.setStartInterpolation((int) nbtNum(v)); return true;
@@ -3409,31 +3392,6 @@ public final class KfcGen {
             if (dec.isEmpty()) return false;
             d.setTransformation(dec.get());
             return true;
-        }
-        // item_display 표시 아이템: 전체 엔티티 writeNbt/readNbt 없이 아이템 스택만 codec round-trip.
-        //   item            → set value(아이템 NBT 그대로 파싱·교체)
-        //   item.<sub>/item[..] → 현재 아이템 인코딩 후 부분 경로 수정(엔티티 직렬화 회피)
-        if (d instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity _id) {
-            if (path.equals("item")) {
-                if (v instanceof net.minecraft.nbt.NbtCompound _ic) return applyItemDisplayNbt(_id, _ic, false);
-                return false;
-            }
-            if (path.startsWith("item.") || path.startsWith("item[")) {
-                net.minecraft.registry.RegistryWrapper.WrapperLookup _lk = _id.getRegistryManager();
-                net.minecraft.nbt.NbtCompound _root = new net.minecraft.nbt.NbtCompound();
-                net.minecraft.item.ItemStack _cur = _id.getItemStack();
-                if (!_cur.isEmpty()) {
-                    net.minecraft.nbt.NbtElement _enc = _cur.toNbt(_lk);
-                    if (_enc instanceof net.minecraft.nbt.NbtCompound _ec) _root.put("item", _ec);
-                }
-                if (!putAtPath(_root, path, v)) return false;
-                net.minecraft.nbt.NbtElement _m = _root.get("item");
-                net.minecraft.item.ItemStack _ns = (_m instanceof net.minecraft.nbt.NbtCompound _mc)
-                        ? net.minecraft.item.ItemStack.fromNbt(_lk, _mc).orElse(net.minecraft.item.ItemStack.EMPTY)
-                        : net.minecraft.item.ItemStack.EMPTY;
-                _id.setItemStack(_ns);
-                return true;
-            }
         }
         return false;
     }
@@ -3758,20 +3716,11 @@ public final class KfcGen {
             switch (k) {
                 case "transformation": case "interpolation_duration":
                 case "start_interpolation": case "teleport_duration": break;
-                case "item":   // item 은 item_display 만 fast 처리(아래 deep-merge)
-                    if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity)) return false;
-                    break;
                 default: return false;   // fast 불가 키 혼재 → 전체 폴백
             }
         }
         for (String k : patch.getKeys()) {
-            if (k.equals("item")) {
-                // data merge {item:{...}} = 현재 표시 아이템에 deep merge(바닐라 /data merge 의미).
-                net.minecraft.nbt.NbtElement _iv = patch.get("item");
-                if (!(_iv instanceof net.minecraft.nbt.NbtCompound _ic)) return false;
-                if (!applyItemDisplayNbt(
-                        (net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) e, _ic, true)) return false;
-            } else if (!displaySetFast(e, k, patch.get(k))) return false;
+            if (!displaySetFast(e, k, patch.get(k))) return false;
         }
         return true;
     }

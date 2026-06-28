@@ -3039,6 +3039,26 @@ def _tp_rot_comp(v: str, field: str) -> str:
     return jfloat(v)
 
 
+def _tp_relmask(location, rotation) -> int:
+    """tp 의 '~'(상대) 성분 → 바닐라 TeleportCommand 의 movementFlags 비트마스크.
+    X=1, Y=2, Z=4, Y_ROT=8, X_ROT=16. caret(^)·절대 좌표는 절대(플래그 없음).
+    이 마스크가 있어야 teleportToWithRot 가 Entity.teleport 에 상대 플래그를 전달해
+    탑승자 전파(getPassengerTeleportTarget)가 바닐라와 동일하게 동작한다 — 상대 회전 시
+    차량 텔포가 탑승자 yaw 를 덮어쓰지 않아 디스플레이 리그 이중 회전을 막는다."""
+    m = 0
+    lp = str(location).split()
+    if len(lp) == 3 and not any(p.startswith("^") for p in lp):
+        if lp[0].startswith("~"): m |= 1
+        if lp[1].startswith("~"): m |= 2
+        if lp[2].startswith("~"): m |= 4
+    if rotation is not None:
+        rp = str(rotation).split()
+        if len(rp) == 2:
+            if rp[0].startswith("~"): m |= 8
+            if rp[1].startswith("~"): m |= 16
+    return m
+
+
 def _tp_targets(em: Emitted, targets: str, body) -> bool | None:
     """tp 대상 해소(@s/루프/단일) 후 body(엔티티식) 호출. 미해소면 None."""
     if targets == "@s":
@@ -3117,7 +3137,8 @@ def emit_tp(nn: list[str], args: dict, em: Emitted) -> bool:
 
     if rot is not None:
         yaw, pitch = rot
-        body = lambda t: f"KfcGen.teleportToWithRot({t}, _tpPos.x, _tpPos.y, _tpPos.z, {yaw}, {pitch});"
+        relmask = _tp_relmask(location, rotation)
+        body = lambda t: f"KfcGen.teleportToWithRot({t}, _tpPos.x, _tpPos.y, _tpPos.z, {yaw}, {pitch}, {relmask});"
     elif face == ("pos",):
         body = lambda t: f"KfcGen.teleportToFacing({t}, _tpPos.x, _tpPos.y, _tpPos.z, _tpFace.x, _tpFace.y, _tpFace.z);"
     elif face is not None and face[0] == "ent":
@@ -6310,7 +6331,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             # 바닐라 as @e 는 '선택 시점에 고정된 집합' 을 순회(루프 중 스폰/킬 무관)하므로,
             # 공유 스냅샷을 '복사' 해서 돈다 → 고증 정확 + ConcurrentModificationException 방지.
             # (복사는 얕은 참조 복사라 저렴; 필터/태그/위치는 참조에서 라이브로 읽어 영향 없음.)
-            out.append("for (Entity e : new java.util.ArrayList<>(KfcGen.entitiesSnapshot(ctx))) {")
+            out.append("for (Entity e : KfcGen.passengerFirst(KfcGen.entitiesSnapshot(ctx))) {")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
             out.append("    " + src_line)
             out.extend(mr1)

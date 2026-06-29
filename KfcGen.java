@@ -3838,8 +3838,11 @@ public final class KfcGen {
                 } catch (Exception ex) { return SNBT_INVALID; }
             });
             if (tmpl == SNBT_INVALID) return;
+            // fast 경로(displaySetFast)는 val 을 읽기 전용으로만 쓴다 → 캐시 템플릿 직접 전달(copy 제거).
+            if (displaySetFast(e, path.replace(" ", ""), tmpl)) return;
+            // 느린 경로만 copy — putAtPath 가 val 을 nbt 에 참조 삽입할 수 있고, readNbt 가 그 하위를
+            // 엔티티에 보관할 수 있어 캐시 원본 보호가 필요하다.
             net.minecraft.nbt.NbtElement val = tmpl.copy();
-            if (displaySetFast(e, path.replace(" ", ""), val)) return;
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
             if (putAtPath(nbt, path, val)) e.readNbt(nbt);   // NbtPath: 인덱스/필터 경로 정확
@@ -3882,11 +3885,16 @@ public final class KfcGen {
                 try { return net.minecraft.nbt.StringNbtReader.readCompound(s); }
                 catch (Exception ex) { return SNBT_INVALID; }
             });
-            if (tmpl == SNBT_INVALID || !(tmpl instanceof net.minecraft.nbt.NbtCompound)) return;
-            net.minecraft.nbt.NbtCompound patch = ((net.minecraft.nbt.NbtCompound) tmpl).copy();
-            // run-anime/boost 의 매 틱 보간 머지({start_interpolation,interpolation_duration} 등)는
-            // 엔티티 전체 writeNbt/readNbt 없이 직접 setter 로 — 핵심 핫패스.
-            if (displayMergeFast(e, patch)) return;
+            if (tmpl == SNBT_INVALID || !(tmpl instanceof net.minecraft.nbt.NbtCompound tc)) return;
+            // fast 경로(이 팩 머지의 ~99%)는 patch 를 읽기 전용으로만 쓴다:
+            // displayMergeFast/displaySetFast 는 getKeys/get 으로 읽기만 하고, transformation 은
+            // v.copy() 로 캐시 저장, 부분경로는 새 root 객체에만 기록, applyItemDisplayNbt 는
+            // 새 itemNbt 에 copyFrom(patch) 한다(patch 미변경). 따라서 캐시 템플릿을 copy 없이
+            // 직접 넘겨 매 호출 NbtCompound 깊은 복사(~1.87만회/틱)를 제거한다. 관측 동일.
+            if (displayMergeFast(e, tc)) return;
+            // 느린 경로(non-display/혼합키, 드묾)만 방어적 copy — writeNbt/readNbt 가 nbt 하위를
+            // 엔티티에 참조 보관할 수 있어 캐시 원본 보호가 필요하다.
+            net.minecraft.nbt.NbtCompound patch = tc.copy();
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
             nbt.copyFrom(patch);
@@ -4074,17 +4082,20 @@ public final class KfcGen {
         return net.minecraft.text.Text.literal(fallback);
     }
 
-    /** bossbar add: 이미 있으면 이름을 최신 add 값으로 갱신 후 반환.
-     *  원본 데이터팩은 'bossbar remove → bossbar add' 순서로 매 호출 재생성하므로,
-     *  remove 가 어떤 이유로 누락되었거나 level.dat 로 복원된 잔존 바가 있을 때
-     *  과거의 stale/미해소-selector 이름이 그대로 남아 "없음 중첩"처럼 보이는 것을 막는다.
-     *  (이름을 bbText 로 재해소하므로 selector 도 현재 상태로 갱신된다.) */
+    /** bossbar add: 바닐라 /bossbar add 는 같은 id 가 이미 있으면 ALREADY_EXISTS 로 실패하고
+     *  아무것도 하지 않는다 — 기존 bar 의 이름/값/색/플레이어를 절대 건드리지 않는다.
+     *  (과거 구현은 '이미 있으면 이름을 add 값으로 갱신'했는데, 이는 바닐라 의미 위반이며
+     *   회귀를 만든다: 게임 중 `bossbar set name` 으로 갱신된 동적 이름(예: "02:00.000 내로 완주")이,
+     *   잔존 bar 가 있는 채로 startset 이 `bossbar add master "Master License"` 를 재실행하면
+     *   정적 add 이름("Master License")으로 되돌아간다. 이후 load-settings 의 set name 이 조건
+     *   매칭/매크로 타이밍으로 스킵되면 그 흰 "Master License" 가 완주 텍스트를 덮어 보인다.)
+     *  → 바닐라처럼 이미 있으면 no-op(기존 bar 그대로 반환). 신규일 때만 add. */
     public static net.minecraft.entity.boss.CommandBossBar bossbarAdd(
             net.minecraft.server.command.ServerCommandSource src, String idStr, String nameJson) {
         net.minecraft.util.Identifier id = bbId(idStr);
         net.minecraft.entity.boss.BossBarManager mgr = src.getServer().getBossBarManager();
         net.minecraft.entity.boss.CommandBossBar bar = mgr.get(id);
-        if (bar != null) { bar.setName(bbText(src, nameJson, idStr)); return bar; }
+        if (bar != null) return bar;
         return mgr.add(id, bbText(src, nameJson, idStr));
     }
 

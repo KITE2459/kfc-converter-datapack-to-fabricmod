@@ -231,6 +231,138 @@ def _compute_tail_return(indented_body: str) -> str:
     return "" if omit else "\n        return 0;"
 
 
+# ── Java 'normal completion'(JLS 14.21) 간이 흐름분석 ───────────────────────
+# TCO 루프 본문이 '끝까지 fall-through(정상 완료)' 가능할 때만 trailing `return 0;` 이
+# 도달 가능하다. 무조건 `continue`/`return` 으로 끝나는 본문(예: 마지막 obj 가
+# `execute positioned ^ ^ ^X run function self` → `{ source=ARG; continue; }` 무조건 블록)
+# 에선 그 return 이 unreachable 이라 Java 컴파일 에러가 된다. 문자열/괄호/중괄호 균형,
+# if/else, 블록, for/while/do/switch 를 처리한다(주석은 줄 단위 // 만 제거).
+
+def _idchar(c):
+    return bool(c) and bool(re.match(r'\w', c))
+
+def _fa_strip_comments(code):
+    return "\n".join(l for l in code.split("\n") if not l.lstrip().startswith("//"))
+
+def _fa_skip_string(s, i):
+    q = s[i]; i += 1; n = len(s)
+    while i < n:
+        if s[i] == '\\':
+            i += 2; continue
+        if s[i] == q:
+            return i + 1
+        i += 1
+    return n
+
+def _fa_balanced(s, i):
+    """s[i] 가 '(' 또는 '{' 일 때 짝 맞는 닫힘 '다음' 인덱스(문자열 인식)."""
+    open_c = s[i]; close_c = ')' if open_c == '(' else '}'
+    depth = 0; n = len(s)
+    while i < n:
+        c = s[i]
+        if c in '"\'':
+            i = _fa_skip_string(s, i); continue
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+def _fa_stmt_end(code, i):
+    n = len(code); rest = code[i:]
+    m = re.match(r'(if|for|while|switch)\b', rest)
+    if m:
+        kw = m.group(1); j = i + len(kw)
+        while j < n and code[j] in ' \t\r\n': j += 1
+        if j < n and code[j] == '(':
+            j = _fa_balanced(code, j)
+        j = _fa_substmt_end(code, j)
+        if kw == 'if':
+            k = j
+            while k < n and code[k] in ' \t\r\n': k += 1
+            if code[k:k+4] == 'else' and not _idchar(code[k+4] if k+4 < n else ''):
+                return _fa_substmt_end(code, k + 4)
+        return j
+    if re.match(r'do\b', rest):
+        j = _fa_substmt_end(code, i + 2)
+        while j < n and code[j] in ' \t\r\n': j += 1
+        if re.match(r'while\b', code[j:]):
+            j += 5
+            while j < n and code[j] in ' \t\r\n': j += 1
+            if j < n and code[j] == '(':
+                j = _fa_balanced(code, j)
+            while j < n and code[j] != ';': j += 1
+            return j + 1 if j < n else n
+        return j
+    if code[i] == '{':
+        return _fa_balanced(code, i)
+    j = i
+    while j < n:
+        c = code[j]
+        if c in '"\'':
+            j = _fa_skip_string(code, j); continue
+        if c == '{' or c == '(':
+            j = _fa_balanced(code, j); continue
+        if c == ';':
+            return j + 1
+        j += 1
+    return n
+
+def _fa_substmt_end(code, j):
+    n = len(code)
+    while j < n and code[j] in ' \t\r\n': j += 1
+    if j >= n:
+        return n
+    return _fa_stmt_end(code, j)
+
+def _fa_top_statements(code):
+    code = _fa_strip_comments(code)
+    stmts = []; i = 0; n = len(code)
+    while i < n:
+        while i < n and code[i] in ' \t\r\n;':
+            i += 1
+        if i >= n:
+            break
+        end = _fa_stmt_end(code, i)
+        s = code[i:end].strip()
+        if s:
+            stmts.append(s)
+        i = end if end > i else i + 1
+    return stmts
+
+def _stmt_completes(stmt):
+    s = stmt.strip()
+    if not s:
+        return True
+    if re.match(r'(return|continue|break|throw)\b', s):
+        return False
+    if re.match(r'if\b', s):
+        i = s.index('(')
+        e = _fa_balanced(s, i)
+        then_stmt = s[e:_fa_substmt_end(s, e)].strip()
+        rest = s[_fa_substmt_end(s, e):].strip()
+        if rest.startswith('else') and not _idchar(rest[4] if len(rest) > 4 else ''):
+            return _stmt_completes(then_stmt) or _stmt_completes(rest[4:].strip())
+        return True  # else 없는 if 는 항상 정상 완료(조건 거짓 경로)
+    if s.startswith('{'):
+        inners = _fa_top_statements(s[1:_fa_balanced(s, 0) - 1])
+        return _stmt_completes(inners[-1]) if inners else True
+    if re.match(r'while\s*\(\s*true\s*\)', s):
+        return 'break' in s
+    if re.match(r'(for|while|switch|do)\b', s):
+        return True  # 조건 있는 루프/스위치는 정상 완료 가능(코드젠은 무한루프 미생성)
+    return True
+
+def _completes_normally(code):
+    """문장 시퀀스 code 가 정상 완료(끝까지 fall-through) 가능한지 — 마지막 top-level 문장으로 판정.
+       (앞 문장이 무조건 종료하면 그건 별도 unreachable 에러이므로 코드젠이 만들지 않는다고 가정.)"""
+    stmts = _fa_top_statements(code)
+    return _stmt_completes(stmts[-1]) if stmts else True
+
+
 # ── 꼬리재귀 → 루프 변환(TCO) ───────────────────────────────────────────────
 # 자기재귀 함수는 기본적으로 함수 단위 브릿지(StackOverflow 방지)로 폴백한다.
 # 그러나 재귀가 '마지막 줄의 단일 꼬리호출'이면 do/while 루프로 바꿔 스택을 쌓지
@@ -560,8 +692,13 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         if tco:
             # 꼬리재귀 → 루프. prelude(executor/_exName/_pos 등)를 루프 내부에 두어
             # source 가 재바인드될 때마다 재계산한다. 꼬리 self-call 은 본문에서 이미
-            # `source = ARG; continue;` 로 치환됨. 재귀 안 하는 경로는 아래로 흘러 return 0
-            # (self-call 이 조건 블록 안이라 도달 가능; 무조건 재귀는 _tco_eligible 이 배제).
+            # `source = ARG; continue;` 로 치환됨.
+            # trailing `return 0;` 은 본문이 정상 완료(fall-through) 가능할 때만 붙인다.
+            # 마지막 obj 가 무조건 블록(`execute positioned ^ ^ ^X run function self`
+            # → `{ source=ARG; continue; }`)이면 그 뒤 return 은 unreachable(컴파일 에러)
+            # 이므로 흐름분석(_completes_normally)으로 생략한다. while(true) 는 break 없이
+            # 종료하지 않으므로 return 생략해도 'missing return' 이 아니다.
+            _tco_tail = "\n        return 0;" if _completes_normally(indented_body) else ""
             methods = f"""    public static void execute(ServerCommandSource source) {{
         executeReturn(source);
     }}
@@ -574,8 +711,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         // 종료 점수가 감소해 그 전에 자연 종료하므로 이 가드에 도달하지 않는다).
         if (++_tcoSteps > 65536) return 0;
         {prelude}
-{indented_body}
-        return 0;
+{indented_body}{_tco_tail}
         }}
     }}"""
         else:

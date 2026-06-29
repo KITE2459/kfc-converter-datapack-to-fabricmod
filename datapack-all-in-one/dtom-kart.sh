@@ -2,7 +2,7 @@
 # 스크립트(루트)가 위치한 디렉터리를 기준으로 datapacks 경로 자동 설정
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 대상 디렉터리 (datapacks 경로 설정)
-DATAPACKS_DIR="$SCRIPT_DIR/datapacks"
+DATAPACKS_DIR="$SCRIPT_DIR/datapacks-kart"
 cd
 
 # 1️⃣ 폴더를 ZIP으로 압축하고 원본 폴더 삭제
@@ -139,16 +139,16 @@ echo "mcfunction 처리 완료!"
 # echo "mcfunction 처리 완료!"
 
 # 최종 ZIP 파일 생성
-echo "Creating kartall.zip..."
+echo "Creating kartall-kart.zip..."
 cd "$TMP_DIR"
-zip -0 -qr "../kartall.zip" *
+zip -6 -qr "../kartall-kart.zip" *
 cd ..
 
 # 정리
 cd "$DATAPACKS_DIR"
-mv kartall.zip ..
+mv kartall-kart.zip ..
 rm -rf "$DATAPACKS_DIR"/*
-mv ../kartall.zip .
+mv ../kartall-kart.zip .
 
 echo "모든 작업 완료!"
 

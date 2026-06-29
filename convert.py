@@ -35,7 +35,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import emit
 from datapack_io import open_datapack
-from assemble import function_to_class, JavaClass
+from assemble import function_to_class, JavaClass, audit_executeReturn
 
 
 def sanitize_pkg(name: str) -> str:
@@ -383,6 +383,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     import os as _os
     stats = collections.Counter()
     fn_meta = []
+    audit_violations = []   # (fid, [issue...]) — 흐름분석 사전 체크(개선사항 E)
     generated_fids = set()
     fn_count = 0
 
@@ -441,6 +442,9 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         stats["gated"] += gat
         stats["bridge"] += br
         fn_meta.append((fid, pkg, cls, nat, gat, br, full))
+        _au = audit_executeReturn(code)
+        if _au:
+            audit_violations.append((fid, _au))
         generated_fids.add(fid)
         fn_count += 1
 
@@ -531,6 +535,17 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
 
     write_report(out_root, fn_meta, stats, group)
+
+    # ── 사전 흐름분석 감사(개선사항 E): unreachable/missing-return 0건 확인 ──
+    if audit_violations:
+        print(f"[generate][AUDIT] ⚠️ executeReturn 흐름분석 위반 {len(audit_violations)}건 "
+              f"(컴파일 에러 가능성):")
+        for fid, iss in audit_violations[:20]:
+            print(f"    {fid}: {', '.join(iss)}")
+        if len(audit_violations) > 20:
+            print(f"    ... 외 {len(audit_violations)-20}건")
+    else:
+        print(f"[generate][AUDIT] ✅ 흐름분석 위반 0건 (unreachable/missing-return 없음)")
 
     # ── 모드 진입점 + resources 생성 (tick/load 태그 기반) ──
     tags = load_tags(trees_path)

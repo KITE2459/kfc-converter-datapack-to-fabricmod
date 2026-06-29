@@ -9,6 +9,7 @@ testdatapack/
 *.json
 test*
 kart*
+datapack-all-in-one/
 
 # eclipse
 

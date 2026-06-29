@@ -206,29 +206,6 @@ def _find_reused_set_exprs(emitted) -> set:
     return reused
 
 
-def _compute_tail_return(indented_body: str) -> str:
-    """executeReturn 끝의 `return 0;` 이 unreachable(컴파일 에러) 이 되지 않도록,
-       본문 마지막 비공백 줄이 무조건 return 또는 'return 으로 끝나는 무조건 블록 닫기'면
-       trailing return 을 생략한다. 일반/매크로 함수 공통."""
-    body_lines_stripped = [l for l in indented_body.split("\n")
-                           if l.strip() and not l.lstrip().startswith("//")]
-    last = body_lines_stripped[-1].strip() if body_lines_stripped else ""
-    omit = bool(re.match(r'^return\b.*;$', last))
-    if not omit and last == "}":
-        raw = indented_body.split("\n")
-        li = max(i for i, l in enumerate(raw) if l.strip())
-        if re.match(r'^\s{8}\}$', raw[li]):
-            depth = 0
-            for j in range(li, -1, -1):
-                s = raw[j].rstrip()
-                depth += s.count("}") - s.count("{")
-                if depth == 0:
-                    if raw[j].strip() == "{":
-                        inner_last = body_lines_stripped[-2].strip() if len(body_lines_stripped) >= 2 else ""
-                        if re.match(r'^return\b.*;$', inner_last):
-                            omit = True
-                    break
-    return "" if omit else "\n        return 0;"
 
 
 # ── Java 'normal completion'(JLS 14.21) 간이 흐름분석 ───────────────────────
@@ -297,6 +274,25 @@ def _fa_stmt_end(code, i):
             while j < n and code[j] != ';': j += 1
             return j + 1 if j < n else n
         return j
+    if re.match(r'try\b', rest):
+        # try block (catch (..) block)* (finally block)? — 세미콜론 없이 끝나는 블록문이라
+        # 마지막 catch/finally 블록까지를 한 문장으로 본다(뒤 문장과 병합 방지).
+        j = _fa_substmt_end(code, i + 3)
+        while True:
+            k = j
+            while k < n and code[k] in ' \t\r\n': k += 1
+            if code[k:k+5] == 'catch' and not _idchar(code[k+5] if k+5 < n else ''):
+                k += 5
+                while k < n and code[k] in ' \t\r\n': k += 1
+                if k < n and code[k] == '(':
+                    k = _fa_balanced(code, k)
+                j = _fa_substmt_end(code, k)
+            elif code[k:k+7] == 'finally' and not _idchar(code[k+7] if k+7 < n else ''):
+                j = _fa_substmt_end(code, k + 7)
+                break
+            else:
+                break
+        return j
     if code[i] == '{':
         return _fa_balanced(code, i)
     j = i
@@ -363,6 +359,45 @@ def _completes_normally(code):
     return _stmt_completes(stmts[-1]) if stmts else True
 
 
+def _tail_return_str(indented_body: str) -> str:
+    """executeReturn 말미 trailing `return 0;` 문자열 — 본문이 정상 완료(fall-through)
+       가능할 때만 붙인다(JLS 14.21 흐름분석 _completes_normally 단일 기준).
+       매크로/비-TCO/TCO 경로가 모두 이 한 함수를 쓴다(분석 일원화)."""
+    return "\n        return 0;" if _completes_normally(indented_body) else ""
+
+
+def audit_executeReturn(code: str) -> list[str]:
+    """생성된 클래스 코드의 executeReturn 본문을 흐름분석으로 재검증한다(코드젠 신뢰 안 함).
+       반환: 위반 코드 리스트(빈 리스트=정상). 컴파일 전 회귀 감지용(개선사항 E).
+       - MISSING_RETURN: 비-TCO 메서드 본문이 정상 완료(fall-through)인데 return 없음 → javac 'missing return'.
+       - UNREACHABLE_RETURN: 마지막 문장이 return 인데 직전 문장이 정상 완료 안 함 → javac 'unreachable'."""
+    issues = []
+    for sig in ("int executeReturn(ServerCommandSource source, Map<String, String> macroArgs)",
+                "int executeReturn(ServerCommandSource source)"):
+        i = code.find(sig)
+        if i < 0:
+            continue
+        b = code.find("{", i)
+        if b < 0:
+            continue
+        body = code[b + 1:_fa_balanced(code, b) - 1]
+        # TCO 메서드: int _tcoSteps=0; while(true){ <loop> } — 검사 대상은 루프 본문.
+        m = re.search(r'while\s*\(\s*true\s*\)\s*\{', body)
+        if m:
+            lb = body.find("{", m.start())
+            check = body[lb + 1:_fa_balanced(body, lb) - 1]
+            # while(true) 는 break 없으면 메서드를 정상 완료시키지 않으므로 missing-return 아님.
+        else:
+            check = body
+            if _completes_normally(body):
+                issues.append(f"MISSING_RETURN[{sig.split('(')[0].split()[-1]}]")
+        stmts = _fa_top_statements(check)
+        if len(stmts) >= 2 and re.match(r'return\b.*;$', stmts[-1].strip()) \
+                and not _stmt_completes(stmts[-2]):
+            issues.append(f"UNREACHABLE_RETURN[{sig.split('(')[0].split()[-1]}]")
+    return issues
+
+
 # ── 꼬리재귀 → 루프 변환(TCO) ───────────────────────────────────────────────
 # 자기재귀 함수는 기본적으로 함수 단위 브릿지(StackOverflow 방지)로 폴백한다.
 # 그러나 재귀가 '마지막 줄의 단일 꼬리호출'이면 do/while 루프로 바꿔 스택을 쌓지
@@ -396,9 +431,12 @@ def _tco_eligible(emitted, self_fqcn: str, is_macro: bool) -> bool:
             last_exec = i
     if self_idx != [last_exec]:
         return False   # self-call 이 마지막 실행 obj 에서만 있어야(꼬리)
-    # 그 obj 의 self-call 뒤에 실행문이 없고(진짜 tail), 닫는 '}' 가 있어야(조건 블록 안).
-    # 무조건 self-call(가드 없는 무한재귀)은 원본에선 maxCommandChainLength 로 잘리지만
-    # 루프로 바꾸면 안 잘려 무한루프가 되므로 TCO 부적격으로 둔다(브릿지 유지).
+    # 그 obj 의 self-call 뒤에 실행문이 없고(진짜 tail), 닫는 '}' 가 있어야 한다.
+    # 참고: 이 'closed' 검사는 조건/무조건 블록을 구분하지 않으므로, 가드 없는 무조건
+    # tail self-call 도 적격이 된다. 이는 안전하다 — (1) executeReturn 루프 상단의
+    # `_tcoSteps > 65536` 가드가 바닐라 maxCommandChainLength 컷오프를 모방해 무한루프를
+    # 막고, (2) 무조건 self-call 은 본문이 `{ source=ARG; continue; }` 로 끝나 흐름분석
+    # (_completes_normally)이 trailing `return 0;` 을 unreachable 로 보고 생략한다.
     em = emitted[last_exec]
     seen = False; closed = False
     for l in em.java:
@@ -670,13 +708,13 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
 
     prelude = "\n        ".join(prelude_stmts)
     indented_body = "\n".join("        " + l if l else "" for l in body.split("\n"))
+    tail_return = _tail_return_str(indented_body)   # 흐름분석 일원화: 매크로/비-TCO/TCO 공통
 
     macro_note = f"\n *  매크로 함수 - 변수: {', '.join(macro_params)}." if is_macro_fn else ""
 
     if is_macro_fn:
         # int executeReturn(source, macroArgs) 가 본문(return 값 전파), void execute 는 래퍼.
         # → `store result score X run function <macro> with ...` 가 반환값을 캡처 가능.
-        tail_return = _compute_tail_return(indented_body)
         methods = f"""    public static void execute(ServerCommandSource source, Map<String, String> macroArgs) {{
         executeReturn(source, macroArgs);
     }}
@@ -688,7 +726,6 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     else:
         # 일반 함수: int executeReturn(source) 가 실제 본문(return 값 전파),
         #            void execute(source) 는 그 결과를 버리는 래퍼.
-        tail_return = _compute_tail_return(indented_body)
         if tco:
             # 꼬리재귀 → 루프. prelude(executor/_exName/_pos 등)를 루프 내부에 두어
             # source 가 재바인드될 때마다 재계산한다. 꼬리 self-call 은 본문에서 이미
@@ -698,7 +735,6 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             # → `{ source=ARG; continue; }`)이면 그 뒤 return 은 unreachable(컴파일 에러)
             # 이므로 흐름분석(_completes_normally)으로 생략한다. while(true) 는 break 없이
             # 종료하지 않으므로 return 생략해도 'missing return' 이 아니다.
-            _tco_tail = "\n        return 0;" if _completes_normally(indented_body) else ""
             methods = f"""    public static void execute(ServerCommandSource source) {{
         executeReturn(source);
     }}
@@ -711,7 +747,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         // 종료 점수가 감소해 그 전에 자연 종료하므로 이 가드에 도달하지 않는다).
         if (++_tcoSteps > 65536) return 0;
         {prelude}
-{indented_body}{_tco_tail}
+{indented_body}{tail_return}
         }}
     }}"""
         else:

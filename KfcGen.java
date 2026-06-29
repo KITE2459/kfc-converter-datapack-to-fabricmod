@@ -27,6 +27,11 @@ public final class KfcGen {
             BLOCK_TAG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.nbt.NbtElement>
             SNBT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    // NbtPath 는 파싱 후 완전 불변(string/nodeEndIndices/nodes 전부 final, 적용 시 root 만 다룸)이라
+    // 재사용 안전. data 경로는 전부 상수 리터럴(storagePutSnbt 895 등 매 틱 호출)이므로 문자열→
+    // NbtPath 캐시로 NbtPathArgumentType 재파싱을 제거한다.
+    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.command.argument.NbtPathArgumentType.NbtPath>
+            NBTPATH_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     // display transformation 행렬형 리터럴의 파싱+TRS 분해(matrix→translation/rotation/scale)는
     // setTransformation 이 매 호출 수행하는 핫 비용이다. AffineTransformation 은 불변이고 분해를
     // 인스턴스 내부에 1회 memoize(initialized 플래그)하므로, NbtElement 값 기준으로 캐시해 동일
@@ -3161,8 +3166,13 @@ public final class KfcGen {
     // MC 의 NbtPathArgumentType 를 런타임 파싱해 임의 경로(점/[인덱스]/{필터})를 정확히 처리.
 
     private static net.minecraft.command.argument.NbtPathArgumentType.NbtPath nbtPath(String s) {
-        try { return net.minecraft.command.argument.NbtPathArgumentType.NbtPath.parse(s); }
-        catch (Exception e) { return null; }
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = NBTPATH_CACHE.get(s);
+        if (p != null) return p;
+        try {
+            p = net.minecraft.command.argument.NbtPathArgumentType.NbtPath.parse(s);
+            NBTPATH_CACHE.put(s, p);   // 성공 파싱만 캐시(불변·재사용 안전). 실패 경로는 드물어 미캐시.
+            return p;
+        } catch (Exception e) { return null; }
     }
 
     /** 루트 NBT 에서 경로 첫 매치 요소(없으면 null). */

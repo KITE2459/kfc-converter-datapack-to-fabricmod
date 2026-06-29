@@ -19,7 +19,7 @@ public final class KfcGen {
     // 호출하므로, 문자열 → 파싱결과를 캐시해 매 호출 파싱/레지스트리 조회/객체 생성을 없앤다.
     private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.scoreboard.ScoreHolder>
             HOLDER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.sound.SoundEvent>
+    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>>
             SOUND_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.sound.SoundCategory>
             SOUND_CAT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
@@ -1134,15 +1134,30 @@ public final class KfcGen {
     }
 
     /** playsound <sound> <source> <targets> <pos> <vol> <pitch> — 플레이어별 재생. */
+    // 좌표식이 이미 Vec3d 인 경우의 오버로드. emit 이 cond_pos_expr 결과(Vec3d/localOffset)를
+    // .x/.y/.z 로 분해해 넘기면 호출당 좌표식이 3번 평가되어, new Vec3d 가 3개 할당되거나
+    // localOffset(삼각함수)이 3번 돌았다. playSound 는 이 팩 최다 호출(~33만)이라 그 왕복이
+    // 큰 GC/CPU 비용. Vec3d 를 1회만 받아 컴포넌트를 읽어 동일 패킷을 보낸다. 값/순서 동일.
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 String soundId, String category,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch) {
+        if (p == null || pos == null) return;
+        playSound(p, soundId, category, pos.x, pos.y, pos.z, vol, pitch);
+    }
+
     public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
                                  String soundId, String category,
                                  double x, double y, double z, float vol, float pitch) {
         if (p == null) return;
-        net.minecraft.sound.SoundEvent ev = SOUND_CACHE.computeIfAbsent(soundId, sid -> {
+        net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev =
+                SOUND_CACHE.computeIfAbsent(soundId, sid -> {
             net.minecraft.util.Identifier id = idOf(
                     sid.contains(":") ? sid : "minecraft:" + sid);
             net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
-            return e != null ? e : net.minecraft.sound.SoundEvent.of(id);  // 미등록도 id 그대로 재생(바닐라 허용)
+            // RegistryEntry 래핑까지 캐시한다 — RegistryEntry.of(ev) 를 매 호출(이 팩 ~33만회)
+            // 새로 할당하던 비용 제거. RegistryEntry/SoundEvent 모두 불변이라 공유 안전.
+            return net.minecraft.registry.entry.RegistryEntry.of(
+                    e != null ? e : net.minecraft.sound.SoundEvent.of(id));  // 미등록도 id 그대로 재생(바닐라 허용)
         });
         net.minecraft.sound.SoundCategory cat = SOUND_CAT_CACHE.computeIfAbsent(category, c -> {
             // /playsound 의 source 인자명(record/block/player)은 SoundCategory enum 상수명
@@ -1156,7 +1171,7 @@ public final class KfcGen {
             return net.minecraft.sound.SoundCategory.MASTER;
         });
         p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
-                net.minecraft.registry.entry.RegistryEntry.of(ev), cat,
+                ev, cat,
                 x, y, z, vol, pitch, p.getWorld().getRandom().nextLong()));
     }
 
@@ -1417,6 +1432,14 @@ public final class KfcGen {
     public static net.minecraft.server.command.ServerCommandSource facing(
             net.minecraft.server.command.ServerCommandSource src, double tx, double ty, double tz) {
         return src.withLookingAt(new net.minecraft.util.math.Vec3d(tx, ty, tz));
+    }
+
+    // 좌표식이 이미 Vec3d 인 경우의 오버로드. emit 이 cond_pos_expr 결과(Vec3d)를 .x/.y/.z 로
+    // 분해해 넘기면 facing 이 다시 new Vec3d 로 재조립했다(분해→재조립 + 좌표식 3중 평가).
+    // Vec3d 를 그대로 받아 withLookingAt 에 넘겨 그 왕복 할당·중복 평가를 제거한다. 값 동일.
+    public static net.minecraft.server.command.ServerCommandSource facing(
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.util.math.Vec3d target) {
+        return src.withLookingAt(target);
     }
 
     /** facing entity <e> <anchor> — eyes 면 눈높이, feet 면 발 위치를 향함.

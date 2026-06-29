@@ -2762,7 +2762,7 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
         em.reason = f"playsound 셀렉터({holder[:25]}) 미지원(플레이어 한정)"
         return False
     call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
-            f'{pe}.x, {pe}.y, {pe}.z, {jfloat(vol)}, {jfloat(pitch)});')
+            f'{pe}, {jfloat(vol)}, {jfloat(pitch)});')
     if sel.base == "s":
         em.java.append('if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _ps) '
                        + call)
@@ -5897,7 +5897,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
             if pe is None:
                 return ("UNS", [], f"facing {praw and praw['raw']} (좌표 미지원)", [])
             nv = f"kfcSrc{_uid()}"
-            _fc = f'KfcGen.facing({cur_src}, {pe}.x, {pe}.y, {pe}.z)'
+            _fc = f'KfcGen.facing({cur_src}, {pe})'
             if src_nullable:
                 _fc = f'({cur_src} == null ? null : {_fc})'
             rebinds.append(f'ServerCommandSource {nv} = {_fc};')

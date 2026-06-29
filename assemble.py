@@ -231,6 +231,87 @@ def _compute_tail_return(indented_body: str) -> str:
     return "" if omit else "\n        return 0;"
 
 
+# ── 꼬리재귀 → 루프 변환(TCO) ───────────────────────────────────────────────
+# 자기재귀 함수는 기본적으로 함수 단위 브릿지(StackOverflow 방지)로 폴백한다.
+# 그러나 재귀가 '마지막 줄의 단일 꼬리호출'이면 do/while 루프로 바꿔 스택을 쌓지
+# 않고 네이티브화할 수 있다(표준 TCO). side-effect 시퀀스가 재귀와 완전히 같고,
+# 꼬리 위치라 재귀의 반환값이 곧 다음 반복의 반환값이 되어 반환값까지 보존된다.
+# 적격성은 극도로 보수적으로 판정한다(부적격 함수에 적용하면 의미가 깨지므로).
+ENABLE_TCO = True
+
+def _tco_selfcall_re(self_fqcn: str):
+    import re as _re
+    return _re.compile(_re.escape(self_fqcn) + r'\.(?:execute|executeReturn)\(')
+
+def _tco_eligible(emitted, self_fqcn: str, is_macro: bool) -> bool:
+    """TCO 적격: (1) 비매크로, (2) self-recursion 외 브릿지 사유 없음,
+       (3) self-call 이 '마지막 실행 obj' 에서만 등장(꼬리), (4) 그 obj 의 self-call
+       뒤에는 닫는 괄호/주석/공백만(뒤따르는 실행문 없음 = 진짜 tail)."""
+    if not ENABLE_TCO or is_macro:
+        return False
+    if any(em.kind in ("bridge", "dispatch") for em in emitted):
+        return False
+    rx = _tco_selfcall_re(self_fqcn)
+    # self-call 을 포함하는 obj 인덱스(주석 줄 제외한 실제 코드 줄 기준)
+    self_idx = [i for i, em in enumerate(emitted)
+                if any(rx.search(l) for l in em.java if not l.lstrip().startswith("//"))]
+    if not self_idx:
+        return False
+    # 마지막 '실행' obj 인덱스(terminal/주석-only 가 아닌 마지막). emitted 는 parse 순서.
+    last_exec = None
+    for i, em in enumerate(emitted):
+        if any(l.strip() and not l.lstrip().startswith("//") for l in em.java):
+            last_exec = i
+    if self_idx != [last_exec]:
+        return False   # self-call 이 마지막 실행 obj 에서만 있어야(꼬리)
+    # 그 obj 의 self-call 뒤에 실행문이 없고(진짜 tail), 닫는 '}' 가 있어야(조건 블록 안).
+    # 무조건 self-call(가드 없는 무한재귀)은 원본에선 maxCommandChainLength 로 잘리지만
+    # 루프로 바꾸면 안 잘려 무한루프가 되므로 TCO 부적격으로 둔다(브릿지 유지).
+    em = emitted[last_exec]
+    seen = False; closed = False
+    for l in em.java:
+        if l.lstrip().startswith("//"):
+            continue
+        if rx.search(l):
+            seen = True
+            continue
+        if seen:
+            s = l.strip()
+            if not s:
+                continue
+            if all(c in "{}" for c in s):
+                if "}" in s:
+                    closed = True
+                continue
+            return False   # self-call 뒤 실행문 존재 → tail 아님
+    return seen and closed
+
+def _tco_rewrite(body: str, self_fqcn: str) -> str:
+    """body 내 self-call `{fqcn}.execute(ARG);`/`.executeReturn(ARG);` 를
+       `source = ARG; continue;` 로 치환(괄호 균형으로 ARG 정확 추출)."""
+    import re as _re
+    rx = _tco_selfcall_re(self_fqcn)
+    out = []
+    for line in body.split("\n"):
+        if line.lstrip().startswith("//"):
+            out.append(line); continue
+        m = rx.search(line)
+        if not m:
+            out.append(line); continue
+        start = m.end(); depth = 1; i = start
+        while i < len(line) and depth:
+            if line[i] == '(': depth += 1
+            elif line[i] == ')': depth -= 1
+            i += 1
+        if depth != 0:          # ARG 가 한 줄로 안 닫힘(예상 밖) → 안전하게 미치환
+            out.append(line); continue
+        arg = line[start:i-1]
+        indent = line[:len(line) - len(line.lstrip())]
+        out.append(f"{indent}source = {arg};")
+        out.append(f"{indent}continue;")
+    return "\n".join(out)
+
+
 def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartriderpack") -> JavaClass:
     """한 함수의 파스트리 줄들 -> 자바 클래스 코드."""
     set_group(group)   # emit 의 fqcn 이 같은 group 을 쓰도록 (호출↔패키지 일치)
@@ -259,6 +340,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         ((_self_fqcn + ".execute(") in _l) or ((_self_fqcn + ".executeReturn(") in _l)
         for _em in emitted for _l in _em.java
     )
+    # 꼬리재귀면 브릿지 대신 루프(TCO)로 네이티브화한다(아래 조립부에서 분기).
+    _has_macro_line = any(o.get("macro") for o in parse_trees)
+    tco = _tco_eligible(emitted, _self_fqcn, _has_macro_line)
     # 함수 단위 파싱 거부: 한 줄이라도 무효 명령이면 mcfunction 은 함수 전체를 로드 거부.
     for obj, em in zip(parse_trees, emitted):
         if em.rejects_function:
@@ -348,7 +432,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         n_native = n_gated = 0
         n_bridge = len(parse_trees)
         fully_converted = False
-    elif is_self_recursive or _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
+    elif (is_self_recursive and not tco) or _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
         # ── 함수 단위 폴백 ──  (강제 브릿지 prefix 매칭 시에도 이 경로)
         # 정책: instantExecuteCommand(자바->바닐라 디스패처)는 최적화 이득이 없어 최종 산출에서
         # 금지. 그런 줄(dispatch)이 하나라도 있으면 함수 전체를 원본 mcfunction 실행으로 폴백한다.
@@ -383,6 +467,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         fully_converted = False
     else:
         body = "\n".join(body_lines).rstrip()
+        if tco:
+            # 꼬리 self-call 을 `source = ARG; continue;` 로 치환(루프 본문).
+            body = _tco_rewrite(body, _self_fqcn)
         fully_converted = True
 
     if _is_traced(fid):
@@ -470,7 +557,29 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         # 일반 함수: int executeReturn(source) 가 실제 본문(return 값 전파),
         #            void execute(source) 는 그 결과를 버리는 래퍼.
         tail_return = _compute_tail_return(indented_body)
-        methods = f"""    public static void execute(ServerCommandSource source) {{
+        if tco:
+            # 꼬리재귀 → 루프. prelude(executor/_exName/_pos 등)를 루프 내부에 두어
+            # source 가 재바인드될 때마다 재계산한다. 꼬리 self-call 은 본문에서 이미
+            # `source = ARG; continue;` 로 치환됨. 재귀 안 하는 경로는 아래로 흘러 return 0
+            # (self-call 이 조건 블록 안이라 도달 가능; 무조건 재귀는 _tco_eligible 이 배제).
+            methods = f"""    public static void execute(ServerCommandSource source) {{
+        executeReturn(source);
+    }}
+
+    public static int executeReturn(ServerCommandSource source) {{
+        int _tcoSteps = 0;
+        while (true) {{
+        // 바닐라 maxCommandChainLength(기본 65536) 컷오프 모방 — 종료 조건이 어긋난
+        // 비정상 재귀에서 서버가 무한루프로 멈추는 것을 막는다(정상 재귀는 본문에서
+        // 종료 점수가 감소해 그 전에 자연 종료하므로 이 가드에 도달하지 않는다).
+        if (++_tcoSteps > 65536) return 0;
+        {prelude}
+{indented_body}
+        return 0;
+        }}
+    }}"""
+        else:
+            methods = f"""    public static void execute(ServerCommandSource source) {{
         executeReturn(source);
     }}
 

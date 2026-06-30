@@ -2624,12 +2624,15 @@ public final class KfcGen {
                                     String[] tagsPos, String[] tagsNeg,
                                     double minDist, double maxDist) {
         // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
-        if (origin != null && maxDist >= 0) {
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
             return !ctx.world.getEntitiesByType(type, rangeBox(origin, maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
-        return !ctx.world.getEntitiesByType(type,
-                en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+        // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
+        for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
+            if (matchTags(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+        }
+        return false;
     }
 
     public static boolean anyEntityAnyType(GameContext ctx, net.minecraft.util.math.Vec3d origin,
@@ -2670,8 +2673,22 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
+        // 거리 상한이 있으면 box 한정 섹션 스캔(allEntities/anyEntity 와 동일한 정확한 의미).
+        // typeBucket 전체(월드의 해당 타입 전부) 순회를 피한다 — onkartcollision 등 핫패스에서
+        // maxDist 가 작아(예: 4) box 스캔이 훨씬 적게 본다. 결과 집합/최근접 동일.
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
+            net.minecraft.util.math.Box _bx = rangeBox(origin, maxDist);
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : ctx.world.getEntitiesByType(t, _bx,
+                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+            }
+            return best;
+        }
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
                 if (!matchTags(e, tagsPos, tagsNeg)) continue;
                 if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
@@ -2817,12 +2834,15 @@ public final class KfcGen {
                                     net.minecraft.entity.EntityType<?> type,
                                     String[] tagsPos, String[] tagsNeg,
                                     double minDist, double maxDist) {
-        if (origin != null && maxDist >= 0) {
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
             return !ctx.world.getEntitiesByType(type, rangeBox(origin.getPos(), maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
-        return !ctx.world.getEntitiesByType(type,
-                en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+        // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
+        for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
+            if (matchTags(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+        }
+        return false;
     }
 
     /** if entity @a/@p/@r[tag,distance] — 조건에 맞는 플레이어가 하나라도 있으면 true. */
@@ -2949,8 +2969,19 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
+            net.minecraft.util.math.Box _bx = rangeBox(origin.getPos(), maxDist);
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : ctx.world.getEntitiesByType(t, _bx,
+                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                    double d = origin.squaredDistanceTo(e);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+            }
+            return best;
+        }
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 타입 버킷만 순회(전 엔티티 스캔 제거)
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
                 if (!matchTags(e, tagsPos, tagsNeg)) continue;
                 if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : origin.squaredDistanceTo(e);
@@ -3226,6 +3257,13 @@ public final class KfcGen {
     //   · 우리 쓰기 경로(set/put/append/merge/remove)는 invalidateSnapshot 로 즉시 무효(write-through).
     //  명령 함수는 엔티티 틱 페이즈와 분리되어 동기 실행되므로, 한 실행 내 다중 읽기는 동일 age 로 안전하다.
     private static final boolean ENTITY_READ_CACHE = true;
+
+    // 측정 결론(8주행+8관전, 동일 트랙/주행): typeBucket(false)이 box(true)보다 빠름.
+    //   onStartTick 18.10% vs 19.17%, kartmain_loop 14.68% vs 15.53%,
+    //   getEntitiesByType 0.52% vs 0.88%, nearestEntity+anyEntity 0.22% vs 0.87%.
+    // box 한정 섹션 스캔은 순회량은 줄지만 매 호출 List 할당 + predicate lambda 비용이 더 컸다.
+    // (워크로드가 크게 바뀌면 true 로 재측정 가능하도록 토글은 남겨둔다.)
+    private static final boolean QUERY_BOX = false;
     private static final class NbtSnap {
         final net.minecraft.nbt.NbtCompound nbt; final int age; final long gen;
         NbtSnap(net.minecraft.nbt.NbtCompound n, int a, long g) { nbt = n; age = a; gen = g; }

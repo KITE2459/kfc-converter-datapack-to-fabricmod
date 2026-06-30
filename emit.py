@@ -6357,8 +6357,19 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     elif len(jtypes) == 1:
         if lim:
             out.append("{ int _lim = 0;")
-        out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]},")
-        out.append(f"        en -> {filt})) {{")
+        # 바닐라 arbitrary 순회 순서 재현(고증): distance(상한)+limit 인 경우, 바닐라는
+        # EntitySelector.appendEntitiesFromWorld 가 box != null 이면 collectEntitiesByType(filter,
+        # box, ...) = SectionedEntityCache 섹션순으로 순회한다. no-box(EntityIndex 소환순)로 돌면
+        # limit early-out 의 first-N 이 달라진다(겹친 vertex 등). 그래서 max거리+limit 일 때만
+        # box 오버로드로 섹션순을 맞춘다(SET 동일, 순서만 바닐라화; limit 없으면 SET 무관이라 유지).
+        _has_max = sel.distance is not None and sel.distance[1] is not None
+        if lim and _has_max:
+            out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]}, "
+                       f"KfcGen.rangeBox({pre_src}.getPosition(), {_dist_arg(sel.distance[1])}),")
+            out.append(f"        en -> {filt})) {{")
+        else:
+            out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]},")
+            out.append(f"        en -> {filt})) {{")
         out.append("    " + src_line)
         out.extend(mr1)
         if mod_guard:

@@ -2690,7 +2690,7 @@ def _entity_loop_open_core(sel, var: str):
         if not sel.type_id and not sel.type_is_tag:
             if (sel.limit or 0) >= 1:
                 return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
-                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit})) {{'], sel, var)
+                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})) {{'], sel, var)
             return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
                     f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{'], sel, var)
         types = resolve_entity_types(sel) if sel.type_is_tag else (
@@ -2704,7 +2704,7 @@ def _entity_loop_open_core(sel, var: str):
         if not types or None in types:
             return None
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit})'
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})'
               if (sel.limit or 0) >= 1 else
               f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
         return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : {_q}) {{'], sel, var)
@@ -2899,7 +2899,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
     dmin = _dist_arg(lo); dmax = _dist_arg(hi)
     if types:
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit})'
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})'
               if (sel.limit or 0) >= 1 else
               f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
     else:
@@ -6313,7 +6313,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             _dmx = "-1" if _hi is None else str(_hi)
             out.append(f"for (Entity e : KfcGen.nearestNAnyType(ctx, source.getPosition(), "
                        f"{jarr_tags(sel.tags_pos)}, {jarr_tags(sel.tags_neg)}, "
-                       f"{_dmn}, {_dmx}, {lim})) {{")
+                       f"{_dmn}, {_dmx}, {lim}, true)) {{")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
             out.append("    " + src_line)
             out.extend(mr1)

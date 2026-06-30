@@ -2790,9 +2790,20 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int n) {
+        // 기존 생성물 호환: sort 의도 미지정 → 현행(정렬) 유지.
+        return nearestN(ctx, origin, types, tagsPos, tagsNeg, minDist, maxDist, n, true);
+    }
+
+    public static java.util.List<net.minecraft.entity.Entity> nearestN(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int n,
+            boolean wantNearest) {
         java.util.List<net.minecraft.entity.Entity> all =
                 allEntities(ctx, origin, types, tagsPos, tagsNeg, minDist, maxDist);
-        if (origin != null) {
+        // sort=nearest(wantNearest) 이거나 토글이 켜진 경우에만 거리순 정렬. 그 외(@e arbitrary)는
+        // 반복 순서 그대로 첫 N개 — 바닐라 arbitrary 와 일치하고 정렬 비용을 없앤다.
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
             all.sort(java.util.Comparator.comparingDouble(e -> e.getPos().squaredDistanceTo(origin)));
         }
         return all.size() <= n ? all : all.subList(0, n);
@@ -2818,9 +2829,16 @@ public final class KfcGen {
     public static java.util.List<net.minecraft.entity.Entity> nearestNAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int limit) {
+        return nearestNAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist, limit, true);
+    }
+
+    public static java.util.List<net.minecraft.entity.Entity> nearestNAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int limit,
+            boolean wantNearest) {
         java.util.List<net.minecraft.entity.Entity> all =
                 allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist);
-        if (origin != null && all.size() > 1) {
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
             all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
         }
         if (limit >= 0 && all.size() > limit) {
@@ -3264,6 +3282,12 @@ public final class KfcGen {
     // box 한정 섹션 스캔은 순회량은 줄지만 매 호출 List 할당 + predicate lambda 비용이 더 컸다.
     // (워크로드가 크게 바뀌면 true 로 재측정 가능하도록 토글은 남겨둔다.)
     private static final boolean QUERY_BOX = false;
+    // @e[limit=N] sort 미지정은 바닐라에서 arbitrary(정렬 안 함)이다. 현재 변환은 거리 정렬
+    // (nearestN)으로 처리하는데, 이는 (1) 고증 편차(arbitrary↔nearest)이고 (2) 불필요한 정렬
+    // 비용이다. emit 이 sort=nearest 여부를 wantNearest 로 넘기므로, 이 토글이 false 면 명시적
+    // sort=nearest 만 정렬하고 arbitrary 는 첫 N개(반복 순서=바닐라)로 처리해 정렬을 생략한다.
+    // 기본 true = 현행 동작 유지(안전). false 로 두고 재빌드하면 최적화 활성(A/B 측정용).
+    private static final boolean LIMIT_SORT_NEAREST = true;
     private static final class NbtSnap {
         final net.minecraft.nbt.NbtCompound nbt; final int age; final long gen;
         NbtSnap(net.minecraft.nbt.NbtCompound n, int a, long g) { nbt = n; age = a; gen = g; }

@@ -1005,11 +1005,14 @@ def _dynamic_dispatch(fid: str, em: "Emitted") -> "list[str] | None":
         em.reason = "동적 function: 호출가능 후보 없음(레지스트리 미주입/매칭 0)"
         return None
     cands = sorted(set(cands))
-    lines = [f"switch ({sel_token}) {{"]
+    # 매크로 디스패치 키(예: macroArgs.get("model"))가 null 이면 switch(null) 은 String.hashCode()
+    # 호출로 NPE 가 나 서버가 죽는다. 바닐라 mcfunction 은 매크로 인자가 비면 명령을 조용히
+    # 건너뛰므로(no-op), 키를 지역변수로 받아 null 가드 후에만 switch 한다(블록으로 스코프 격리).
+    lines = [f"{{ String _dk = {sel_token};", "  if (_dk != null) switch (_dk) {"]
     for val, cf in cands:
         lines.append(f"    case {jstr(val)}: {fqcn(cf)}.execute(source); break;")
     lines.append("    default: break;")   # 알 수 없는 값 = 원본도 무효 함수(no-op)
-    lines.append("}")
+    lines.append("  } }")
     em.kind = "native"
     em.reason = f"동적 function 디스패치({len(cands)}개 후보)"
     return lines

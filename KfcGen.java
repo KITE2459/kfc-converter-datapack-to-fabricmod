@@ -3287,7 +3287,7 @@ public final class KfcGen {
     // 비용이다. emit 이 sort=nearest 여부를 wantNearest 로 넘기므로, 이 토글이 false 면 명시적
     // sort=nearest 만 정렬하고 arbitrary 는 첫 N개(반복 순서=바닐라)로 처리해 정렬을 생략한다.
     // 기본 true = 현행 동작 유지(안전). false 로 두고 재빌드하면 최적화 활성(A/B 측정용).
-    private static final boolean LIMIT_SORT_NEAREST = true;
+    private static final boolean LIMIT_SORT_NEAREST = false;
     private static final class NbtSnap {
         final net.minecraft.nbt.NbtCompound nbt; final int age; final long gen;
         NbtSnap(net.minecraft.nbt.NbtCompound n, int a, long g) { nbt = n; age = a; gen = g; }

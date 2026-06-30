@@ -1207,6 +1207,16 @@ def macro_value_expr(v: str) -> str:
     return jstr(v)
 
 
+def _want_nearest(sel: "Selector") -> bool:
+    """거리순 정렬이 의미상 필요한 셀렉터인지. 바닐라 sort 기본값 규칙:
+       · @n / @p 는 sort 미지정이라도 암묵적으로 nearest
+       · @e / @a 는 sort 미지정 시 arbitrary(순서 무관)
+       · 명시 sort=nearest 는 종류 무관하게 nearest
+    이 경우에만 nearestN/nearestNAnyType 이 정렬을 수행해야 한다(LIMIT_SORT_NEAREST 토글과 무관히
+    보호됨). 그 외 arbitrary 는 정렬을 생략해도 관측 동등이다."""
+    return sel.sort == "nearest" or sel.base in ("n", "p")
+
+
 def nearest_entity_java(sel: "Selector") -> str | None:
     """비-@s 엔티티 소스 셀렉터 -> 최근접 엔티티 자바 식(없으면 null 반환식). 불가 시 None."""
     if sel is None or sel.scores or getattr(sel, "predicates", None) or _sel_has_extra(sel):
@@ -2690,7 +2700,7 @@ def _entity_loop_open_core(sel, var: str):
         if not sel.type_id and not sel.type_is_tag:
             if (sel.limit or 0) >= 1:
                 return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
-                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})) {{'], sel, var)
+                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})) {{'], sel, var)
             return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
                     f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{'], sel, var)
         types = resolve_entity_types(sel) if sel.type_is_tag else (
@@ -2704,7 +2714,7 @@ def _entity_loop_open_core(sel, var: str):
         if not types or None in types:
             return None
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})'
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})'
               if (sel.limit or 0) >= 1 else
               f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
         return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : {_q}) {{'], sel, var)
@@ -2899,7 +2909,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
     dmin = _dist_arg(lo); dmax = _dist_arg(hi)
     if types:
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if sel.sort == "nearest" else "false"})'
+        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})'
               if (sel.limit or 0) >= 1 else
               f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
     else:
@@ -6307,7 +6317,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         out.append("}")
     elif jtypes == "ANY":
         # 타입 미지정 @e -> 전 엔티티 순회 (+ limit). sort=nearest 면 거리순 정렬+제한.
-        if sel.sort == "nearest" and lim:
+        if _want_nearest(sel) and lim:
             _lo, _hi = sel.distance if sel.distance else (None, None)
             _dmn = "-1" if _lo is None else str(_lo)
             _dmx = "-1" if _hi is None else str(_hi)

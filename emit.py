@@ -2610,6 +2610,29 @@ def _loop_score_pred_conds(sel, var: str):
     return conds
 
 
+_LIMIT_LAMBDA_CONSUMED_EXTRA = False
+
+
+def _limit_extra_lambda(sel):
+    """limit 셀렉터의 모든 비-type/tag/distance 술어(scores/predicate + team/level/name/
+       nbt/advancements/rotation)를 nearestN/nearestNAnyType 의 extra 람다 문자열로 묶는다.
+       바닐라는 모든 술어를 선택 시점(collect)에서 limit·sort 전에 평가하므로, 이 술어를
+       루프 안 continue(=limit 후, 게다가 루프 본문 상태변화에 재노출)가 아니라 후보 수집
+       직후(limit 전)에 한 번 평가해야 정확하다.
+       반환: None(predicate 미해소→폴백) / ""(추가 술어 없음) / ", _pe -> (...)"(람다).
+       람다를 반환할 때 _LIMIT_LAMBDA_CONSUMED_EXTRA 를 True 로 세워, entity_loop_open 이
+       _selector_extra_guards 를 limit 후에 중복 부착하지 않도록 한다."""
+    global _LIMIT_LAMBDA_CONSUMED_EXTRA
+    g = _loop_score_pred_conds(sel, "_pe")
+    if g is None:
+        return None
+    g = list(g) + _selector_extra_conds(sel, "_pe")
+    if not g:
+        return ""
+    _LIMIT_LAMBDA_CONSUMED_EXTRA = True
+    return f', _pe -> ({" && ".join(_order_guards(g))})'
+
+
 def _loop_with_guards(open_lines, sel, var: str):
     """@e 루프 오프너 뒤에 scores/predicates 가드(`if (!c) continue;`)를 덧붙인다.
        predicate 미해소면 None(폴백)."""
@@ -2623,9 +2646,17 @@ def _loop_with_guards(open_lines, sel, var: str):
 
 def entity_loop_open(sel, var):
     """엔티티 루프 헬퍼(공개 진입점): 코어 + team/level/name 가드."""
+    global _LIMIT_LAMBDA_CONSUMED_EXTRA
+    _LIMIT_LAMBDA_CONSUMED_EXTRA = False
     out = _entity_loop_open_core(sel, var)
     if out is None:
         return None
+    if _LIMIT_LAMBDA_CONSUMED_EXTRA:
+        # limit 셀렉터의 extra 술어(team/level/name/nbt/advancements/rotation)가 이미
+        # nearestN/nearestNAnyType 의 extra 람다(수집 직후·limit 전)에서 평가됐다. 여기서
+        # _selector_extra_guards 를 limit 후 continue 로 또 붙이면 (1) 중복이고 (2) 루프 본문이
+        # 해당 속성을 바꾸면 재평가가 어긋난다(바닐라는 선택 시점 스냅샷 평가). → 중복 부착 금지.
+        return list(out)
     return list(out) + _selector_extra_guards(sel, var)
 
 
@@ -2699,8 +2730,15 @@ def _entity_loop_open_core(sel, var: str):
         # limit=N 이면 가까운 N개만(바닐라 sort 미지정=nearest).
         if not sel.type_id and not sel.type_is_tag:
             if (sel.limit or 0) >= 1:
+                _ex = _limit_extra_lambda(sel)
+                if _ex is None:
+                    return None
+                _wn = "true" if _want_nearest(sel) else "false"
+                if _ex:
+                    return [f'for (net.minecraft.entity.Entity {var} : '
+                            f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn}{_ex})) {{']
                 return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
-                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})) {{'], sel, var)
+                        f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn})) {{'], sel, var)
             return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : '
                     f'KfcGen.allEntitiesAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})) {{'], sel, var)
         types = resolve_entity_types(sel) if sel.type_is_tag else (
@@ -2714,9 +2752,17 @@ def _entity_loop_open_core(sel, var: str):
         if not types or None in types:
             return None
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})'
-              if (sel.limit or 0) >= 1 else
-              f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
+        if (sel.limit or 0) >= 1:
+            _ex = _limit_extra_lambda(sel)
+            if _ex is None:
+                return None
+            _wn = "true" if _want_nearest(sel) else "false"
+            if _ex:
+                return [f'for (net.minecraft.entity.Entity {var} : '
+                        f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn}{_ex})) {{']
+            _q = f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn})'
+            return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : {_q}) {{'], sel, var)
+        _q = f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})'
         return _loop_with_guards([f'for (net.minecraft.entity.Entity {var} : {_q}) {{'], sel, var)
     return None
 
@@ -2907,28 +2953,60 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
     tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
     lo, hi = sel.distance if sel.distance else (None, None)
     dmin = _dist_arg(lo); dmax = _dist_arg(hi)
+    # 바닐라 셀렉터 평가 순서 = 술어(scores/predicates/nbt/...) → sort → limit.
+    # limit 가 있으면 scores 등을 루프 안 continue(=limit 후)로 붙이면 안 된다(첫 N개를 먼저
+    # 자른 뒤 술어를 거르므로 거의 안 맞음 = 순위표/find-check 버그). limit 셀렉터는 모든
+    # 비-type/tag/distance 술어를 nearestN/nearestNAnyType 의 extra 람다(수집 직후·limit 전)로
+    # 넘긴다. _lambda_consumed=True 면 동일 술어를 루프 안에서 중복 부착하지 않는다.
+    _has_limit = (sel.limit or 0) >= 1
+    _wn = "true" if _want_nearest(sel) else "false"
+    _lambda_consumed = False
     if types:
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-        _q = (f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {"true" if _want_nearest(sel) else "false"})'
-              if (sel.limit or 0) >= 1 else
-              f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})')
+        if _has_limit:
+            _ex = _limit_extra_lambda(sel)
+            if _ex is None:
+                em.reason = f"tag @e[limit] 술어 미해소({holder[:25]})"
+                return False
+            _q = f'KfcGen.nearestN(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn}{_ex})'
+            _lambda_consumed = bool(_ex)
+        else:
+            _q = f'KfcGen.allEntities(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})'
     else:
         # 타입 미지정 @e (또는 런타임 타입태그) - 전 엔티티 순회
-        _q = f'KfcGen.allEntitiesAny(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
+        if _has_limit:
+            # 런타임 타입태그/태그-only + limit: 타입태그·scores·nbt 모두 limit 전에 평가.
+            # (기존 allEntitiesAny 경로는 limit 를 아예 무시하던 잠재버그도 함께 해소.)
+            _g = _loop_score_pred_conds(sel, "_pe")
+            if _g is None:
+                em.reason = f"tag @e[limit] 술어 미해소({holder[:25]})"
+                return False
+            _exc = []
+            if runtime_type_tag is not None:
+                tid, tneg = runtime_type_tag
+                _chk = f'KfcGen.entityInTypeTag(_pe, {jstr(tid)})'
+                _exc.append(f'!({_chk})' if tneg else _chk)
+            _exc += list(_g) + _selector_extra_conds(sel, "_pe")
+            _exl = f', _pe -> ({" && ".join(_order_guards(_exc))})' if _exc else ""
+            _q = f'KfcGen.nearestNAnyType(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax}, {sel.limit}, {_wn}{_exl})'
+            _lambda_consumed = True
+        else:
+            _q = f'KfcGen.allEntitiesAny(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
     em.java.append(f'for (net.minecraft.entity.Entity _t : {_q}) {{')
-    if runtime_type_tag is not None:
+    if runtime_type_tag is not None and not _lambda_consumed:
         tid, tneg = runtime_type_tag
         chk = f'KfcGen.entityInTypeTag(_t, {jstr(tid)})'
         em.java.append(f'    if ({"" if tneg else "!"}({chk})) continue;')
-    for o2, (slo, shi) in sel.scores.items():
-        slo_j = _scbound(slo, "Integer.MIN_VALUE")
-        shi_j = _scbound(shi, "Integer.MAX_VALUE")
-        em.java.append(f'    if (!KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
-    if sel.predicates:
-        for g in predicate_guards(sel.predicates, "_t", player=False):
-            em.java.append(f'    if (!({g})) continue;')
-    for ns, inv in _nbt_conds:
-        em.java.append(f'    if (!KfcGen.nbtMatches(_t, {ns}, {inv})) continue;')
+    if not _lambda_consumed:
+        for o2, (slo, shi) in sel.scores.items():
+            slo_j = _scbound(slo, "Integer.MIN_VALUE")
+            shi_j = _scbound(shi, "Integer.MAX_VALUE")
+            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+        if sel.predicates:
+            for g in predicate_guards(sel.predicates, "_t", player=False):
+                em.java.append(f'    if (!({g})) continue;')
+        for ns, inv in _nbt_conds:
+            em.java.append(f'    if (!KfcGen.nbtMatches(_t, {ns}, {inv})) continue;')
     em.java.append(f'    _t.{fn}({jstr(name)});')
     em.java.append("}")
     em.kind = "native"

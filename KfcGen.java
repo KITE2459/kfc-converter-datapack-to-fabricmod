@@ -2809,6 +2809,23 @@ public final class KfcGen {
         return all.size() <= n ? all : all.subList(0, n);
     }
 
+    /** limit 셀렉터에 scores/predicate 등 추가 술어가 붙은 경우. 바닐라는 모든 술어 매치를
+     *  limit(과 sort) 보다 먼저 적용한다(@e[scores={..},limit=N]). extra 를 후보 수집 직후
+     *  (정렬·자르기 전)에 적용해 그 순서를 정확히 재현한다. */
+    public static java.util.List<net.minecraft.entity.Entity> nearestN(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int n,
+            boolean wantNearest, java.util.function.Predicate<net.minecraft.entity.Entity> extra) {
+        java.util.List<net.minecraft.entity.Entity> all =
+                allEntities(ctx, origin, types, tagsPos, tagsNeg, minDist, maxDist);
+        if (extra != null) all.removeIf(e -> !extra.test(e));
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
+            all.sort(java.util.Comparator.comparingDouble(e -> e.getPos().squaredDistanceTo(origin)));
+        }
+        return all.size() <= n ? all : all.subList(0, n);
+    }
+
     public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
@@ -2838,6 +2855,23 @@ public final class KfcGen {
             boolean wantNearest) {
         java.util.List<net.minecraft.entity.Entity> all =
                 allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist);
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
+            all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
+        }
+        if (limit >= 0 && all.size() > limit) {
+            return new java.util.ArrayList<>(all.subList(0, limit));
+        }
+        return all;
+    }
+
+    /** 타입 미지정 + 추가 술어(scores/predicate). 술어를 정렬·limit 전에 적용(바닐라 순서). */
+    public static java.util.List<net.minecraft.entity.Entity> nearestNAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int limit,
+            boolean wantNearest, java.util.function.Predicate<net.minecraft.entity.Entity> extra) {
+        java.util.List<net.minecraft.entity.Entity> all =
+                allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist);
+        if (extra != null) all.removeIf(e -> !extra.test(e));
         if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
             all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
         }

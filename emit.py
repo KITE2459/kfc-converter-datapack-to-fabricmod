@@ -459,8 +459,6 @@ PREDICATES: dict[str, str] = {}   # "kartmobil:ifride" -> 자바 boolean 식 템
 # instanceof 패턴 바인딩 없이 {P} 를 직접 사용 (같은 줄 다중 바인딩 충돌 방지).
 PREDICATES_PLAYER: dict[str, str] = {}
 
-def _player_input_expr(key: str, target: str) -> str:
-    return f'{target}.getPlayerInput().{key}()'
 
 def compile_predicate_json(j):
     """predicate JSON -> (일반식, 플레이어컨텍스트식). 둘 다 {E}/{P} 템플릿.
@@ -618,12 +616,8 @@ def at_effect_cond(raw: str) -> str | None:
     if sel is None or sel.predicates or sel.type_id or sel.distance is not None or _sel_has_extra(sel):
         return None
     guards = [f'KfcGen.hasEffect(_pp, {jstr(effect)})']
-    guards += [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-    guards += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
-    for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
-        slo_j = _scbound(slo, "Integer.MIN_VALUE")
-        shi_j = _scbound(shi, "Integer.MAX_VALUE")
-        guards.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+    guards += _tag_conds(sel, '_pp')
+    guards += _score_conds(sel, '_pp')
     if base == "s":
         return ('(executor instanceof net.minecraft.server.network.ServerPlayerEntity _pp && '
                 + " && ".join(guards) + ')')
@@ -728,8 +722,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
             return None
         conds.append(tc)
     # 태그
-    conds += [f'{evar}.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-    conds += [f'!{evar}.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    conds += _tag_conds(sel, evar)
     # 박스(dx/dy/dz)
     if sel.volume is not None:
         dx, dy, dz = sel.volume
@@ -745,11 +738,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
         ge = f'KfcGen.gamemodeIs({evar}, {jstr(sel.gamemode)})'
         conds.append(f'!({ge})' if sel.gamemode_neg else ge)
     # 점수
-    for o2, (slo, shi) in (sel.scores or {}).items():
-        slo_j = _scbound(slo, "Integer.MIN_VALUE")
-        shi_j = _scbound(shi, "Integer.MAX_VALUE")
-        conds.append(f'KfcGen.scoreMatches(sb, {evar}.getNameForScoreboard(), '
-                     f'{jstr(o2)}, {slo_j}, {shi_j})')
+    conds += _score_conds(sel, evar)
     # predicate (런타임 testPredicate 폴백 포함)
     if sel.predicates:
         pg = predicate_guards(sel.predicates, evar, player=player)
@@ -818,8 +807,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
     if (sel.volume is not None and sel.base in ("a", "p", "r")
             and not sel.scores and not sel.predicates):
         dx, dy, dz = sel.volume
-        pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-        pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        pc = _tag_conds(sel, '_pe')
         pc.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, _pe)')
         if sel.gamemode is not None:
             ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
@@ -872,11 +860,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             parts.append(f'executor.getCommandTags().contains({jstr(t)})')
         for t in sel.tags_neg:
             parts.append(f'!executor.getCommandTags().contains({jstr(t)})')
-        for o2, (slo, shi) in sel.scores.items():
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
-                         f'{jstr(o2)}, {slo_j}, {shi_j})')
+        parts += _score_conds(sel, 'executor')
         rc = rotation_conds(sel, "executor")
         if rc is None:
             return _selector_cond_general(sel, src_var)
@@ -911,8 +895,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             if not ok_precompiled:
                 # 컴파일타임 predicate JSON 부재 -> 범용 런타임 폴백(testPredicate)
                 return _selector_cond_general(sel, src_var)
-            tagconds = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-            tagconds += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            tagconds = _tag_conds(sel, '_pe')
             _vc = _volume_cond(sel, "_pe", src_var)
             if _vc: tagconds.append(_vc)
             lo3, hi3 = sel.distance if sel.distance else (None, None)
@@ -941,8 +924,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
     if sel.base in ("a", "p", "r"):
         # 태그/거리만이면 단순 anyPlayer, 점수/게임모드가 섞이면 anyPlayerWhere 람다로 일반화.
         if sel.gamemode is not None or sel.scores:
-            pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-            pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            pc = _tag_conds(sel, '_pe')
             if sel.distance is not None:
                 dl, dh = sel.distance
                 pc.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
@@ -952,11 +934,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             if sel.gamemode is not None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
-            for o2, (slo, shi) in sel.scores.items():
-                slo_j = _scbound(slo, "Integer.MIN_VALUE")
-                shi_j = _scbound(shi, "Integer.MAX_VALUE")
-                pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), '
-                          f'{jstr(o2)}, {slo_j}, {shi_j})')
+            pc += _score_conds(sel, '_pe')
             return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc) if pc else "true"}))'
         return f'KfcGen.anyPlayer(ctx, {src_var}.getPosition(), {tp}, {tn}, {lo}, {hi})'
     jt = resolve_entity_types(sel)
@@ -1402,6 +1380,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
     if r is not None:
         return r
 
+    _h = _DISPATCH_SIMPLE.get(command)
+    if _h is not None:
+        return _h(nn, args, em)
+
     # ---- scoreboard players add/remove/set/operation ----
     if command == "scoreboard" and "players" in nn:
         sub = nn[nn.index("players") + 1] if "players" in nn else None
@@ -1414,50 +1396,20 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
     if command == "scoreboard" and "objectives" in nn:
         return emit_scoreboard_objectives(nn, args, em)
 
-    if command == "effect":
-        return emit_effect(nn, args, em)
 
-    if command == "xp":
-        return emit_xp(nn, args, em)
 
-    if command == "experience":
-        return emit_xp(nn, args, em)   # experience = xp 별칭 (add/set; query 는 폴백)
 
-    if command == "give":
-        return emit_give(nn, args, em)
 
-    if command == "gamerule":
-        return emit_gamerule(nn, args, em)
 
-    if command == "worldborder":
-        return emit_worldborder(nn, args, em)
 
-    if command == "damage":
-        return emit_damage(nn, args, em)
 
-    if command == "trigger":
-        return emit_trigger(nn, args, em)
 
-    if command == "schedule":
-        return emit_schedule(nn, args, em)
 
-    if command == "place":
-        return emit_place(nn, args, em)
 
-    if command == "spreadplayers":
-        return emit_spreadplayers(nn, args, em)
 
-    if command in ("tp", "teleport"):
-        return emit_tp(nn, args, em)
 
-    if command == "setworldspawn":
-        return emit_setworldspawn(nn, args, em)
 
-    if command == "spawnpoint":
-        return emit_spawnpoint(nn, args, em)
 
-    if command == "enchant":
-        return emit_enchant(nn, args, em)
 
     # ---- tag @s add/remove ----
     if command == "time":
@@ -1575,8 +1527,6 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             return emit_tag_selector(verb, sel, name, em)  # @e/@n/@p 셀렉터 -> 루프/단일
         return False
 
-    if command == "bossbar":
-        return emit_bossbar(nn, args, em)
 
     # ---- function ns:path [with ...|{compound}] ----
     if command == "function":
@@ -1653,8 +1603,6 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         return True
 
     # ---- data (modify/get/...) : 질문1=A, 최대 네이티브 시도 ----
-    if command == "data":
-        return emit_data(nn, args, em)
 
     if command == "kill":
         holder = first_arg(args, "targets") or "@s"
@@ -1675,14 +1623,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
 
         if sel.base == "s":
             # @s / @s[tag/score/predicate]: 실행자 자신을 (필터 만족 시) 제거.
-            conds = [f'executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-            conds += [f'!executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            conds = _tag_conds(sel, 'executor')
             _vc = _volume_cond(sel, "executor")
             if _vc: conds.append(_vc)
-            for o2, (slo, shi) in (sel.scores or {}).items():
-                slo_j = _scbound(slo, "Integer.MIN_VALUE")
-                shi_j = _scbound(shi, "Integer.MAX_VALUE")
-                conds.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+            conds += _score_conds(sel, 'executor')
             conds += _kill_pred_guards("executor")
             conds += _selector_extra_conds(sel, "executor")
             guard = " && ".join(["executor != null"] + conds)
@@ -1695,10 +1639,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             em.reason = f"kill 셀렉터({holder[:25]}) 루프 미해소"
             return False
         em.java.extend(loop)
-        for o2, (slo, shi) in (sel.scores or {}).items():
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _k.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+        for _c in _score_conds(sel, '_k'):
+            em.java.append(f'    if (!{_c}) continue;')
         for g in _kill_pred_guards("_k"):
             em.java.append(f'    if (!({g})) continue;')
         em.java.append("    KfcGen.killEntity(_k);")
@@ -1706,10 +1648,6 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         em.kind = "native"
         return True
 
-    if command == "stopsound":
-        return emit_stopsound(nn, args, em)
-    if command == "playsound":
-        return emit_playsound(nn, args, em)
 
     if command == "attribute":
         holder = first_arg(args, "target")
@@ -1989,33 +1927,6 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             f'_ft.getX(), _ft.getY(), _ft.getZ(), {jstr(block)}, {jstr(mode)}, {fj}); }}')
         em.kind = "native"; return True
 
-    if command == "kill":
-        tgt = first_arg(args, "targets") or "@s"
-        if tgt == "@s":
-            em.java.append('if (executor != null) KfcGen.killEntity(executor);')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        if sel is None:
-            em.reason = f"kill 셀렉터({tgt[:25]}) 미지원"; return False
-        # nbt/predicate 동반은 1차 미지원(아이템/술어 매칭 필요) - 정확한 사유로 폴백
-        if getattr(sel, "nbt", None) or sel.predicates:
-            em.reason = f"kill 셀렉터 nbt/predicate 미지원({tgt[:25]})"; return False
-        lo = entity_loop_open(sel, "_kE")
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"kill 셀렉터({tgt[:25]}) 해소 불가"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _kE = {ent};'
-                           f' if (_kE != null) KfcGen.killEntity(_kE); }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        for o2, (slo, shi) in sel.scores.items():
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _kE.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
-        em.java.append('    KfcGen.killEntity(_kE);')
-        em.java.append("}")
-        em.kind = "native"; return True
 
     if command == "spectate":
         tgt = first_arg(args, "target")
@@ -2487,10 +2398,7 @@ def emit_tellraw_title(nn, args, em, cmd):
 
     def _player_guards(var):
         gs = []
-        for o2, (slo, shi) in (sel.scores.items() if sel and sel.scores else []):
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            gs.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        gs += _score_conds(sel, var)
         for pid in (sel.predicates if sel else []):
             neg_p = pid.startswith("!"); key = pid[1:] if neg_p else pid
             pn = key if ":" in key else "minecraft:" + key
@@ -2539,8 +2447,7 @@ def emit_tellraw_title(nn, args, em, cmd):
         em.kind = "native"
         return True
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _tp : ctx.allPlayers) {")
-    conds = [f'_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-    conds += [f'!_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    conds = _tag_conds(sel, '_tp')
     _vc = _volume_cond(sel, "_tp")
     if _vc: conds.append(_vc)
     conds += _player_guards("_tp")
@@ -2564,6 +2471,48 @@ def _unquote_sel(v: str) -> str:
     if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
         return v[1:-1].replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
     return v
+
+
+def _tag_conds(sel, var: str) -> list:
+    """sel.tags_pos/neg -> [var.getCommandTags().contains(t), !var...contains(t)] 조건 리스트."""
+    out = [f'{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
+    out += [f'!{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    return out
+
+
+def _score_conds(sel, var: str) -> list:
+    """sel.scores -> [scoreMatches(sb, var.getNameForScoreboard(), obj, lo, hi)] 조건 리스트."""
+    if not sel:
+        return []
+    out = []
+    for obj_name, (slo, shi) in (sel.scores or {}).items():
+        lo_j = _scbound(slo, "Integer.MIN_VALUE")
+        hi_j = _scbound(shi, "Integer.MAX_VALUE")
+        out.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), '
+                   f'{jstr(obj_name)}, {lo_j}, {hi_j})')
+    return out
+
+
+def rotation_conds(sel, evar: str):
+    """x_rotation/y_rotation -> 자바 조건식 리스트. yaw 래핑(min>max)도 OR 로 지원."""
+    out = []
+    if sel.x_rotation is not None:
+        lo, hi = sel.x_rotation
+        if lo is not None:
+            out.append(f'{evar}.getPitch() >= {lo}')
+        if hi is not None:
+            out.append(f'{evar}.getPitch() <= {hi}')
+    if sel.y_rotation is not None:
+        lo, hi = sel.y_rotation
+        if lo is not None and hi is not None and float(lo) > float(hi):
+            # 래핑 범위: yaw>=lo OR yaw<=hi (예: y_rotation=170..-170 -> 정면 뒤쪽)
+            out.append(f'({evar}.getYaw() >= {lo} || {evar}.getYaw() <= {hi})')
+        else:
+            if lo is not None:
+                out.append(f'{evar}.getYaw() >= {lo}')
+            if hi is not None:
+                out.append(f'{evar}.getYaw() <= {hi}')
+    return out
 
 
 def _selector_extra_conds(sel, var: str) -> list:
@@ -2621,10 +2570,7 @@ def _loop_score_pred_conds(sel, var: str):
     """루프 변수 var 에 대한 scores + predicates 의 bare boolean 조건 리스트.
        (단순 루프 빌더가 빠뜨리던 제약 - 누락 시 거짓양성). predicate 미해소면 None."""
     conds = []
-    for obj_name, (slo, shi) in (sel.scores or {}).items():
-        lo_j = _scbound(slo, "Integer.MIN_VALUE")
-        hi_j = _scbound(shi, "Integer.MAX_VALUE")
-        conds.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
+    conds += _score_conds(sel, var)
     if sel.predicates:
         pg = predicate_guards(sel.predicates, var, player=(sel.base in ("a", "p", "r")))
         if pg is None:
@@ -2697,8 +2643,7 @@ def _entity_loop_open_core(sel, var: str):
                    f"KfcGen.sortedPlayersByDist(ctx, source.getPosition(), {_furth})) {{"]
         else:
             out = [f"for (net.minecraft.entity.Entity {var} : ctx.allPlayers) {{"]
-        conds = [f'{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-        conds += [f'!{var}.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        conds = _tag_conds(sel, var)
         if sel.volume is not None:
             dx, dy, dz = sel.volume
             conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, '
@@ -2808,8 +2753,7 @@ def emit_stopsound(nn: list[str], args: dict, em: Emitted) -> bool:
         em.kind = "native"
         return True
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _sp : ctx.allPlayers) {")
-    conds = [f'_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-    conds += [f'!_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    conds = _tag_conds(sel, '_sp')
     _vc = _volume_cond(sel, "_sp")
     if _vc: conds.append(_vc)
     if conds:
@@ -2850,8 +2794,7 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
         em.kind = "native"
         return True
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
-    conds = [f'_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-    conds += [f'!_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    conds = _tag_conds(sel, '_ps')
     _vc = _volume_cond(sel, "_ps")
     if _vc: conds.append(_vc)
     if conds:
@@ -2943,8 +2886,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         return True
     if sel.base == "a":
         em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _t : ctx.allPlayers) {")
-        conds = [f'_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-        conds += [f'!_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        conds = _tag_conds(sel, '_t')
         if sel.predicates:
             conds += predicate_guards(sel.predicates, "_t", player=True)
         if sel.distance is not None:
@@ -2960,10 +2902,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         if sel.gamemode is not None:
             gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
             conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
-        for o2, (slo, shi) in sel.scores.items():
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            conds.append(f'KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        conds += _score_conds(sel, '_t')
         for ns, inv in _nbt_conds:
             conds.append(f'KfcGen.nbtMatches(_t, {ns}, {inv})')
         if conds:
@@ -3037,10 +2976,8 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         chk = f'KfcGen.entityInTypeTag(_t, {jstr(tid)})'
         em.java.append(f'    if ({"" if tneg else "!"}({chk})) continue;')
     if not _lambda_consumed:
-        for o2, (slo, shi) in sel.scores.items():
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            em.java.append(f'    if (!KfcGen.scoreMatches(sb, _t.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+        for _c in _score_conds(sel, '_t'):
+            em.java.append(f'    if (!{_c}) continue;')
         if sel.predicates:
             for g in predicate_guards(sel.predicates, "_t", player=False):
                 em.java.append(f'    if (!({g})) continue;')
@@ -3560,18 +3497,14 @@ def bossbar_player_collection(sel_raw: str, var: str):
 
     def _score_guards():
         gs = []
-        for o2, (slo, shi) in (sel.scores.items() if sel.scores else []):
-            slo_j = _scbound(slo, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi, "Integer.MAX_VALUE")
-            gs.append(f'KfcGen.scoreMatches(sb, _pp.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})')
+        gs += _score_conds(sel, '_pp')
         return gs
 
     lines = [f'java.util.List<net.minecraft.server.network.ServerPlayerEntity> {var} '
              f'= new java.util.ArrayList<>();']
     if sel.base == "a":
         lines.append(f'for (net.minecraft.server.network.ServerPlayerEntity _pp : ctx.allPlayers) {{')
-        conds = [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-        conds += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        conds = _tag_conds(sel, '_pp')
         _vc = _volume_cond(sel, "_pp")
         if _vc: conds.append(_vc)
         if sel.predicates:
@@ -3834,8 +3767,7 @@ def emit_scoreboard(sub: str, args: dict, em: Emitted) -> bool:
             return False
         if sel.base == "a":
             em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _t : ctx.allPlayers) {")
-            conds = [f'_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-            conds += [f'!_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            conds = _tag_conds(sel, '_t')
             _vc = _volume_cond(sel, "_t")
             if _vc: conds.append(_vc)
             conds += _selector_extra_conds(sel, "_t")
@@ -4109,10 +4041,8 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
             else:
                 em.reason = f"scoreboard operation 다중 대상({dholder[:25]}) 타입 미해소"
                 return False
-            for o2, (slo2, shi2) in (dsel.scores or {}).items():
-                slo_j = _scbound(slo2, "Integer.MIN_VALUE")
-                shi_j = _scbound(shi2, "Integer.MAX_VALUE")
-                body.append(f'    if (!KfcGen.scoreMatches(sb, _od.getNameForScoreboard(), {jstr(o2)}, {slo_j}, {shi_j})) continue;')
+            for _c in _score_conds(dsel, '_od'):
+                body.append(f'    if (!{_c}) continue;')
             body.append(f'    KfcGen.opScore(sb, _od.getNameForScoreboard(), {jstr(do)}, {jstr(op)}, {sname0}, {jstr(so)});')
             body.append("}")
             if sguard0:
@@ -4512,143 +4442,6 @@ _REBIND_SAFE_AFTER = {"if", "unless", "score", "target", "targetObjective", "mat
                       "source", "sourceObjective", "positioned", "pos", "rotated", "rotation",
                       "items", "entity", "entities", "slots", "item_predicate", "run"}
 
-def extract_rebinds(head: list[dict]):
-    """head 에서 positioned/rotated(수치)/positioned as @s/align 을 떼어 소스 재바인딩 문장으로.
-       반환 (new_head, rebind_stmts, final_src_var) 또는 None(전처리 불가)."""
-    nn0 = [s.get("node") for s in head if "node" in s]
-    if not any(n in ("positioned", "rotated", "align", "at") for n in nn0):
-        return None
-    new_head = []
-    rebinds = []
-    src_var = "source"
-    i = 0
-    while i < len(head):
-        s = head[i]
-        n = s.get("node")
-        if n == "positioned":
-            nxt = head[i + 1].get("node") if i + 1 < len(head) else None
-            if nxt == "as":
-                # positioned as <@s> - 소스 위치를 실행자 위치로
-                raw = None
-                j = i + 2
-                while j < len(head) and (head[j].get("node") == "targets" or head[j].get("arg") == "targets"):
-                    if head[j].get("arg") == "targets":
-                        raw = head[j]["value"]["raw"]
-                    j += 1
-                if raw != "@s":
-                    return None  # 비-@s 1차 미지원
-                nv = f"kfcSrc{_uid()}"
-                # executor 없으면 원본은 명령 실패 - 위치 유지로 절충(틱 루트에서 안전)
-                rebinds.append(f'ServerCommandSource {nv} = (executor != null ? '
-                               f'{src_var}.withPosition(executor.getPos()) : {src_var});')
-                src_var = nv
-                i = j
-                continue
-            raw = None
-            j = i + 1
-            while j < len(head) and (head[j].get("node") == "pos" or head[j].get("arg") == "pos"):
-                if head[j].get("arg") == "pos":
-                    raw = head[j]["value"]["raw"]
-                j += 1
-            if raw is None:
-                return None
-            expr = pos_rebind_expr(raw, src_var)
-            if expr is None:
-                return None
-            nv = f"kfcSrc{_uid()}"
-            rebinds.append(f'ServerCommandSource {nv} = {expr};')
-            src_var = nv
-            i = j
-            continue
-        if n == "rotated":
-            raw = None
-            j = i + 1
-            while j < len(head) and (head[j].get("node") in ("rotation", "rot")
-                                      or head[j].get("arg") in ("rotation", "rot")):
-                if head[j].get("arg") in ("rotation", "rot"):
-                    raw = head[j]["value"]["raw"]
-                j += 1
-            if raw is None:
-                return None  # rotated as <selector> - 1차 미지원
-            expr = rot_rebind_expr(raw, src_var)
-            if expr is None:
-                return None
-            nv = f"kfcSrc{_uid()}"
-            rebinds.append(f'ServerCommandSource {nv} = {expr};')
-            src_var = nv
-            i = j
-            continue
-        if n == "at":
-            # at <@s> = positioned as @s + rotated as @s (위치 + 회전 둘 다 @s 로).
-            # 바닐라 at 은 회전도 옮기므로, 이후 rotate @s ~ 등 '~' 가 @s 자기 회전을 쓰게 된다.
-            # (회전 리바인드를 빠뜨리면 부모 소스 회전을 써서 모델이 엉뚱한 방향으로 스냅함.)
-            raw = None
-            j = i + 1
-            while j < len(head) and (head[j].get("node") == "targets" or head[j].get("arg") == "targets"):
-                if head[j].get("arg") == "targets":
-                    raw = head[j]["value"]["raw"]
-                j += 1
-            if raw != "@s":
-                return None  # 비-@s at 1차 미지원
-            nv = f"kfcSrc{_uid()}"
-            rebinds.append(f'ServerCommandSource {nv} = (executor != null ? '
-                           f'{src_var}.withPosition(executor.getPos())'
-                           f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) '
-                           f': {src_var});')
-            src_var = nv
-            i = j
-            continue
-        if n == "align":
-            raw = None
-            j = i + 1
-            while j < len(head) and (head[j].get("node") == "axes" or head[j].get("arg") == "axes"):
-                if head[j].get("arg") == "axes":
-                    raw = head[j]["value"]["raw"]
-                j += 1
-            if raw is None:
-                return None
-            comps = []
-            for ax in ("x", "y", "z"):
-                p = f"{src_var}.getPosition().{ax}"
-                comps.append(f"Math.floor({p})" if ax in raw else p)
-            nv = f"kfcSrc{_uid()}"
-            rebinds.append(f'ServerCommandSource {nv} = {src_var}.withPosition('
-                           f'new net.minecraft.util.math.Vec3d({", ".join(comps)}));')
-            src_var = nv
-            i = j
-            continue
-        new_head.append(s)
-        i += 1
-    if not rebinds:
-        return None
-    # 사후 검증: 남은 head 에 위치 의존/미지원 요소가 없어야 (조건은 src_var 기준으로 생성됨)
-    safe = {"if", "unless", "score", "target", "targetObjective", "matches", "range",
-            "source", "sourceObjective", "items", "entity", "entities", "slots",
-            "item_predicate", "predicate", "loaded", "block", "pos", "data", "path",
-            "rot", "rotation", "axes", "objective", "name"}
-    for s in new_head:
-        n = s.get("node")
-        if n is not None and n not in safe:
-            return None
-    # 순서 의존성 검사: rebind 가 2개 이상이고 그 사이에 위치의존 조건(if/unless block-loaded)이
-    # 끼면, 조건들이 전부 최종 src 기준으로 평가돼 의미가 틀어진다. 그런 교차는 폴백.
-    rebind_count = 0
-    cond_between = False
-    bad_interleave = False
-    pending_cond = False
-    for idx, s in enumerate(head):
-        nd = s.get("node")
-        if nd in ("positioned", "rotated", "align"):
-            if pending_cond and rebind_count >= 1:
-                bad_interleave = True
-            rebind_count += 1
-            pending_cond = False
-        elif nd in ("block", "loaded") and rebind_count >= 1:
-            # rebind 후 등장한 위치의존 조건 - 다음 rebind 와 교차하면 문제
-            pending_cond = True
-    if bad_interleave:
-        return None
-    return (new_head, rebinds, src_var)
 
 
 _on_depth = 0  # on passengers/vehicle 재귀 깊이 - 변수명 유일화용 (emit_line 마다 리셋)
@@ -6076,20 +5869,6 @@ def parse_clear_item(pred: str):
     return (item_id, cm.group(1))
 
 
-def parse_item_predicate(pred: str):
-    """아이템 술어 -> (item_id, custom_data_snbt|None). 미지원 형태면 None.
-       지원: `*`, `<id>`, `#<tag>`, `<id>[<ns:>custom_data~{...}]`, `*[<ns:>custom_data~{...}]`
-       (#tag 은 런타임 stackMatches 가 stack.isIn(TagKey) 로 평가)."""
-    m = re.match(r'^(\*|#?[a-z0-9_.:/-]+)(?:\[(.*)\])?$', pred.strip())
-    if not m:
-        return None
-    item_id, comp = m.group(1), m.group(2)
-    if comp is None or comp == "":
-        return (item_id, None)
-    cm = re.match(r'^(?:minecraft:)?custom_data~(\{.*\})$', comp.strip())
-    if not cm:
-        return None  # custom_data~ 외 컴포넌트 술어는 1차 미지원
-    return (item_id, cm.group(1))
 
 
 def skip_after(nn, i, token):
@@ -6137,11 +5916,7 @@ def _emit_as_loop_recursive(line, head, tail, em, sel):
                     if pg is None:
                         em.reason = "as @s predicate 미해소"; return False
                     guards += pg
-                for o2, (slo, shi) in sel.scores.items():
-                    slo_j = _scbound(slo, "Integer.MIN_VALUE")
-                    shi_j = _scbound(shi, "Integer.MAX_VALUE")
-                    guards.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
-                                  f'{jstr(o2)}, {slo_j}, {shi_j})')
+                guards += _score_conds(sel, 'executor')
                 # @s 의 distance 는 자기 자신(거리 0) -> 무시(항상 통과)
                 loop_open = [f'if ({" && ".join(guards)}) {{ net.minecraft.entity.Entity {_asE} = executor;']
             else:
@@ -6343,10 +6118,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         _dmin = _dist_arg(_dlo)
         _dmax = _dist_arg(_dhi)
         conds.append(f'KfcGen.inRange({pre_src}.getPosition(), en, {_dmin}, {_dmax})')
-    for obj_name, (lo, hi) in sel.scores.items():
-        lo_j = _scbound(lo, "Integer.MIN_VALUE")
-        hi_j = _scbound(hi, "Integer.MAX_VALUE")
-        conds.append(f'KfcGen.scoreMatches(sb, en.getNameForScoreboard(), {jstr(obj_name)}, {lo_j}, {hi_j})')
+    conds += _score_conds(sel, 'en')
     for pid in sel.predicates:
         expr = PREDICATES.get(pid)
         if expr is None:
@@ -6985,11 +6757,7 @@ def single_entity_expr(raw: str) -> str | None:
         # `rotated as @s[...,scores=...]` / `facing entity @s[...]` 등에서 점수 필터가
         # 사라지고 모든 분기가 무조건 실행됐다(예: loop-main=0/1 동시 실행 -> rightspeed 상쇄).
         # 다른 셀렉터 분기(@p/@e)와 동일하게 scoreMatches 가드를 적용해 바닐라 무결성 회복.
-        for o2, (slo2, shi2) in (sel.scores or {}).items():
-            slo_j = _scbound(slo2, "Integer.MIN_VALUE")
-            shi_j = _scbound(shi2, "Integer.MAX_VALUE")
-            guards.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), '
-                          f'{jstr(o2)}, {slo_j}, {shi_j})')
+        guards += _score_conds(sel, 'executor')
         # gamemode= 가드 (@s 가 플레이어일 때) - 마찬가지로 누락되어 있던 제약 복원.
         if sel.gamemode is not None:
             ge = f'KfcGen.gamemodeIs(executor, {jstr(sel.gamemode)})'
@@ -7033,15 +6801,11 @@ def single_entity_expr(raw: str) -> str | None:
         # 순위 판정처럼 '고정 기준점' 이 필요한 알고리즘에서 nearest 로 바꾸면 기준이 흔들린다.
         _is_arbitrary = (sel.base == "a")
         if sel.gamemode is not None or sel.scores or sel.predicates or sel.x_rotation or sel.y_rotation or sel.volume is not None:
-            pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
-            pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            pc = _tag_conds(sel, '_pe')
             if sel.gamemode is not None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
-            for o5, (sl5, sh5) in sel.scores.items():
-                sl_j = _scbound(sl5, "Integer.MIN_VALUE")
-                sh_j = _scbound(sh5, "Integer.MAX_VALUE")
-                pc.append(f'KfcGen.scoreMatches(sb, _pe.getNameForScoreboard(), {jstr(o5)}, {sl_j}, {sh_j})')
+            pc += _score_conds(sel, '_pe')
             rcp = rotation_conds(sel, "_pe")
             if rcp is None:
                 return None
@@ -7083,10 +6847,7 @@ def single_entity_expr(raw: str) -> str | None:
                 tid = sel.type_id if ":" in sel.type_id else "minecraft:" + sel.type_id
                 e = f'KfcGen.entityTypeIs(_ee, {jstr(tid)})'
                 extra.append(f'!({e})' if sel.type_neg else e)
-            for o6, (sl6, sh6) in (sel.scores or {}).items():
-                sl_j = _scbound(sl6, "Integer.MIN_VALUE")
-                sh_j = _scbound(sh6, "Integer.MAX_VALUE")
-                extra.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
+            extra += _score_conds(sel, '_ee')
             rce = rotation_conds(sel, "_ee")
             if rce is None:
                 return None
@@ -7105,10 +6866,7 @@ def single_entity_expr(raw: str) -> str | None:
         if sel.gamemode is not None:
             return None  # @e/@n 의 gamemode 는 미지원 - 무시 대신 거부(정확성)
         ec = []
-        for o6, (sl6, sh6) in (sel.scores or {}).items():
-            sl_j = _scbound(sl6, "Integer.MIN_VALUE")
-            sh_j = _scbound(sh6, "Integer.MAX_VALUE")
-            ec.append(f'KfcGen.scoreMatches(sb, _ee.getNameForScoreboard(), {jstr(o6)}, {sl_j}, {sh_j})')
+        ec += _score_conds(sel, '_ee')
         rce = rotation_conds(sel, "_ee")
         if rce is None:
             return None
@@ -7128,27 +6886,6 @@ def single_entity_expr(raw: str) -> str | None:
 
 
 
-def rotation_conds(sel, evar: str):
-    """x_rotation/y_rotation -> 자바 조건식 리스트. yaw 래핑(min>max)도 OR 로 지원."""
-    out = []
-    if sel.x_rotation is not None:
-        lo, hi = sel.x_rotation
-        if lo is not None:
-            out.append(f'{evar}.getPitch() >= {lo}')
-        if hi is not None:
-            out.append(f'{evar}.getPitch() <= {hi}')
-    if sel.y_rotation is not None:
-        lo, hi = sel.y_rotation
-        if lo is not None and hi is not None and float(lo) > float(hi):
-            # 래핑 범위: yaw>=lo OR yaw<=hi (예: y_rotation=170..-170 -> 정면 뒤쪽)
-            out.append(f'({evar}.getYaw() >= {lo} || {evar}.getYaw() <= {hi})')
-        else:
-            if lo is not None:
-                out.append(f'{evar}.getYaw() >= {lo}')
-            if hi is not None:
-                out.append(f'{evar}.getYaw() <= {hi}')
-    return out
-
 def jarr_tags(tags: list) -> str:
     """태그 리스트 -> 자바 String[] 리터럴."""
     if not tags:
@@ -7156,8 +6893,6 @@ def jarr_tags(tags: list) -> str:
     return "new String[]{" + ", ".join(jstr(t) for t in tags) + "}"
 
 
-def ent_expr_to_name(expr): return expr   # placeholder (비교형 셀렉터는 1차 미지원이라 미사용)
-def ent_expr_var(expr): return expr
 
 
 # ───────────────────────── 식별자 -> 자바 FQCN ─────────────────────────
@@ -7220,9 +6955,6 @@ VANILLA_COMMANDS = {
 
 # 외부에서 실제 dispatcher 루트 목록을 주입하면 그것으로 교체 (정확도 우선)
 _dispatcher_roots: set | None = None
-def set_dispatcher_roots(roots):
-    global _dispatcher_roots
-    _dispatcher_roots = set(roots) if roots else None
 
 def is_valid_root_command(command) -> bool:
     """command 가 유효한 마크 루트 명령인가. None/빈 문자열/집합 밖이면 무효."""
@@ -7547,3 +7279,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# 단순 위임(노드 경로 무관, command 만으로 핸들러 결정) 명령 디스패치 테이블.
+# emit_target 의 거대한 if/elif 체인에서 순수 위임 분기를 분리 — 명령 추가/수정 용이.
+_DISPATCH_SIMPLE = {
+    "effect": emit_effect, "xp": emit_xp, "experience": emit_xp,
+    "give": emit_give, "gamerule": emit_gamerule, "worldborder": emit_worldborder,
+    "damage": emit_damage, "trigger": emit_trigger, "schedule": emit_schedule,
+    "place": emit_place, "spreadplayers": emit_spreadplayers,
+    "setworldspawn": emit_setworldspawn, "spawnpoint": emit_spawnpoint,
+    "enchant": emit_enchant, "bossbar": emit_bossbar, "data": emit_data,
+    "stopsound": emit_stopsound, "playsound": emit_playsound,
+    "tp": emit_tp, "teleport": emit_tp,
+}

@@ -652,6 +652,10 @@ tasks.withType(JavaCompile).configureEach {
     options.incremental = false
     options.compilerArgs += ['-proc:none']
 }
+
+tasks.withType(AbstractArchiveTask).configureEach {
+    zip64 = true
+}
 """
 
 _SETTINGS = """pluginManagement {

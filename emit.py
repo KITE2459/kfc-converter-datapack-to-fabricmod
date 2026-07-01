@@ -1366,6 +1366,56 @@ def try_simple_rule(command: str, nn: list, args: dict, em: Emitted):
     return True
 
 
+def _loot_fanout(sel_raw, var, body, em, reason_label, loot_decl):
+    """loot give / replace entity 공통: { <loot_decl> <단일|루프 body> }.
+       single_entity_expr 우선(@s/@p/@n/limit=1 단일), 실패 시 루프.
+       body(entvar) 는 자바 문장(가드 포함 여부는 body 가 결정).
+       loot_decl 은 '_loot' 리스트 선언문(블록 최상단 1회)."""
+    em.java.append(f"{{ {loot_decl}")
+    ent = single_entity_expr(sel_raw) if sel_raw else None
+    if ent is not None:
+        em.java.append(f"  net.minecraft.entity.Entity {var} = {ent};")
+        em.java.append(f"  {body(var)}")
+    else:
+        sel = parse_selector(sel_raw) if sel_raw else None
+        lo = entity_loop_open(sel, var) if sel else None
+        if lo is None:
+            em.reason = f"{reason_label} 대상({str(sel_raw)[:20]}) 미지원"
+            return False
+        em.java.extend(lo)
+        em.java.append(f"    {body(var)}")
+        em.java.append("}")
+    em.java.append("}")
+    em.kind = "native"
+    return True
+
+
+def _fanout_target(tgt, var, body, em, reason_label):
+    """대상 셀렉터 tgt 를 @s / 단일 엔티티 / 루프 세 경로로 전개하는 공통 헬퍼.
+       body(entvar) 는 자바 '문장 하나'(끝에 ; 포함)를 만드는 콜백.
+       - @s        : if (executor != null) <body(executor)>
+       - 단일       : { Entity <var> = <expr>; if (<var> != null) <body(var)> }
+       - 루프       : for(...) { <body(var)> }
+       성공 시 em.kind='native' 세팅 후 True, 미해소 시 em.reason 세팅 후 False.
+       (advancement/recipe/clear/item replace 등 동일 골격의 중복을 제거)"""
+    if tgt == "@s":
+        em.java.append(f'if (executor != null) {body("executor")}')
+        em.kind = "native"; return True
+    sel = parse_selector(tgt)
+    lo = entity_loop_open(sel, var) if sel else None
+    if lo is None:
+        ent = single_entity_expr(tgt)
+        if ent is None:
+            em.reason = f"{reason_label} 대상({str(tgt)[:20]}) 미지원"; return False
+        em.java.append(f'{{ net.minecraft.entity.Entity {var} = {ent};'
+                       f' if ({var} != null) {body(var)} }}')
+        em.kind = "native"; return True
+    em.java.extend(lo)
+    em.java.append(f'    {body(var)}')
+    em.java.append("}")
+    em.kind = "native"; return True
+
+
 def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool:
     """비-execute(또는 run 뒤) 타겟 커맨드를 자바로. 성공 시 True, 네이티브 불가면 False."""
     # 중첩 execute(run execute ...) - 서브체인을 그대로 execute 폴드로 재귀.
@@ -1877,35 +1927,16 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 mem = first_arg(args, "members")
                 if not tname:
                     em.reason = "team join 팀명 없음"; return False
-                if mem is None or mem == "@s":
-                    em.java.append(f'if (executor != null) KfcGen.teamJoin(sb, {jstr(tname)}, executor.getNameForScoreboard());')
-                    em.kind = "native"; return True
-                sel = parse_selector(mem)
-                lo = entity_loop_open(sel, "_tjE") if sel else None
-                if lo is None:
-                    ent = single_entity_expr(mem)
-                    if ent is None:
-                        em.reason = f"team join 대상({str(mem)[:20]}) 미지원"; return False
-                    em.java.append(f'{{ net.minecraft.entity.Entity _tjE = {ent};'
-                                   f' if (_tjE != null) KfcGen.teamJoin(sb, {jstr(tname)}, _tjE.getNameForScoreboard()); }}')
-                    em.kind = "native"; return True
-                em.java.extend(lo)
-                em.java.append(f'    KfcGen.teamJoin(sb, {jstr(tname)}, _tjE.getNameForScoreboard());')
-                em.java.append("}")
-                em.kind = "native"; return True
+                return _fanout_target(
+                    mem or "@s", "_tjE",
+                    lambda e: f'KfcGen.teamJoin(sb, {jstr(tname)}, {e}.getNameForScoreboard());',
+                    em, "team join")
             if verb == "leave":
                 mem = first_arg(args, "members")
-                if mem == "@s" or mem is None:
-                    em.java.append('if (executor != null) KfcGen.teamLeave(sb, executor.getNameForScoreboard());')
-                    em.kind = "native"; return True
-                sel = parse_selector(mem)
-                lo = entity_loop_open(sel, "_tmE") if sel else None
-                if lo is None:
-                    em.reason = f"team leave 대상({str(mem)[:20]}) 미지원"; return False
-                em.java.extend(lo)
-                em.java.append('    KfcGen.teamLeave(sb, _tmE.getNameForScoreboard());')
-                em.java.append("}")
-                em.kind = "native"; return True
+                return _fanout_target(
+                    mem or "@s", "_tmE",
+                    lambda e: f'KfcGen.teamLeave(sb, {e}.getNameForScoreboard());',
+                    em, "team leave")
             em.reason = f"team {verb} (1차 미지원)"; return False
         em.reason = f"team {verb} 미지원"; return False
 
@@ -1980,22 +2011,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         if "everything" in nn:
             tgt = first_arg(args, "targets") or "@s"
             grant = "true" if verb == "grant" else "false"
-            if tgt == "@s":
-                em.java.append(f'KfcGen.advancementAll(server, executor, {grant});')
-                em.kind = "native"; return True
-            sel = parse_selector(tgt)
-            lo = entity_loop_open(sel, "_aae") if sel else None
-            if lo is None:
-                ent = single_entity_expr(tgt)
-                if ent is None:
-                    em.reason = f"advancement everything 대상({tgt[:20]}) 미지원"; return False
-                em.java.append(f'{{ net.minecraft.entity.Entity _aae = {ent};'
-                               f' if (_aae != null) KfcGen.advancementAll(server, _aae, {grant}); }}')
-                em.kind = "native"; return True
-            em.java.extend(lo)
-            em.java.append(f'    KfcGen.advancementAll(server, _aae, {grant});')
-            em.java.append("}")
-            em.kind = "native"; return True
+            return _fanout_target(
+                tgt, "_aae",
+                lambda e: f'KfcGen.advancementAll(server, {e}, {grant});',
+                em, "advancement everything")
         if "only" not in nn:
             scope = next((s for s in ("from", "through", "until") if s in nn), "?")
             em.reason = f"advancement {verb} {scope} (범위 1차 미지원)"; return False
@@ -2004,22 +2023,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         grant = "true" if verb == "grant" else "false"
         if not advid:
             em.reason = "advancement id 없음"; return False
-        if tgt == "@s":
-            em.java.append(f'KfcGen.advancement(server, executor, {jstr(advid)}, {grant});')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        lo = entity_loop_open(sel, "_ae") if sel else None
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"advancement 대상({tgt[:20]}) 미지원"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _ae = {ent};'
-                           f' if (_ae != null) KfcGen.advancement(server, _ae, {jstr(advid)}, {grant}); }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        em.java.append(f'    KfcGen.advancement(server, _ae, {jstr(advid)}, {grant});')
-        em.java.append("}")
-        em.kind = "native"; return True
+        return _fanout_target(
+            tgt, "_ae",
+            lambda e: f'KfcGen.advancement(server, {e}, {jstr(advid)}, {grant});',
+            em, "advancement")
 
     if command == "recipe":
         verb = nn[1] if len(nn) > 1 else None
@@ -2031,25 +2038,11 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             em.reason = "recipe id 없음"; return False
         unlock = "true" if verb == "give" else "false"
         rj = "null" if rec == "*" else jstr(rec)
-        if tgt == "@s":
-            em.java.append(f'if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
-                           f' KfcGen.recipe(server, _rp, {rj}, {unlock});')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        lo = entity_loop_open(sel, "_re") if sel else None
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"recipe 대상({tgt[:20]}) 미지원"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _re = {ent};'
-                           f' if (_re instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
-                           f' KfcGen.recipe(server, _rp, {rj}, {unlock}); }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        em.java.append(f'    if (_re instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
-                       f' KfcGen.recipe(server, _rp, {rj}, {unlock});')
-        em.java.append("}")
-        em.kind = "native"; return True
+        return _fanout_target(
+            tgt, "_re",
+            lambda e: (f'if ({e} instanceof net.minecraft.server.network.ServerPlayerEntity _rp)'
+                       f' KfcGen.recipe(server, _rp, {rj}, {unlock});'),
+            em, "recipe")
 
     if command == "clear":
         tgt = first_arg(args, "targets") or "@s"
@@ -2062,22 +2055,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         cd = "null" if cdata is None else jstr(cdata)
         mc = "-1" if maxc is None else jint(maxc)
         iid_j = "null" if iid == "*" else jstr(iid)
-        if tgt == "@s":
-            em.java.append(f'if (executor != null) KfcGen.clearItems(executor, {iid_j}, {cd}, {mc});')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        lo = entity_loop_open(sel, "_clE") if sel else None
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"clear 대상({tgt[:20]}) 미지원"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _clE = {ent};'
-                           f' if (_clE != null) KfcGen.clearItems(_clE, {iid_j}, {cd}, {mc}); }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        em.java.append(f'    KfcGen.clearItems(_clE, {iid_j}, {cd}, {mc});')
-        em.java.append("}")
-        em.kind = "native"; return True
+        return _fanout_target(
+            tgt, "_clE",
+            lambda e: f'KfcGen.clearItems({e}, {iid_j}, {cd}, {mc});',
+            em, "clear")
 
     if command == "item":
         verb = nn[1] if len(nn) > 1 else None
@@ -2166,22 +2147,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                                   f' if (_isrc != null) KfcGen.itemReplaceFrom({e}, {jstr(slot)}, _isrc, {jstr(srcslot)}); }}')
         else:
             em.reason = "item replace 형식 미지원"; return False
-        # 타겟 해소: @s / 단일 / 루프
-        if tgt == "@s":
-            em.java.append(f'if (executor != null) {body("executor")}')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        lo = entity_loop_open(sel, "_it") if sel else None
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"item replace 대상({tgt[:20]}) 미지원"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _it = {ent}; if (_it != null) {body("_it")} }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        em.java.append(f'    {body("_it")}')
-        em.java.append("}")
-        em.kind = "native"; return True
+        # 타겟 해소: @s / 단일 / 루프 (공통 헬퍼)
+        return _fanout_target(tgt, "_it", body, em, "item replace")
 
     if command == "clone":
         b = first_arg(args, "begin"); e = first_arg(args, "end"); d = first_arg(args, "destination")
@@ -2318,25 +2285,11 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             if not players:
                 em.reason = "loot give players 없음"
                 return False
-            ent = single_entity_expr(players)
-            em.java.append(f"{{ {loot_decl}")
-            if ent is not None:  # @p/@n/@s/limit=1 -> 단일
-                em.java.append(f"  net.minecraft.entity.Entity _ge = {ent};")
-                em.java.append("  if (_ge instanceof net.minecraft.server.network.ServerPlayerEntity _gp)"
-                               " KfcGen.lootGive(_loot, java.util.List.of(_gp));")
-            else:
-                sel = parse_selector(players)
-                lo = entity_loop_open(sel, "_ge") if sel else None
-                if lo is None:
-                    em.reason = f"loot give 대상({str(players)[:20]}) 미지원"
-                    return False
-                em.java.extend(lo)
-                em.java.append("    if (_ge instanceof net.minecraft.server.network.ServerPlayerEntity _gp)"
-                               " KfcGen.lootGive(_loot, java.util.List.of(_gp));")
-                em.java.append("}")
-            em.java.append("}")
-            em.kind = "native"
-            return True
+            return _loot_fanout(
+                players, "_ge",
+                lambda e: (f"if ({e} instanceof net.minecraft.server.network.ServerPlayerEntity _gp)"
+                           f" KfcGen.lootGive(_loot, java.util.List.of(_gp));"),
+                em, "loot give", loot_decl)
 
         if tk == "replace":
             sub = target_nodes[1] if len(target_nodes) > 1 else None
@@ -2348,23 +2301,10 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             cnt_arg = cnt if cnt is not None else "-1"
             if sub == "entity":
                 ents = sect(target_nodes, "entities")
-                ent = single_entity_expr(ents) if ents else None
-                em.java.append(f"{{ {loot_decl}")
-                if ent is not None:  # @n/@p/@s/limit=1 -> 단일
-                    em.java.append(f"  net.minecraft.entity.Entity _le = {ent};")
-                    em.java.append(f"  if (_le != null) KfcGen.lootReplaceEntity(_le, {jstr(slot)}, {cnt_arg}, _loot);")
-                else:
-                    sel = parse_selector(ents) if ents else None
-                    lo = entity_loop_open(sel, "_le") if sel else None
-                    if lo is None:
-                        em.reason = f"loot replace entity 대상({str(ents)[:20]}) 미지원"
-                        return False
-                    em.java.extend(lo)
-                    em.java.append(f"    KfcGen.lootReplaceEntity(_le, {jstr(slot)}, {cnt_arg}, _loot);")
-                    em.java.append("}")
-                em.java.append("}")
-                em.kind = "native"
-                return True
+                return _loot_fanout(
+                    ents, "_le",
+                    lambda e: f"if ({e} != null) KfcGen.lootReplaceEntity({e}, {jstr(slot)}, {cnt_arg}, _loot);",
+                    em, "loot replace entity", loot_decl)
             if sub == "block":
                 bpos = sect(target_nodes, "pos")
                 bpe = cond_pos_expr(bpos) if bpos else None
@@ -3345,21 +3285,7 @@ def emit_damage(nn: list[str], args: dict, em: Emitted) -> bool:
     dtype = first_arg(args, "damageType")
     tj = "null" if dtype is None else jstr(str(dtype))
     body = lambda exp: f"KfcGen.applyDamage({exp}, source.getWorld(), {amount}f, {tj});"
-    if tgt == "@s":
-        em.java.append(f'if (executor != null) {body("executor")}')
-        em.kind = "native"; return True
-    sel = parse_selector(tgt)
-    lo = entity_loop_open(sel, "_dmgE") if sel else None
-    if lo is None:
-        ent = single_entity_expr(tgt)
-        if ent is None:
-            em.reason = f"damage 대상({tgt[:20]}) 미해소"; return False
-        em.java.append(f'{{ net.minecraft.entity.Entity _dmgE = {ent}; if (_dmgE != null) {body("_dmgE")} }}')
-        em.kind = "native"; return True
-    em.java.extend(lo)
-    em.java.append(f'    {body("_dmgE")}')
-    em.java.append("}")
-    em.kind = "native"; return True
+    return _fanout_target(tgt, "_dmgE", body, em, "damage")
 
 
 def emit_trigger(nn: list[str], args: dict, em: Emitted) -> bool:
@@ -3412,39 +3338,11 @@ def emit_give(nn: list[str], args: dict, em: Emitted) -> bool:
         ij = jstr(item)
         callc = (lambda p: f'if ({p} instanceof net.minecraft.server.network.ServerPlayerEntity _gp) '
                            f'KfcGen.giveItemString(source, _gp, {ij}, {cj});')
-        if tgt == "@s":
-            em.java.append(f'if (executor != null) {{ {callc("executor")} }}')
-            em.kind = "native"; return True
-        sel = parse_selector(tgt)
-        lo = entity_loop_open(sel, "_gE") if sel else None
-        if lo is None:
-            ent = single_entity_expr(tgt)
-            if ent is None:
-                em.reason = f"give 대상({tgt[:20]}) 미해소"; return False
-            em.java.append(f'{{ net.minecraft.entity.Entity _gE = {ent}; if (_gE != null) {{ {callc("_gE")} }} }}')
-            em.kind = "native"; return True
-        em.java.extend(lo)
-        em.java.append(f'    {callc("_gE")}')
-        em.java.append("}")
-        em.kind = "native"; return True
+        return _fanout_target(tgt, "_gE", callc, em, "give")
     ij = jstr(item)
     call = (lambda p: f'if ({p} instanceof net.minecraft.server.network.ServerPlayerEntity _gp) '
                       f'KfcGen.giveItem(_gp, {ij}, {cj});')
-    if tgt == "@s":
-        em.java.append(f'if (executor != null) {{ {call("executor")} }}')
-        em.kind = "native"; return True
-    sel = parse_selector(tgt)
-    lo = entity_loop_open(sel, "_gE") if sel else None
-    if lo is None:
-        ent = single_entity_expr(tgt)
-        if ent is None:
-            em.reason = f"give 대상({tgt[:20]}) 미해소"; return False
-        em.java.append(f'{{ net.minecraft.entity.Entity _gE = {ent}; if (_gE != null) {{ {call("_gE")} }} }}')
-        em.kind = "native"; return True
-    em.java.extend(lo)
-    em.java.append(f'    {call("_gE")}')
-    em.java.append("}")
-    em.kind = "native"; return True
+    return _fanout_target(tgt, "_gE", call, em, "give")
 
 
 def emit_gamerule(nn: list[str], args: dict, em: Emitted) -> bool:

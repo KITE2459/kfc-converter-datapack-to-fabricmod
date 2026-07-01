@@ -1010,10 +1010,20 @@ public final class KfcGen {
     }
 
     public static void killEntity(net.minecraft.entity.Entity e) {
-        if (e != null && !(e instanceof net.minecraft.server.network.ServerPlayerEntity)) {
-            e.discard();
-            snapRemove(e);
-        }
+        if (e == null) return;
+        // 바닐라 KillCommand 는 대상 전원(플레이어 포함)에 entity.kill(world) 를 호출한다.
+        //   - LivingEntity.kill : damage(world, genericKill(), MAX) → 실제 사망 처리
+        //                         (드롭 / 사망 사운드·파티클 / advancement / "~가 죽었습니다" / death event)
+        //   - Entity.kill(기본) : remove(RemovalReason.KILLED) + ENTITY_DIE 게임이벤트
+        // 기존 discard() 는 단순 despawn(사망 이벤트·드롭 없음)이고 플레이어를 통째로 무시해
+        // 바닐라와 시맨틱이 달랐다.
+        if (!(e.getWorld() instanceof net.minecraft.server.world.ServerWorld sw)) return;
+        e.kill(sw);
+        // 생물은 death 처리(실제 제거는 이후) → death 프레임 동안 셀렉터에 잡히는 바닐라 동작을
+        // 위해 스냅샷을 건드리지 않고 틱 경계 재수집(entitiesSnapshot)에 맡긴다.
+        if (e instanceof net.minecraft.entity.LivingEntity) return;
+        // 비생물은 remove(KILLED) 로 즉시 제거되므로 스냅샷/버킷에서 즉시 뺀다.
+        snapRemove(e);
     }
 
     // ── time / weather (월드 상태) ──

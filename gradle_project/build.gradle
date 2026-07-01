@@ -224,10 +224,9 @@ tasks.register('convert') {
     dependsOn 'kfcGenerate'
 }
 
-tasks.named('jar') {
-    entryCompression = ZipEntryCompression.STORED
-}
-
-tasks.named('remapJar') {
-    entryCompression = ZipEntryCompression.STORED
+// 초대형 팩: 생성 클래스 수가 65,535개를 넘으면 표준 ZIP 엔트리 한계를 초과해
+// `jar`/`remapJar` 태스크가 "Archive contains more than 65535 entries" 로 실패한다.
+// 모든 아카이브 태스크에 ZIP64 확장을 켜 엔트리/용량 한계를 제거한다(JVM 7+ 가 정상 로드).
+tasks.withType(AbstractArchiveTask).configureEach {
+    zip64 = true
 }

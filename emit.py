@@ -6157,7 +6157,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         # box 오버로드로 섹션순을 맞춘다(SET 동일, 순서만 바닐라화; limit 없으면 SET 무관이라 유지).
         _has_max = sel.distance is not None and sel.distance[1] is not None
         if lim and _has_max:
-            out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]}, "
+            out.append(f"for (Entity e : KfcGen.entitiesByTypeBox(ctx, {jtypes[0]}, "
                        f"KfcGen.rangeBox({pre_src}.getPosition(), {_dist_arg(sel.distance[1])}),")
             out.append(f"        en -> {filt})) {{")
         else:

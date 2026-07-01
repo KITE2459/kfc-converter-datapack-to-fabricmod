@@ -195,6 +195,20 @@ public final class KfcGen {
         return b == null ? java.util.Collections.emptyList() : b;
     }
 
+    // ── Sepals(Catheter) 호환 타입-박스 질의 ──
+    // world.getEntitiesByType(TypeFilter, box, pred) 는 바닐라에선 섹션 타입 인덱스로 안전하지만,
+    // Sepals-fabric 은 이를 Catheter 로 재구현하며 '박스 내 엔티티를 질의 타입으로 캐스팅' 한다.
+    // 그래서 혼합 타입 박스 — 예: rectangle-hitbox/calc 가 area_effect_cloud 꼭짓점과 같은 2.6블록
+    // 반경에 있는 text_display 카트를 함께 담는 박스 — 에서 TextDisplayEntity→AreaEffectCloudEntity
+    // (class_8113$class_8123 → class_1295) ClassCastException 으로 크래시하거나 부분 결과를 반환한다.
+    // getOtherEntities 는 Predicate<Entity> 기반이라 타입 캐스팅이 없어 Sepals 에서도 안전하며,
+    // 타입 검사를 술어 안에서 수행하므로 결과 집합/의미는 getEntitiesByType(type, box, pred) 와 동일하다.
+    public static java.util.List<net.minecraft.entity.Entity> entitiesByTypeBox(
+            GameContext ctx, net.minecraft.entity.EntityType<?> t, net.minecraft.util.math.Box box,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        return ctx.world.getOtherEntities(null, box, e -> e.getType() == t && pred.test(e));
+    }
+
     /** 네이티브화하지 못한 명령을 런타임에 1회 파싱·실행하는 브릿지 폴백. */
     /** caret(^) 로컬좌표 → 절대좌표. 마크 LocalCoordinates 공식 그대로.
      *  rot: Vec2f(x=pitch, y=yaw). (x,y,z) = (^left, ^up, ^forward). */
@@ -2635,7 +2649,7 @@ public final class KfcGen {
                                     double minDist, double maxDist) {
         // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
         if (QUERY_BOX && origin != null && maxDist >= 0) {
-            return !ctx.world.getEntitiesByType(type, rangeBox(origin, maxDist),
+            return !entitiesByTypeBox(ctx, type, rangeBox(origin, maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
@@ -2689,7 +2703,7 @@ public final class KfcGen {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
             net.minecraft.util.math.Box _bx = rangeBox(origin, maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
-                for (net.minecraft.entity.Entity e : ctx.world.getEntitiesByType(t, _bx,
+                for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
                         en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                     double d = e.getPos().squaredDistanceTo(origin);
                     if (d < bestD) { bestD = d; best = e; }
@@ -2785,7 +2799,7 @@ public final class KfcGen {
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
-                out.addAll(ctx.world.getEntitiesByType(t, rangeBox(origin, maxDist),
+                out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
                         en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
                 out.addAll(ctx.world.getEntitiesByType(t,
@@ -2897,7 +2911,7 @@ public final class KfcGen {
                                     String[] tagsPos, String[] tagsNeg,
                                     double minDist, double maxDist) {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
-            return !ctx.world.getEntitiesByType(type, rangeBox(origin.getPos(), maxDist),
+            return !entitiesByTypeBox(ctx, type, rangeBox(origin.getPos(), maxDist),
                     en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
@@ -3034,7 +3048,7 @@ public final class KfcGen {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
             net.minecraft.util.math.Box _bx = rangeBox(origin.getPos(), maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
-                for (net.minecraft.entity.Entity e : ctx.world.getEntitiesByType(t, _bx,
+                for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
                         en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                     double d = origin.squaredDistanceTo(e);
                     if (d < bestD) { bestD = d; best = e; }
@@ -3234,7 +3248,7 @@ public final class KfcGen {
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
-                out.addAll(ctx.world.getEntitiesByType(t, rangeBox(origin.getPos(), maxDist),
+                out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin.getPos(), maxDist),
                         en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
                 out.addAll(ctx.world.getEntitiesByType(t,

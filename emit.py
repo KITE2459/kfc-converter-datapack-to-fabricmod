@@ -247,6 +247,16 @@ def box_origin_expr(sel, src_var: str) -> str:
     return f"{src_var}.getPosition()"
 
 
+def _volume_cond(sel, var: str, src_var: str = "source") -> str | None:
+    """볼륨 셀렉터(@x[x,y,z,dx,dy,dz])의 posInBox 조건식. 볼륨 없으면 None.
+       모든 셀렉터 소비 경로(루프 가드/존재검사/명령 대상)에서 박스 필터가 누락되지
+       않도록 공통 사용한다. 누락 시 박스 밖 대상까지 명령이 적용돼 바닐라와 어긋난다."""
+    if sel.volume is None:
+        return None
+    dx, dy, dz = sel.volume
+    return f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, {var})'
+
+
 def _split_commas_depth0(s: str) -> list:
     out, depth, buf = [], 0, ""
     for ch in s:
@@ -817,7 +827,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc)}))' 
     if sel.scores and sel.base != "s":
         # @e/@n + scores 1개: anyEntityScored 로 지원 (rectangle-hitbox/calc 의 #crashed 판정 등).
-        if sel.base in ("e", "n") and len(sel.scores) == 1 and not sel.predicates:
+        if sel.base in ("e", "n") and len(sel.scores) == 1 and not sel.predicates and sel.volume is None:
             jt = resolve_entity_types(sel)
             if jt is None:
                 return _selector_cond_general(sel, src_var)
@@ -875,6 +885,8 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             lo, hi = sel.distance
             parts.append(f'KfcGen.posInRange({src_var}.getPosition(), executor.getPos(), '
                          f'{_dist_arg(lo)}, {_dist_arg(hi)})')
+        _vc = _volume_cond(sel, "executor", src_var)
+        if _vc: parts.append(_vc)
         if not parts:
             return "(executor != null)"
         return "(executor != null && " + " && ".join(parts) + ")"
@@ -901,6 +913,8 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
                 return _selector_cond_general(sel, src_var)
             tagconds = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
             tagconds += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            _vc = _volume_cond(sel, "_pe", src_var)
+            if _vc: tagconds.append(_vc)
             lo3, hi3 = sel.distance if sel.distance else (None, None)
             if lo3 is not None or hi3 is not None:
                 tagconds.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
@@ -933,6 +947,8 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
                 dl, dh = sel.distance
                 pc.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
                           f'{_dist_arg(dl)}, {_dist_arg(dh)})')
+            _vc = _volume_cond(sel, "_pe", src_var)
+            if _vc: pc.append(_vc)
             if sel.gamemode is not None:
                 ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
                 pc.append(f'!({ge})' if sel.gamemode_neg else ge)
@@ -1661,6 +1677,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             # @s / @s[tag/score/predicate]: 실행자 자신을 (필터 만족 시) 제거.
             conds = [f'executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
             conds += [f'!executor.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            _vc = _volume_cond(sel, "executor")
+            if _vc: conds.append(_vc)
             for o2, (slo, shi) in (sel.scores or {}).items():
                 slo_j = _scbound(slo, "Integer.MIN_VALUE")
                 shi_j = _scbound(shi, "Integer.MAX_VALUE")
@@ -2523,6 +2541,8 @@ def emit_tellraw_title(nn, args, em, cmd):
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _tp : ctx.allPlayers) {")
     conds = [f'_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
     conds += [f'!_tp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    _vc = _volume_cond(sel, "_tp")
+    if _vc: conds.append(_vc)
     conds += _player_guards("_tp")
     conds += _selector_extra_conds(sel, "_tp")
     if sel.distance:
@@ -2790,6 +2810,8 @@ def emit_stopsound(nn: list[str], args: dict, em: Emitted) -> bool:
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _sp : ctx.allPlayers) {")
     conds = [f'_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
     conds += [f'!_sp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    _vc = _volume_cond(sel, "_sp")
+    if _vc: conds.append(_vc)
     if conds:
         em.java.append(f'    if (!({" && ".join(conds)})) continue;')
     em.java.append("    " + call)
@@ -2830,6 +2852,8 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
     conds = [f'_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
     conds += [f'!_ps.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+    _vc = _volume_cond(sel, "_ps")
+    if _vc: conds.append(_vc)
     if conds:
         em.java.append(f'    if (!({" && ".join(conds)})) continue;')
     em.java.append("    " + call)
@@ -2927,6 +2951,12 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
             dlo, dhi = sel.distance
             conds.append(f'KfcGen.posInRange(source.getPosition(), _t.getPos(), '
                          f'{_dist_arg(dlo)}, {_dist_arg(dhi)})')
+        if sel.volume is not None:
+            # 볼륨 셀렉터 @a[x,y,z,dx,dy,dz] — 박스 밖 플레이어를 걸러야 한다. 이 조건이
+            # 빠지면 tag @a[box] add 가 전체 플레이어에 태그를 부여해(예: multi-hub-player
+            # 회수 실패 → 방장 미이양) 바닐라와 어긋난다.
+            dx, dy, dz = sel.volume
+            conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, {dx}, {dy}, {dz}, _t)')
         if sel.gamemode is not None:
             gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
             conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
@@ -2996,6 +3026,12 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         else:
             _q = f'KfcGen.allEntitiesAny(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
     em.java.append(f'for (net.minecraft.entity.Entity _t : {_q}) {{')
+    if sel.volume is not None:
+        # 볼륨 셀렉터 @e[x,y,z,dx,dy,dz] — 박스 밖 엔티티 제외(누락 시 전체 대상이 됨).
+        # (limit+volume 은 현행 팩에 없음; 있으면 별도로 수집 시점 필터가 필요.)
+        _vdx, _vdy, _vdz = sel.volume
+        em.java.append(f'    if (!KfcGen.posInBox({box_origin_expr(sel, "source")}, '
+                       f'{_vdx}, {_vdy}, {_vdz}, _t)) continue;')
     if runtime_type_tag is not None and not _lambda_consumed:
         tid, tneg = runtime_type_tag
         chk = f'KfcGen.entityInTypeTag(_t, {jstr(tid)})'
@@ -3536,6 +3572,8 @@ def bossbar_player_collection(sel_raw: str, var: str):
         lines.append(f'for (net.minecraft.server.network.ServerPlayerEntity _pp : ctx.allPlayers) {{')
         conds = [f'_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
         conds += [f'!_pp.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+        _vc = _volume_cond(sel, "_pp")
+        if _vc: conds.append(_vc)
         if sel.predicates:
             conds += predicate_guards(sel.predicates, "_pp", player=True)
         conds += _score_guards()
@@ -3798,6 +3836,8 @@ def emit_scoreboard(sub: str, args: dict, em: Emitted) -> bool:
             em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _t : ctx.allPlayers) {")
             conds = [f'_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
             conds += [f'!_t.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
+            _vc = _volume_cond(sel, "_t")
+            if _vc: conds.append(_vc)
             conds += _selector_extra_conds(sel, "_t")
             if conds:
                 em.java.append(f'    if (!({" && ".join(conds)})) continue;')
@@ -4060,6 +4100,8 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
                 body = [f'for (net.minecraft.server.network.ServerPlayerEntity _od : ctx.allPlayers) {{']
                 cs = [f'_od.getCommandTags().contains({jstr(t)})' for t in dsel.tags_pos]
                 cs += [f'!_od.getCommandTags().contains({jstr(t)})' for t in dsel.tags_neg]
+                _vc = _volume_cond(dsel, "_od")
+                if _vc: cs.append(_vc)
                 if cs:
                     body.append(f'    if (!({" && ".join(cs)})) continue;')
             elif lo is not None:
@@ -6971,6 +7013,8 @@ def single_entity_expr(raw: str) -> str | None:
         if rc2 is None:
             return None
         guards.extend(rc2)
+        _vc = _volume_cond(sel, "executor")
+        if _vc: guards.append(_vc)
         if sel.distance is not None:
             return None  # @s 에 distance 는 무의미/특이 - 미지원
         if not guards:
@@ -6988,7 +7032,7 @@ def single_entity_expr(raw: str) -> str | None:
         # @a[limit=1] 은 sort=arbitrary(위치 무관, 첫 매치) — @p(nearest)와 다르다.
         # 순위 판정처럼 '고정 기준점' 이 필요한 알고리즘에서 nearest 로 바꾸면 기준이 흔들린다.
         _is_arbitrary = (sel.base == "a")
-        if sel.gamemode is not None or sel.scores or sel.predicates or sel.x_rotation or sel.y_rotation:
+        if sel.gamemode is not None or sel.scores or sel.predicates or sel.x_rotation or sel.y_rotation or sel.volume is not None:
             pc = [f'_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_pos]
             pc += [f'!_pe.getCommandTags().contains({jstr(t)})' for t in sel.tags_neg]
             if sel.gamemode is not None:
@@ -7011,6 +7055,8 @@ def single_entity_expr(raw: str) -> str | None:
                 dl5, dh5 = sel.distance
                 pc.append(f'KfcGen.posInRange(source.getPosition(), _pe.getPos(), '
                           f'{_dist_arg(dl5)}, {_dist_arg(dh5)})')
+            _vc = _volume_cond(sel, "_pe")
+            if _vc: pc.append(_vc)
             body5 = " && ".join(pc) if pc else "true"
             if _is_arbitrary:
                 return f'KfcGen.firstPlayerWhere(ctx, _pe -> ({body5}))'
@@ -7050,6 +7096,8 @@ def single_entity_expr(raw: str) -> str | None:
                 if pge is None:
                     return None
                 extra += pge
+            _vc = _volume_cond(sel, "_ee")
+            if _vc: extra.append(_vc)
             body6 = " && ".join(extra) if extra else "true"
             return (f'KfcGen.nearestEntityAnyTypeWhere(ctx, source.getPosition(), {tp}, {tn}, '
                     f'{dmin}, {dmax}, _ee -> ({body6}))')
@@ -7070,6 +7118,8 @@ def single_entity_expr(raw: str) -> str | None:
             if pge is None:
                 return None
             ec += pge
+        _vc = _volume_cond(sel, "_ee")
+        if _vc: ec.append(_vc)
         if ec:
             return (f'KfcGen.nearestEntityWhere(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
                     f'{dmin}, {dmax}, _ee -> ({" && ".join(ec)}))')
@@ -7341,7 +7391,9 @@ def emit_macro(obj: dict, em: Emitted) -> Emitted:
 
 def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
     """수치 매크로 파싱(Integer/Double/Float.parse*(...macroArgs.get...))을 포함한 자바 문장을
-       try-catch(NumberFormatException) 로 감싸, 빈/비수치 인자일 때 그 줄만 스킵한다.
+       try-catch 로 감싸, 빈/비수치/null 인자일 때 그 줄만 스킵한다.
+       (Integer.parseInt(null)->NumberFormatException, Double/Float.parseXxx(null)->NullPointerException
+        이므로 둘 다 잡아야 double/float 매크로 인자 null 시 서버 크래시를 막을 수 있다.)
        단, 변수 선언문(`Type var = expr;`)은 그 변수가 이후 줄에서 참조될 수 있으므로
        선언을 try 밖으로 빼고 할당만 try 안에서 한다(스코프 보존)."""
     out = []
@@ -7359,14 +7411,14 @@ def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
                 indent = s[:len(s) - len(s.lstrip())]
                 cvar = f"_mcond{_uid()}"
                 out.append(f'{indent}boolean {cvar} = false;'
-                           f' try {{ {cvar} = ({mif.group(1)}); }} catch (NumberFormatException _nfe) {{}}')
+                           f' try {{ {cvar} = ({mif.group(1)}); }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
                 out.append(f'{indent}if ({cvar}) {{')
                 continue
             # 한 줄에서 완결된 블록(`{ ...; }` — 여는/닫는 중괄호 수 균형)은 통째로 감싸도
             # 중괄호 짝이 유지된다. 균형이 안 맞으면(블록이 다음 줄로 이어짐) 감싸지 않는다.
             if st.count("{") == st.count("}") and st.endswith("}"):
                 indent = s[:len(s) - len(s.lstrip())]
-                out.append(f'{indent}try {{ {st} }} catch (NumberFormatException _nfe) {{}}')
+                out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
                 continue
             out.append(s)
             continue
@@ -7379,11 +7431,11 @@ def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
                 default = "0" if jtype in ("int", "long", "short", "byte") else (
                     "0.0" if jtype in ("double", "float") else "null")
                 out.append(f'{indent}{jtype} {name} = {default};'
-                           f' try {{ {name} = {expr}; }} catch (NumberFormatException _nfe) {{}}')
+                           f' try {{ {name} = {expr}; }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
                 continue
         # 단순 문장(세미콜론 종료, 중괄호 없음)만 통째로 감싼다.
         if st.endswith(";"):
-            out.append(f'{indent}try {{ {st} }} catch (NumberFormatException _nfe) {{}}')
+            out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
         else:
             out.append(s)
     return out

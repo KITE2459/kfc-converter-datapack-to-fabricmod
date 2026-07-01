@@ -390,13 +390,14 @@ public final class ParseDumper implements ModInitializer {
                 replaceVarsAll(line, "0"),              // 정수
                 replaceVarsAll(line, "0.0001"),         // 실수
                 replaceVarsAll(line, "\"MACROVAR\""),   // 문자열
+                replaceVarsAll(line, "minecraft:stone"),// 블록/아이템 id 자리(setblock/fill/give 등)
         };
     }
 
     private static String tryBacktrack(
             CommandDispatcher<ServerCommandSource> dispatcher, ServerCommandSource src,
             String line, List<String> distinctVars) {
-        String[] cands = {"0", "0.0001", "\"MACROVAR\"", "MACROVARID"};
+        String[] cands = {"0", "0.0001", "\"MACROVAR\"", "MACROVARID", "minecraft:stone"};
         int n = distinctVars.size();
         if (n == 0 || n > 4) return null;
         int total = 1;

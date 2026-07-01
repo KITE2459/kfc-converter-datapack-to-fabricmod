@@ -3360,12 +3360,27 @@ public final class KfcGen {
             if (s != null && s.age == e.age && s.gen == ENTITY_GEN) return s.nbt;
             net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(n);
+            _addSelectedItem(e, n);
             ENTITY_NBT_SNAP.put(e, new NbtSnap(n, e.age, ENTITY_GEN));
             return n;
         }
         net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(n);
+        _addSelectedItem(e, n);
         return n;
+    }
+
+    /** 바닐라 NbtPredicate.entityToNbt 동등: 플레이어는 writeNbt 후 선택 슬롯의 아이템을
+     *  'SelectedItem' 키로 추가한다. data get / with entity @s SelectedItem 이 이 필드에
+     *  의존하는데(writeNbt 에는 SelectedItemSlot 슬롯번호만 있고 아이템 자체는 없음),
+     *  이게 없으면 매크로 인자 $(id) 등이 비어 폴백 함수(예: 커스텀 모델 건축의 $setblock $(id))가
+     *  빈 블록을 놓아 실패한다. */
+    private static void _addSelectedItem(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound n) {
+        if (e instanceof net.minecraft.entity.player.PlayerEntity _p) {
+            net.minecraft.item.ItemStack _sel = _p.getInventory().getSelectedStack();
+            if (!_sel.isEmpty())
+                n.put("SelectedItem", _sel.toNbt(e.getRegistryManager()));
+        }
     }
 
     /** 엔티티 NBT 를 바꾸는 쓰기 직후 스냅샷 무효화(write-through). */

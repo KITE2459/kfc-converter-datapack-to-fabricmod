@@ -1664,14 +1664,15 @@ public final class KfcGen {
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
     /** tp <targets> $(dest) — 매크로 목적지 런타임 파싱. 바닐라는 치환 후 재파싱하므로
-     *  좌표 3토큰(절대/~상대) 형식을 지원한다. 절대 x/z 가 소수점 없는 정수면 바닐라 좌표
-     *  파서의 블록 센터링(+0.5) 을 적용. 파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등).
-     *  (단일 토큰=엔티티 이름 목적지는 이 팩에서 미사용 — 스킵) */
+     *  `x y z`(3토큰) 또는 `x y z yaw pitch`(5토큰) 를 지원한다(kartall 트랙 pos 는 5토큰:
+     *  "-1000 31 1000 0 0"). 좌표는 절대/~상대, 절대 x/z 가 소수점 없는 정수면 바닐라 좌표
+     *  파서의 블록 센터링(+0.5). 회전은 절대/~상대(source 회전 기준 — 바닐라 RotationArgument).
+     *  파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등). */
     public static void tpMacroDest(net.minecraft.server.command.ServerCommandSource source,
                                    net.minecraft.entity.Entity t, String dest) {
         if (t == null || dest == null) return;
         String[] p = dest.trim().split("\\s+");
-        if (p.length != 3) return;
+        if (p.length != 3 && p.length != 5) return;
         net.minecraft.util.math.Vec3d base = source.getPosition();
         double[] c = new double[3];
         for (int i = 0; i < 3; i++) {
@@ -1687,7 +1688,19 @@ public final class KfcGen {
                 }
             } catch (NumberFormatException ex) { return; }
         }
-        teleportToWithRot(t, c[0], c[1], c[2], t.getYaw(), t.getPitch());
+        float yaw = t.getYaw(), pitch = t.getPitch();
+        if (p.length == 5) {
+            net.minecraft.util.math.Vec2f rot = source.getRotation();   // ~회전은 source 기준(바닐라)
+            try {
+                yaw   = p[3].equals("~") ? rot.y
+                        : p[3].startsWith("~") ? rot.y + Float.parseFloat(p[3].substring(1))
+                        : Float.parseFloat(p[3]);
+                pitch = p[4].equals("~") ? rot.x
+                        : p[4].startsWith("~") ? rot.x + Float.parseFloat(p[4].substring(1))
+                        : Float.parseFloat(p[4]);
+            } catch (NumberFormatException ex) { return; }
+        }
+        teleportToWithRot(t, c[0], c[1], c[2], yaw, pitch);
     }
 
     /** store ← forceload add|remove <from> [<to>] 의 결과값: 상태가 실제 바뀐 청크 수.

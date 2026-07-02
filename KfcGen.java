@@ -2305,6 +2305,25 @@ public final class KfcGen {
         instantExecuteFunction(source, functionId, null);
     }
 
+    /** 브릿지 폴백에서 mcfunction 매크로에 넘길 NbtCompound 를 만든다.
+     *  SnapMacroArgs(= `with entity/storage/block <path>` 로 만든 인자)면 바인드 시점 원본 타입 NBT 를
+     *  그대로 넘겨, 바닐라 Macro.withMacroReplaced/Macro.toString 이 직접 포맷하게 한다(고증 완전 일치).
+     *  그 외(인라인 {compound} 등에서 온 평문 Map)는 문자열 값을 NbtString 으로 넣는다 — 이 경우
+     *  값이 이미 매크로-포맷 문자열이므로 Macro.toString(NbtString)=원문 그대로여서 동일하다.
+     *  빈/없음이면 null(바닐라: 인자 없는 매크로 호출은 실행 안 함). */
+    private static net.minecraft.nbt.NbtCompound bridgeMacroNbt(java.util.Map<String, String> macroArgs) {
+        if (macroArgs == null || macroArgs.isEmpty()) return null;
+        if (macroArgs instanceof SnapMacroArgs snap) {
+            net.minecraft.nbt.NbtCompound raw = snap.rawArgsCopy();
+            return (raw == null || raw.isEmpty()) ? null : raw;
+        }
+        net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
+        for (java.util.Map.Entry<String, String> e : macroArgs.entrySet()) {
+            nbt.putString(e.getKey(), e.getValue());
+        }
+        return nbt;
+    }
+
     /** 단일 바닐라 명령을 서버 디스패처로 그대로 실행(100% 바닐라 동작).
      *  깔끔한 네이티브 API 가 없거나(예: datapack enable/disable - 리소스 리로드 동반) 드물게만
      *  실행되는 관리 명령용. 함수의 나머지 줄은 네이티브로 유지하면서, 이 한 줄만 디스패처에
@@ -2331,12 +2350,7 @@ public final class KfcGen {
             net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource> fn =
                     manager.getFunction(functionId).orElse(null);
             if (fn == null) { System.err.println("[KFC-BRIDGE-ERROR] function not loaded: " + functionId); return 0; }
-            net.minecraft.nbt.NbtCompound nbt = null;
-            if (macroArgs != null && !macroArgs.isEmpty()) {
-                nbt = new net.minecraft.nbt.NbtCompound();
-                for (java.util.Map.Entry<String, String> e : macroArgs.entrySet())
-                    nbt.putString(e.getKey(), e.getValue());
-            }
+            net.minecraft.nbt.NbtCompound nbt = bridgeMacroNbt(macroArgs);
             net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
             try {
                 procedure = fn.withMacroReplaced(nbt, manager.getDispatcher());
@@ -2381,13 +2395,7 @@ public final class KfcGen {
             net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource> fn =
                     manager.getFunction(functionId).orElse(null);
             if (fn == null) { System.err.println("[KFC-BRIDGE-ERROR] function not loaded: " + functionId); return; }
-            net.minecraft.nbt.NbtCompound nbt = null;
-            if (macroArgs != null && !macroArgs.isEmpty()) {
-                nbt = new net.minecraft.nbt.NbtCompound();
-                for (java.util.Map.Entry<String, String> e : macroArgs.entrySet()) {
-                    nbt.putString(e.getKey(), e.getValue());
-                }
-            }
+            net.minecraft.nbt.NbtCompound nbt = bridgeMacroNbt(macroArgs);
             net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
             try {
                 procedure = fn.withMacroReplaced(nbt, manager.getDispatcher());
@@ -4164,6 +4172,30 @@ public final class KfcGen {
         return e.toString();
     }
 
+    /** 인라인 매크로 인자 값(`function X {k:v,...}` 의 v)을 바닐라와 동일하게 정규화한다.
+     *  바닐라는 라인 치환 후 compound 전체를 SNBT 로 재파싱해 각 값을 NBT 타입으로 만들고,
+     *  매크로 치환 시 Macro.toString(NbtElement) 로 문자열화한다. 이를 그대로 재현:
+     *  바닐라 파서(StringNbtReader)로 파싱 → nbtToMacroString(=Macro.toString 과 관측 동등 증명).
+     *  예: 1.5f→"1.5" · 3s→"3" · 2.0d→"2" · 'red'→red · {'a': 1}→{a:1} (공백/인용 정규화).
+     *  파싱 실패(잘못된 SNBT — 바닐라는 그 라인 인스턴스화 실패로 함수 미실행) → null 반환,
+     *  호출부는 null 이면 함수를 호출하지 않는다(관측상 함수 미실행으로 동일).
+     *  값은 변환 시점 상수+유한한 매크로 체인이므로 캐시(distinct 값당 1회 파싱). */
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> MACRO_NORM_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final String MACRO_NORM_INVALID = new String("\u0000invalid");
+    public static String macroNormalize(String raw) {
+        if (raw == null) return null;
+        String r = MACRO_NORM_CACHE.computeIfAbsent(raw, s -> {
+            try {
+                net.minecraft.nbt.NbtCompound w =
+                        net.minecraft.nbt.StringNbtReader.readCompound("{v:" + s + "}");
+                net.minecraft.nbt.NbtElement v = w.get("v");
+                return v == null ? MACRO_NORM_INVALID : nbtToMacroString(v);
+            } catch (Exception ex) { return MACRO_NORM_INVALID; }
+        });
+        return (r == MACRO_NORM_INVALID) ? null : r;
+    }
+
     /** 매크로 인자 Map — 원본(즉시 전 키 문자열화)과 관측 동등하되, 비싼 값(컴파운드/리스트의 SNBT
      *  toString, 스파크상 nbtToMacroString 22.5k ms)을 실제 참조될 때까지 미룬다.
      *  바인드 시점 스냅샷 보존: 스칼라는 즉시 문자열화, 비스칼라는 그 자리에서 copy(깊은 복사)해 둔다.
@@ -4172,7 +4204,12 @@ public final class KfcGen {
     private static final class SnapMacroArgs extends java.util.AbstractMap<String, String> {
         private final java.util.HashMap<String, String> resolved = new java.util.HashMap<>();
         private final java.util.HashMap<String, net.minecraft.nbt.NbtElement> pending = new java.util.HashMap<>();
+        // 바인드 시점 원본 타입 NBT 스냅샷(깊은 복사). 브릿지 폴백은 이 원본을 바닐라 매크로 엔진
+        // (Macro.withMacroReplaced)에 그대로 넘겨, 우리 문자열화(nbtToMacroString)에 의존하지 않고
+        // 바닐라 자체 Macro.toString 으로 치환한다 → 폴백이 바닐라와 완전 동일(미래 MC 포맷 변화에도 자동 추종).
+        private final net.minecraft.nbt.NbtCompound bindSnapshot;
         SnapMacroArgs(net.minecraft.nbt.NbtCompound c) {
+            this.bindSnapshot = c.copy();
             for (String k : c.getKeys()) {
                 net.minecraft.nbt.NbtElement el = c.get(k);
                 if (el == null) continue;
@@ -4184,6 +4221,8 @@ public final class KfcGen {
                 }
             }
         }
+        /** 브릿지용 — 바인드 시점 원본 타입 NBT 의 복사본. */
+        net.minecraft.nbt.NbtCompound rawArgsCopy() { return bindSnapshot.copy(); }
         @Override public boolean containsKey(Object k) {
             return resolved.containsKey(k) || pending.containsKey(k);
         }

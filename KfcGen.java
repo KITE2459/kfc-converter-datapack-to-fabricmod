@@ -1663,6 +1663,57 @@ public final class KfcGen {
     }
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
+    /** tp <targets> $(dest) — 매크로 목적지 런타임 파싱. 바닐라는 치환 후 재파싱하므로
+     *  좌표 3토큰(절대/~상대) 형식을 지원한다. 절대 x/z 가 소수점 없는 정수면 바닐라 좌표
+     *  파서의 블록 센터링(+0.5) 을 적용. 파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등).
+     *  (단일 토큰=엔티티 이름 목적지는 이 팩에서 미사용 — 스킵) */
+    public static void tpMacroDest(net.minecraft.server.command.ServerCommandSource source,
+                                   net.minecraft.entity.Entity t, String dest) {
+        if (t == null || dest == null) return;
+        String[] p = dest.trim().split("\\s+");
+        if (p.length != 3) return;
+        net.minecraft.util.math.Vec3d base = source.getPosition();
+        double[] c = new double[3];
+        for (int i = 0; i < 3; i++) {
+            String s = p[i];
+            double b = (i == 0 ? base.x : i == 1 ? base.y : base.z);
+            try {
+                if (s.equals("~")) c[i] = b;
+                else if (s.startsWith("~")) c[i] = b + Double.parseDouble(s.substring(1));
+                else {
+                    double v = Double.parseDouble(s);
+                    if (i != 1 && s.indexOf('.') < 0) v += 0.5;   // 정수 x/z 센터링
+                    c[i] = v;
+                }
+            } catch (NumberFormatException ex) { return; }
+        }
+        teleportToWithRot(t, c[0], c[1], c[2], t.getYaw(), t.getPitch());
+    }
+
+    /** store ← forceload add|remove <from> [<to>] 의 결과값: 상태가 실제 바뀐 청크 수.
+     *  바닐라 ForceLoadCommand.executeChange: 블록좌표→섹션좌표(getSectionCoord=floor>>4) 범위 루프,
+     *  setChunkForced 가 true 반환한 수 = result. 0 이면 'failed' 예외(store→0) — 반환 0 과 동일.
+     *  범위 256청크 초과는 TOO_BIG 실패 → 0. */
+    public static int forceloadChange(net.minecraft.server.command.ServerCommandSource source,
+                                      double fx, double fz, double tx, double tz, boolean add) {
+        if (!(source.getWorld() instanceof net.minecraft.server.world.ServerWorld sw)) return 0;
+        int x1 = net.minecraft.util.math.ChunkSectionPos.getSectionCoord(
+                net.minecraft.util.math.MathHelper.floor(Math.min(fx, tx)));
+        int z1 = net.minecraft.util.math.ChunkSectionPos.getSectionCoord(
+                net.minecraft.util.math.MathHelper.floor(Math.min(fz, tz)));
+        int x2 = net.minecraft.util.math.ChunkSectionPos.getSectionCoord(
+                net.minecraft.util.math.MathHelper.floor(Math.max(fx, tx)));
+        int z2 = net.minecraft.util.math.ChunkSectionPos.getSectionCoord(
+                net.minecraft.util.math.MathHelper.floor(Math.max(fz, tz)));
+        long area = (long) (x2 - x1 + 1) * (long) (z2 - z1 + 1);
+        if (area > 256L) return 0;
+        int n = 0;
+        for (int cx = x1; cx <= x2; cx++)
+            for (int cz = z1; cz <= z2; cz++)
+                if (sw.setChunkForced(cx, cz, add)) n++;
+        return n;
+    }
+
     public static void teleportToWithRot(net.minecraft.entity.Entity e, double x, double y, double z,
                                          float yaw, float pitch) {
         if (e == null) return;
@@ -1989,18 +2040,39 @@ public final class KfcGen {
     public static java.util.List<net.minecraft.item.ItemStack> lootFromTable(
             net.minecraft.server.command.ServerCommandSource source, String tableId) {
         try {
-            java.util.Optional<net.minecraft.registry.entry.RegistryEntry.Reference<net.minecraft.loot.LootTable>> entry =
-                    source.getServer().getReloadableRegistries().createRegistryLookup()
-                            .getOptionalEntry(net.minecraft.registry.RegistryKey.of(
-                                    net.minecraft.registry.RegistryKeys.LOOT_TABLE,
-                                    idOf(tableId)));
-            if (entry.isEmpty()) return java.util.List.of();
+            net.minecraft.loot.LootTable table;
+            if (tableId != null && tableId.trim().startsWith("{")) {
+                // 인라인 loot table(JSON/SNBT). 바닐라 RegistryEntryArgumentType 은 '{' 를 만나면
+                // SNBT 로 읽어 ENTRY_CODEC 으로 디코드하는데, ENTRY_CODEC(RegistryElementCodec)의
+                // 인라인 분기는 결국 elementCodec(=LootTable.CODEC).decode 그대로다(바이트코드 확인).
+                // ENTRY_CODEC 을 직접 쓰면 선행 getEntryLookup(LOOT_TABLE) 검사에서 실패한다 —
+                // server.getRegistryManager() 의 RegistryOps 에는 reloadable 전용인 loot_table
+                // 레지스트리가 없기 때문(빈 loot 반환 버그). 그래서 인라인은 CODEC 을 직접 디코드한다.
+                // 내부의 중첩 loot_table 참조는 TABLE_KEY(RegistryKey 코덱)라 lookup 이 필요 없고,
+                // enchantment 등 dynamic 참조는 registryManager ops 로 해소된다 — 바닐라와 관측 동등.
+                net.minecraft.nbt.NbtCompound nbt =
+                        net.minecraft.nbt.StringNbtReader.readCompound(tableId);
+                com.mojang.serialization.DynamicOps<net.minecraft.nbt.NbtElement> ops =
+                        source.getServer().getRegistryManager()
+                                .getOps(net.minecraft.nbt.NbtOps.INSTANCE);
+                table = net.minecraft.loot.LootTable.CODEC
+                        .parse(ops, nbt).result().orElse(null);
+                if (table == null) return java.util.List.of();
+            } else {
+                java.util.Optional<net.minecraft.registry.entry.RegistryEntry.Reference<net.minecraft.loot.LootTable>> entry =
+                        source.getServer().getReloadableRegistries().createRegistryLookup()
+                                .getOptionalEntry(net.minecraft.registry.RegistryKey.of(
+                                        net.minecraft.registry.RegistryKeys.LOOT_TABLE,
+                                        idOf(tableId)));
+                if (entry.isEmpty()) return java.util.List.of();
+                table = entry.get().value();
+            }
             net.minecraft.loot.context.LootWorldContext lc =
                     new net.minecraft.loot.context.LootWorldContext.Builder(source.getWorld())
                             .addOptional(net.minecraft.loot.context.LootContextParameters.THIS_ENTITY, source.getEntity())
                             .add(net.minecraft.loot.context.LootContextParameters.ORIGIN, source.getPosition())
                             .build(net.minecraft.loot.context.LootContextTypes.CHEST);
-            return entry.get().value().generateLoot(lc);
+            return table.generateLoot(lc);
         } catch (Exception e) { return java.util.List.of(); }
     }
 
@@ -3181,6 +3253,48 @@ public final class KfcGen {
         return matched;
     }
 
+    /** clear 의 아이템 술어가 매크로($clear @s $(item))로 오는 경우: 치환된 런타임 문자열을
+     *  바닐라 ItemPredicateArgumentType 으로 파싱해 매칭한다(id/태그/컴포넌트/서브술어 전부 —
+     *  바닐라가 치환 후 라인을 재파싱하는 것과 동일 코드 경로). 파싱 실패 = 바닐라에서
+     *  해당 라인 인스턴스화 실패(함수 미실행)이므로 0 반환·무변경으로 안전 동작. */
+    public static int clearItemsPred(net.minecraft.server.command.ServerCommandSource source,
+                                     net.minecraft.entity.Entity e, String predStr, int maxCount) {
+        if (!(e instanceof net.minecraft.entity.player.PlayerEntity p)) return 0;
+        java.util.function.Predicate<net.minecraft.item.ItemStack> pred =
+                parseItemPredicate(source.getServer(), predStr);
+        if (pred == null) return 0;
+        net.minecraft.entity.player.PlayerInventory inv = p.getInventory();
+        int matched = 0;
+        for (int i = 0; i < inv.size(); i++) {
+            net.minecraft.item.ItemStack st = inv.getStack(i);
+            if (st.isEmpty() || !pred.test(st)) continue;
+            if (maxCount == 0) { matched += st.getCount(); continue; }
+            if (maxCount < 0) { matched += st.getCount(); inv.setStack(i, net.minecraft.item.ItemStack.EMPTY); continue; }
+            int take = Math.min(st.getCount(), maxCount - matched);
+            if (take <= 0) break;
+            st.decrement(take);
+            if (st.isEmpty()) inv.setStack(i, net.minecraft.item.ItemStack.EMPTY);
+            matched += take;
+            if (matched >= maxCount) break;
+        }
+        return matched;
+    }
+
+    /** 바닐라 clear/if items 의 아이템 술어 파서(ItemPredicateArgumentType) 런타임 호출.
+     *  술어는 reloadable 데이터(아이템 태그 등)에 바인딩될 수 있어 캐시하지 않는다. */
+    private static java.util.function.Predicate<net.minecraft.item.ItemStack> parseItemPredicate(
+            net.minecraft.server.MinecraftServer server, String predStr) {
+        if (predStr == null) return null;
+        try {
+            net.minecraft.command.CommandRegistryAccess access =
+                    net.minecraft.command.CommandRegistryAccess.of(
+                            server.getRegistryManager(),
+                            server.getSaveProperties().getEnabledFeatures());
+            return new net.minecraft.command.argument.ItemPredicateArgumentType(access)
+                    .parse(new com.mojang.brigadier.StringReader(predStr));
+        } catch (Exception ex) { return null; }
+    }
+
     /** if items entity <e> <slot|range> <pred> : 슬롯(범위 포함, container.* 등)에 일치 아이템 존재.
      *  SlotRanges + getStackReference 로 모든 슬롯 타입(weapon/container/contents/enderchest/armor) 처리. */
     public static boolean itemsMatchSlots(net.minecraft.entity.Entity e, String slotName,
@@ -3735,6 +3849,26 @@ public final class KfcGen {
         int n = putAtPathCount(root, path, v);
         if (n > 0) storageSave(server, id, root);
         return n;
+    }
+
+    /** data modify storage <id> <path> set string <src> [<start> [<end>]] — 부분 문자열 복사.
+     *  바닐라(바이트코드 확인): asString = NbtString.value | NbtPrimitive.toString(그 외 실패),
+     *  인덱스 = i<0 ? len+i : i (getSubstringIndex), start<0|end>len|start>end 는 실패(쓰기 없음),
+     *  결과 NbtString 을 put(값 불변이면 Nothing-changed — 저장 생략). end 센티널 MIN_VALUE = 끝까지. */
+    public static void nbtSetStorageString(net.minecraft.server.MinecraftServer server, String id, String path,
+                                           net.minecraft.nbt.NbtElement src, int start, int end) {
+        String s;
+        if (src instanceof net.minecraft.nbt.NbtString ns) s = ns.value();
+        else if (src instanceof net.minecraft.nbt.NbtPrimitive) s = src.toString();
+        else return;
+        int len = s.length();
+        int a = start < 0 ? len + start : start;
+        int b = (end == Integer.MIN_VALUE) ? len : (end < 0 ? len + end : end);
+        if (a < 0 || b > len || a > b) return;
+        net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+        if (root == null) root = new net.minecraft.nbt.NbtCompound();
+        if (putAtPathCount(root, path, net.minecraft.nbt.NbtString.of(s.substring(a, b))) > 0)
+            storageSave(server, id, root);
     }
 
     /** data modify ... append|prepend from ... : 경로의 리스트에 element 를 추가(없으면 리스트 생성).

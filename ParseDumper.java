@@ -352,6 +352,7 @@ public final class ParseDumper implements ModInitializer {
         if (best == null) {
             List<String> distinct = new ArrayList<>(new java.util.LinkedHashSet<>(varNames));
             String sub = tryBacktrack(dispatcher, src, line, distinct);
+            if (sub == null) sub = tryRepair(dispatcher, src, line, distinct);   // 다변수(n>4)/조합 실패 시 에러 유도 수리
             if (sub != null) {
                 try {
                     ParseResults<ServerCommandSource> pr = dispatcher.parse(sub, src);
@@ -384,6 +385,10 @@ public final class ParseDumper implements ModInitializer {
         writeChain(jw, best.getContext(), bestSub);
     }
 
+    /** 재파싱 더미 후보(전략/백트랙/수리 공용). 자리 타입별: 정수/실수/문자열/식별자/리소스id/NBT맵. */
+    private static final String[] CANDS =
+            {"0", "0.0001", "\"MACROVAR\"", "MACROVARID", "minecraft:stone", "{}"};
+
     private static String[] buildStrategies(String line, List<String> varNames) {
         return new String[] {
                 replaceVarsByIndex(line, varNames),     // 식별자 MACROVAR_<i>
@@ -391,13 +396,14 @@ public final class ParseDumper implements ModInitializer {
                 replaceVarsAll(line, "0.0001"),         // 실수
                 replaceVarsAll(line, "\"MACROVAR\""),   // 문자열
                 replaceVarsAll(line, "minecraft:stone"),// 블록/아이템 id 자리(setblock/fill/give 등)
+                replaceVarsAll(line, "{}"),             // NBT 맵/컴포넌트 자리(loot components 등)
         };
     }
 
     private static String tryBacktrack(
             CommandDispatcher<ServerCommandSource> dispatcher, ServerCommandSource src,
             String line, List<String> distinctVars) {
-        String[] cands = {"0", "0.0001", "\"MACROVAR\"", "MACROVARID", "minecraft:stone"};
+        String[] cands = CANDS;
         int n = distinctVars.size();
         if (n == 0 || n > 4) return null;
         int total = 1;
@@ -414,6 +420,66 @@ public final class ParseDumper implements ModInitializer {
                 if (pr.getExceptions().isEmpty() && pr.getReader().getRemainingLength() == 0)
                     return sub;
             } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    /** 에러 유도 수리: 변수별 후보 인덱스를 유지하며, 파싱 실패 시 에러 커서/메시지가 가리키는
+     *  변수의 후보만 회전시켜 O(변수수×후보수) 안에 수렴을 노린다.
+     *  전조합(tryBacktrack, n≤4) 이 못 다루는 다변수 매크로(give 20+ 변수 등)용.
+     *  브리가디어/코덱은 최좌측 오류를 보고하므로 '커서 이후 첫 미소진 변수 회전' 그리디가
+     *  왼쪽부터 자리를 하나씩 확정해 전진을 보장한다. */
+    private static String tryRepair(CommandDispatcher<ServerCommandSource> dispatcher, ServerCommandSource src,
+                                    String line, List<String> vars) {
+        int n = vars.size();
+        if (n == 0) return null;
+        int[] state = new int[n];
+        int cap = n * CANDS.length + 8;
+        java.util.regex.Pattern vp = java.util.regex.Pattern.compile("\\$\\(([A-Za-z0-9_]+)\\)");
+        for (int iter = 0; iter < cap; iter++) {
+            // 치환 + 각 변수 출현 구간(치환 후 좌표) 기록
+            StringBuilder sb = new StringBuilder();
+            java.util.List<int[]> spans = new java.util.ArrayList<>();   // {start,end,varIdx}
+            java.util.regex.Matcher m = vp.matcher(line);
+            int last = 0;
+            while (m.find()) {
+                sb.append(line, last, m.start());
+                int vi = vars.indexOf(m.group(1));
+                String rep = vi >= 0 ? CANDS[state[vi]] : m.group();
+                spans.add(new int[]{sb.length(), sb.length() + rep.length(), vi});
+                sb.append(rep);
+                last = m.end();
+            }
+            sb.append(line, last, line.length());
+            String sub = sb.toString();
+            int cursor = -1; String msg = "";
+            try {
+                ParseResults<ServerCommandSource> pr = dispatcher.parse(sub, src);
+                if (pr.getExceptions().isEmpty() && pr.getReader().getRemainingLength() == 0)
+                    return sub;                                            // 성공
+                for (var ex : pr.getExceptions().values()) {
+                    cursor = ex.getCursor(); msg = String.valueOf(ex.getMessage()); break;
+                }
+                if (cursor < 0) cursor = pr.getReader().getCursor();
+            } catch (Throwable t) {
+                msg = String.valueOf(t.getMessage());
+                if (t instanceof com.mojang.brigadier.exceptions.CommandSyntaxException cse)
+                    cursor = cse.getCursor();
+            }
+            // 회전 대상: ① 에러 메시지에 현재 후보 원문이 든 변수(구분력 있는 후보만),
+            //           ② 커서 이후에 끝나는 첫 미소진 변수, ③ 아무 미소진 변수.
+            int pick = -1;
+            for (int[] sp : spans) {
+                if (sp[2] < 0 || state[sp[2]] >= CANDS.length - 1) continue;
+                String cur = CANDS[state[sp[2]]];
+                if (cur.length() > 3 && msg.contains(cur.replace("\"", ""))) { pick = sp[2]; break; }
+            }
+            if (pick < 0) for (int[] sp : spans)
+                if (sp[2] >= 0 && sp[1] > cursor && state[sp[2]] < CANDS.length - 1) { pick = sp[2]; break; }
+            if (pick < 0) for (int i = 0; i < n; i++)
+                if (state[i] < CANDS.length - 1) { pick = i; break; }
+            if (pick < 0) return null;                                     // 전 변수 소진
+            state[pick]++;
         }
         return null;
     }

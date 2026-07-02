@@ -2052,8 +2052,14 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         if parsed is None:
             em.reason = f"clear 아이템 술어({str(item)[:25]}) 미지원"; return False
         iid, cdata = parsed
-        cd = "null" if cdata is None else jstr(cdata)
         mc = "-1" if maxc is None else jint(maxc)
+        if cdata == "__RUNTIME_PRED__":
+            iid_j = jstr(iid)
+            return _fanout_target(
+                tgt, "_clE",
+                lambda e: f'KfcGen.clearItemsPred(source, {e}, {iid_j}, {mc});',
+                em, "clear")
+        cd = "null" if cdata is None else jstr(cdata)
         iid_j = "null" if iid == "*" else jstr(iid)
         return _fanout_target(
             tgt, "_clE",
@@ -3094,6 +3100,14 @@ def emit_tp(nn: list[str], args: dict, em: Emitted) -> bool:
 
     # ── 목적지가 엔티티 ──
     if dest_ent is not None and location is None:
+        if re.fullmatch(r'MACROVAR_\d+', dest_ent):
+            # 매크로 목적지($tp @s $(pos), pos="x y z"): 식별자 전략으로 엔티티 자리에 파싱됐지만
+            # 런타임 값은 좌표 문자열 — tpMacroDest 가 바닐라 재파싱과 동일하게 좌표를 해석한다.
+            ok = _tp_targets(em, targets,
+                             lambda t: f'KfcGen.tpMacroDest(source, {t}, {jstr(dest_ent)});')
+            if ok is None:
+                em.reason = f"tp 대상({targets[:20]}) 미해소"; return False
+            em.kind = "native"; return True
         dexpr = "executor" if dest_ent == "@s" else single_entity_expr(dest_ent)
         if dexpr is None:
             em.reason = f"tp 목적지 엔티티({dest_ent[:20]}) 미해소"; return False
@@ -4046,6 +4060,43 @@ def emit_data(nn: list[str], args: dict, em: Emitted) -> bool:
 
     # ---- data modify ----
     if op == "modify":
+        # ── set string <src> [<start> [<end>]] (부분 문자열 복사) ──
+        # 바닐라: 소스를 문자열화(asString) 후 [start,end) 서브스트링을 NbtString 으로 set.
+        # (nn 의 'from' 검사보다 먼저 — 소스 storage 의 path 가 'from' 같은 이름일 수 있음)
+        if "string" in nn:
+            si_ = nn.index("string")
+            skind = nn[si_ + 1] if si_ + 1 < len(nn) else None
+            read = _data_source_read_expr(skind, args)
+            if read is None:
+                em.reason = f"data set string {skind} 소스 미지원"
+                return False
+            if tgtkind != "storage":
+                em.reason = f"data set string -> {tgtkind} 타겟 1차 미지원"
+                return False
+            tid = first_arg(args, "target"); tpath = first_arg(args, "targetPath")
+            if not tid or not tpath:
+                em.reason = "data set string 대상/경로 없음"
+                return False
+            def _sidx(v, dflt):
+                if v is None:
+                    return dflt
+                if re.fullmatch(r'MACROVAR_\d+', str(v)):
+                    # 매크로 인덱스: 런타임 파싱(비수치면 numeric-wrap 이 줄 스킵)
+                    return f'Integer.parseInt({jstr(v)})'
+                try:
+                    int(v); return str(v)
+                except (ValueError, TypeError):
+                    return None
+            s_e = _sidx(first_arg(args, "start"), "0")
+            e_e = _sidx(first_arg(args, "end"), "Integer.MIN_VALUE")   # 센티널 = 끝까지
+            if s_e is None or e_e is None:
+                em.reason = "data set string 인덱스 미지원"
+                return False
+            em.java.append(f'{{ net.minecraft.nbt.NbtElement _v = {read};'
+                           f' if (_v != null) KfcGen.nbtSetStorageString(server, {jstr(tid)}, {jstr(tpath)},'
+                           f' _v, {s_e}, {e_e}); }}')
+            em.kind = "native"
+            return True
         # set value / set from
         is_from = "from" in nn
         # ── set from <entity|storage|block> (NBT 복사) ──
@@ -4290,6 +4341,35 @@ def _abs_coord_java(p, axis):
     if center and '.' not in t:        # 정수 리터럴만 센터링
         v += 0.5
     return repr(v)
+
+
+def _col_expr(raw):
+    """forceload ColumnPos('x z' 블록좌표, ~상대/절대/매크로) -> (xExpr, zExpr) double 식. 미지원 None."""
+    if not raw:
+        return None
+    parts = str(raw).split()
+    if len(parts) != 2:
+        return None
+    out = []
+    for i, p in enumerate(parts):
+        base = 'source.getPosition().' + ('x', 'z')[i]
+        if p == '~':
+            out.append(base)
+        elif p.startswith('~'):
+            try:
+                float(p[1:])
+            except ValueError:
+                return None
+            out.append(f'({base} + {jdouble(p[1:])})')
+        elif re.fullmatch(r'MACROVAR_\d+', p):
+            out.append(f'Double.parseDouble({jstr(p)})')
+        else:
+            try:
+                float(p)
+            except ValueError:
+                return None
+            out.append(jdouble(p))
+    return (out[0], out[1])
 
 
 def cond_pos_expr(raw: str, src_var: str = "source"):
@@ -5768,6 +5848,10 @@ def parse_clear_item(pred: str):
     """clear 아이템 술어 -> (item_id_or_#tag, custom_data_snbt|None). 미지원이면 None.
        지원: '*', '<id>', '#<tag>', '<id>[custom_data(=|~){...}]'."""
     pred = (pred or "*").strip()
+    if re.fullmatch(r'MACROVAR_\d+', pred):
+        # 매크로 아이템 자리($clear @s $(item)): 값은 임의 술어(id/태그/컴포넌트)일 수 있으므로
+        # 런타임에 바닐라 ItemPredicateArgumentType 으로 파싱해 매칭한다(바닐라 재파싱과 동일).
+        return (pred, "__RUNTIME_PRED__")
     if pred.startswith("#"):
         return (pred, None)
     m = re.match(r'^(\*|[a-z0-9_.:-]+)(?:\[(.*)\])?$', pred)
@@ -6405,6 +6489,93 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         em.reason = f"store {dst_kind} (미지원)"
         return False
 
+    # ── store dst 뒤(run 앞) 수정자 체인 처리 ──
+    # /execute 시맨틱: store 뒤의 수정자도 좌→우로 적용되어 run 소스의 실행 컨텍스트를 바꾼다.
+    # 기존엔 '순수 on vehicle 체인'만 처리하고 그 외(as/positioned/if 등)는 dst 파싱이 조용히
+    # 지나쳤는데, 이는 소스가 @s/위치 의존일 때 원 컨텍스트로 오평가되는 오컴파일이었다
+    # (예: swapspeed 의 `as @e[carB,limit=1]`, rkey-tp 의 `positioned $(posx)..`).
+    # 순수 on-vehicle 체인은 기존 경로를 유지(출력 바이트 동일)하고, 그 외 조합은 아래
+    # 일반 핸들러가 (_src, _self) 를 단계별로 재바인딩한다. 미지원 수정자는 폴백.
+    _MID_MODS = {"as", "at", "positioned", "rotated", "facing", "anchored",
+                 "align", "in", "on", "if", "unless"}
+    mi = next((k for k in range(si + 2, len(nn)) if nn[k] in _MID_MODS), None)
+    _rest0 = nn[mi:] if mi is not None else []
+    _pure_on = bool(_rest0) and len(_rest0) % 2 == 0 and all(
+        _rest0[k] == "on" and _rest0[k + 1] == "vehicle" for k in range(0, len(_rest0), 2))
+    if mi is not None and not _pure_on:
+        # 인자 노드의 raw 는 arg 엔트리에서 읽는다: _inject_macro_markers 가 MACROVAR 마커를
+        # arg raw 에만 주입하고 node range 는 더미(재파싱 문자열) 그대로라, range 를 읽으면
+        # 매크로 좌표/셀렉터가 더미 리터럴로 굳는다. 노드 순서↔동명 arg 순서로 짝짓는다.
+        from collections import defaultdict as _dd, deque as _dq
+        _q = _dd(_dq)
+        for _s in head:
+            if "arg" in _s:
+                _q[_s["arg"]].append((_s.get("value") or {}).get("raw"))
+        _nraw = []
+        for _s in head:
+            if "node" in _s:
+                _nm = _s["node"]
+                _r = _q[_nm].popleft() if _q[_nm] else None
+                _nraw.append(_r if _r is not None else _s.get("range"))
+        stmts = []
+        cur = "source"; self_e = "executor"; nullable = False
+        k = mi
+        while k < len(nn):
+            t = nn[k]
+            if t == "as" and k + 1 < len(nn) and nn[k + 1] == "targets":
+                raw = _nraw[k + 1] or ""
+                if raw == "@s":
+                    k += 2; continue
+                ent = single_entity_expr(raw)
+                if ent is None:
+                    em.reason = f"store 중간 as {str(raw)[:20]} (단일 해소 불가)"; return False
+                ev = _fresh_var("stAsE"); sv = _fresh_var("stSrc")
+                stmts.append(f'net.minecraft.entity.Entity {ev} = {ent};')
+                stmts.append(f'net.minecraft.server.command.ServerCommandSource {sv} = '
+                             f'({ev} != null ? {cur}.withEntity({ev}) : null);')
+                cur = sv; self_e = ev; nullable = True; k += 2
+            elif t == "positioned" and k + 1 < len(nn) and nn[k + 1] == "pos":
+                raw = _nraw[k + 1] or ""
+                expr = pos_rebind_expr(raw, cur)
+                if expr is None:
+                    em.reason = f"store 중간 positioned {str(raw)[:20]} 미지원"; return False
+                sv = _fresh_var("stSrc")
+                if nullable:
+                    expr = f'({cur} == null ? null : {expr})'
+                stmts.append(f'net.minecraft.server.command.ServerCommandSource {sv} = {expr};')
+                cur = sv; k += 2
+            elif t == "on" and k + 1 < len(nn) and nn[k + 1] == "vehicle":
+                sv = _fresh_var("stSrc"); ev = _fresh_var("stOnE")
+                stmts.append(f'net.minecraft.server.command.ServerCommandSource {sv} = '
+                             f'({cur} != null ? KfcGen.onVehicle({cur}) : null);')
+                stmts.append(f'net.minecraft.entity.Entity {ev} = '
+                             f'({sv} != null ? {sv}.getEntity() : null);')
+                cur = sv; self_e = ev; nullable = True; k += 2
+            else:
+                em.reason = f"store 중간 수정자({t}) 미지원"; return False
+        src_em2 = Emitted(line=line)
+        valexpr = (store_success_value_expr(tail, src_em2, self_expr=self_e, src_expr=cur)
+                   if is_success else
+                   source_value_expr(tail, src_em2, self_expr=self_e, src_expr=cur))
+        if valexpr is None:
+            em.reason = src_em2.reason
+            return False
+        em.java.append("{")
+        for s in stmts:
+            em.java.append("  " + s)
+        gi = "  "
+        if nullable:
+            em.java.append(f"  if ({cur} != null) {{")
+            gi = "    "
+        for s in src_em2.side_effects:
+            em.java.append(gi + s)
+        em.java.append(gi + dst_writer(valexpr))
+        if nullable:
+            em.java.append("  }")
+        em.java.append("}")
+        em.kind = "native"
+        return True
+
     # store dst 뒤 `on vehicle (on vehicle)*` 재바인딩 체인 감지.
     #  store 는 그 재바인딩 컨텍스트에서 평가된 소스 값을 캡처한다(/execute 시맨틱).
     on_chain = 0
@@ -6614,12 +6785,31 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
         if lo is None or hi is None:
             em.reason = f"store←random value 범위({rng}) 미지원"
             return None
-        try:
-            int(lo); int(hi)
-        except (ValueError, TypeError):
+        def _rint(v):
+            if re.fullmatch(r'MACROVAR_\d+', str(v)):
+                # 매크로 끝점: 환원 후 런타임 파싱(비수치면 numeric-wrap 이 줄 스킵 — 바닐라 동등)
+                return f'Integer.parseInt({jstr(v)})'
+            try:
+                int(v); return str(v)
+            except (ValueError, TypeError):
+                return None
+        lo_e, hi_e = _rint(lo), _rint(hi)
+        if lo_e is None or hi_e is None:
             em.reason = f"store←random value 정수범위 아님({rng})"
             return None
-        return f'ctx.world.getRandom().nextBetween({lo}, {hi})'
+        # 바닐라 RandomCommand: world.getRandom() + MathHelper.nextBetween(양끝 포함)
+        return f'ctx.world.getRandom().nextBetween({lo_e}, {hi_e})'
+    elif cmd == "forceload" and ("add" in nn or "remove" in nn):
+        # store ← forceload add|remove <from> [<to>]: 결과 = 상태가 실제 바뀐 청크 수(0=실패→0).
+        add = "true" if "add" in nn else "false"
+        fr = first_arg(args, "from")
+        to = first_arg(args, "to") or fr
+        fe = _col_expr(fr); te = _col_expr(to)
+        if fe is None or te is None:
+            em.reason = f"store←forceload 좌표({fr}) 미지원"
+            return None
+        return (f'KfcGen.forceloadChange(source, {fe[0]}, {fe[1]}, '
+                f'{te[0]}, {te[1]}, {add})')
     elif cmd == "attribute" and "value" in nn and "get" in nn:
         tsel = first_arg(args, "target")
         attr = first_arg(args, "attribute")
@@ -6645,8 +6835,17 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
             em.reason = f"store←clear 술어({str(item)[:20]}) 미지원"
             return None
         iid, cdata = parsed
-        cd = "null" if cdata is None else jstr(cdata)
         mc = "-1" if maxc is None else jint(maxc)
+        if cdata == "__RUNTIME_PRED__":
+            iid_j = jstr(iid)
+            if tgt == "@s":
+                return f'KfcGen.clearItemsPred(source, executor, {iid_j}, {mc})'
+            ent = single_entity_expr(tgt)
+            if ent is None:
+                em.reason = f"store←clear 대상({tgt[:20]}) 미지원"
+                return None
+            return f'KfcGen.clearItemsPred(source, {ent}, {iid_j}, {mc})'
+        cd = "null" if cdata is None else jstr(cdata)
         iid_j = "null" if iid == "*" else jstr(iid)
         if tgt == "@s":
             return f'KfcGen.clearItems(executor, {iid_j}, {cd}, {mc})'
@@ -7009,6 +7208,7 @@ def _inject_macro_markers(line, reparsed_line, macro_vars, chain):
     import copy as _copy
     out = _copy.deepcopy(chain)
     pos = 0
+    consumed = set()   # apply 가 실제 마커로 치환한 diff 위치들
     def apply(span_text):
         nonlocal pos
         toks = span_text.split(" ")
@@ -7016,7 +7216,12 @@ def _inject_macro_markers(line, reparsed_line, macro_vars, chain):
         p = pos
         while p + len(toks) <= len(rep):
             if rep[p:p + len(toks)] == toks:
-                newt = [diff.get(p + j, t) for j, t in enumerate(toks)]
+                newt = []
+                for j, t in enumerate(toks):
+                    if (p + j) in diff:
+                        newt.append(diff[p + j]); consumed.add(p + j)
+                    else:
+                        newt.append(t)
                 pos = p + len(toks)
                 return " ".join(newt)
             p += 1
@@ -7029,17 +7234,11 @@ def _inject_macro_markers(line, reparsed_line, macro_vars, chain):
                 if nv is None:
                     return None
                 step["value"]["raw"] = nv
-    # 모든 더미가 소비됐는지(리터럴 노드 자리 매크로 등은 미지원)
-    consumed_ok = True
-    # raw 갱신 후에도 diff 위치가 raw 밖(리터럴 노드)에 남았다면 chain 으론 표현 불가 -
-    # emit 이 그 노드를 노드명으로만 보므로 마커 미반영 = 잘못된 코드. 검출:
-    covered = set()
-    pos2 = 0
-    for step in out:
-        if "arg" in step:
-            toks = step["value"]["raw"].split(" ")
-            # 원 rep 기준 위치 재계산은 생략(이중 적용 방지를 위해 raw 에 MACROVAR 존재로 판정)
-    if not any("MACROVAR_" in (s.get("value", {}).get("raw") or "") for s in out if "arg" in s):
+    # 모든 더미 위치가 '정확히' 마커로 환원됐는지 검증. 하나라도 arg raw 밖(리터럴 노드 자리)에
+    # 남거나 apply 오매칭으로 건너뛰면 그 더미("MACROVAR"/0/minecraft:stone/{})가 생성 코드에
+    # 리터럴로 박힌다(예: 버그텍스처 아이템). 부분 주입은 절대 native 로 내보내지 않고
+    # 브릿지(=바닐라 엔진 실행)로 폴백한다.
+    if consumed != set(diff.keys()):
         return None
     return out
 
@@ -7088,7 +7287,8 @@ def emit_macro(obj: dict, em: Emitted) -> Emitted:
         s = stmt
         for i, var in enumerate(macro_vars):
             token = f"MACROVAR_{i}"
-            if token in s:
+            # (?!\d): MACROVAR_1 이 MACROVAR_10 에 오매칭되지 않도록 경계 강제
+            if re.search(re.escape(token) + r'(?!\d)', s):
                 # 문자열 리터럴 안이면 "..." 안의 토큰 -> 문자열 연결로
                 s = substitute_macro_token(s, token, var)
                 used_vars.add(var)
@@ -7166,6 +7366,10 @@ def substitute_macro_token(stmt: str, token: str, var: str) -> str:
        (이전 정규식 `"[^"]*TOKEN[^"]*"` 은 닫는따옴표~여는따옴표 구간을
         가짜 리터럴로 오인해 이웃 리터럴을 삼키는 버그가 있었음.)"""
     repl = f'macroArgs.get({jstr(var)})'
+    # 토큰 경계: MACROVAR_1 이 MACROVAR_10/11… 의 접두사이므로, 뒤에 숫자가 이어지면
+    # 다른(더 긴) 토큰이다. 리터럴 split/코드 치환 모두 (?!\d) 경계를 강제하지 않으면
+    # 2자리 인덱스 변수(23변수 give 등)에서 `speed+"0"` 류 오치환이 생긴다.
+    tok_re = re.compile(re.escape(token) + r'(?!\d)')
     segs = []           # (kind 'S'|'C', text) - S 는 따옴표 포함 리터럴
     cur, in_s, esc = '', False, False
     for ch in stmt:
@@ -7188,11 +7392,11 @@ def substitute_macro_token(stmt: str, token: str, var: str) -> str:
         segs.append(('S' if in_s else 'C', cur))
     out = []
     for kind, seg in segs:
-        if token not in seg:
+        if not tok_re.search(seg):
             out.append(seg); continue
         if kind == 'S':
             inner_s = seg[1:-1]
-            parts = inner_s.split(token)
+            parts = tok_re.split(inner_s)
             pieces = []
             for k, p in enumerate(parts):
                 if k > 0:
@@ -7201,7 +7405,7 @@ def substitute_macro_token(stmt: str, token: str, var: str) -> str:
                     pieces.append('"' + p + '"')
             out.append(" + ".join(pieces) if pieces else jstr(""))
         else:
-            out.append(re.sub(r'\b' + re.escape(token) + r'\b', repl, seg))
+            out.append(re.sub(r'\b' + re.escape(token) + r'\b(?!\d)', repl, seg))
     return "".join(out)
 
 

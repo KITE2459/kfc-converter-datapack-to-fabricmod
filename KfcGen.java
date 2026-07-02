@@ -2191,13 +2191,12 @@ public final class KfcGen {
         if (slotAccessorNbt(e, path.replace(" ", "")) != null) return true;
         try {
             net.minecraft.nbt.NbtCompound root = entitySnapshot(e);   // 캐시 스냅샷(읽기 전용 탐색)
-            String[] parts = path.split("\\.");
-            net.minecraft.nbt.NbtCompound cur = root;
-            for (int i = 0; i < parts.length - 1; i++) {
-                cur = cur.getCompound(parts[i]).orElse(null);
-                if (cur == null) return false;
-            }
-            return cur.contains(parts[parts.length - 1]);
+            // 바닐라 NbtPath 로 검사 — 리스트 인덱스(temp3[0])·필터(foo[{id:1}])·와일드카드([])를
+            // 정확히 처리한다. 단순 '.' split + contains(키) 는 "temp3[0]" 를 리터럴 키로 오인해
+            // 인덱스 경로에서 항상 false 를 반환했다(async-summon 의 temp3[0] 루프가 1회 후 정지하는 버그).
+            net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path.replace(" ", ""));
+            if (p == null) return false;
+            return p.count(root) > 0;
         } catch (Exception ex) {
             return false;
         }
@@ -3325,6 +3324,18 @@ public final class KfcGen {
         catch (Exception e) { return false; }
     }
 
+    /** putAtPath 와 동일하되 NbtPath.put 의 반환값(실제 변경된 노드 수)을 그대로 돌려준다.
+     *  바닐라 NbtPath.put 은 MutableBoolean+NbtElement.equals 로 값이 실제 바뀐 터미널만 카운트하므로
+     *  (동일 값 set → 0, 다른 값/신규 경로 → ≥1), 이는 /data modify 의 결과=수정 개수와 관측 동등.
+     *  store success 는 이 값>0(=변경 있었음)을 성공(1)으로 쓴다(바닐라 시맨틱: 바뀐 게 있으면 성공). */
+    private static int putAtPathCount(net.minecraft.nbt.NbtElement root, String path, net.minecraft.nbt.NbtElement value) {
+        if (value == null) return 0;
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);
+        if (p == null) return 0;
+        try { return p.put(root, value); }
+        catch (Exception e) { return 0; }
+    }
+
     // ──────────────── 엔티티 NBT 읽기 스냅샷 캐시 ────────────────
     //  같은 틱 안에서 같은 엔티티를 여러 번 읽을 때 writeNbt(엔티티 전체 직렬화) 반복을 제거한다.
     //  불변식(원본과 관측 동등): 엔티티가 항상 진실의 원천 — 캐시는 '현재 틱·미변경' 상태에서만 재사용된다.
@@ -3896,6 +3907,37 @@ public final class KfcGen {
         } catch (Exception ignored) {}
     }
 
+    /** storagePutSnbt 와 동일한 쓰기지만 "값이 실제로 바뀌었는지"를 반환한다(store success 용).
+     *  set 모드는 putAtPathCount(=NbtPath.put 변경 개수)>0 으로 판정 — putAtPath(경로 성공 여부)와
+     *  달리, 이미 같은 값을 다시 set 하면 false(바닐라 store success 0)를 정확히 재현한다.
+     *  append/prepend/merge 는 기존 changed 시맨틱과 동일. */
+    public static boolean storagePutSnbtChanged(net.minecraft.server.MinecraftServer server, String id,
+                                                String path, String snbt, String mode) {
+        try {
+            net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
+                try {
+                    net.minecraft.nbt.NbtCompound w =
+                            net.minecraft.nbt.StringNbtReader.readCompound("{v:" + s + "}");
+                    net.minecraft.nbt.NbtElement v = w.get("v");
+                    return v == null ? SNBT_INVALID : v;
+                } catch (Exception ex) { return SNBT_INVALID; }
+            });
+            if (tmpl == SNBT_INVALID) return false;
+            net.minecraft.nbt.NbtElement val = tmpl.copy();
+            net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+            if (root == null) root = new net.minecraft.nbt.NbtCompound();
+            boolean changed;
+            switch (mode) {
+                case "append"  -> changed = appendAtPath(root, path, val, false);
+                case "prepend" -> changed = appendAtPath(root, path, val, true);
+                case "merge"   -> changed = mergeAtPath(root, path, val);
+                default        -> changed = putAtPathCount(root, path, val) > 0;   // set
+            }
+            if (changed) storageSave(server, id, root);
+            return changed;
+        } catch (Exception ignored) { return false; }
+    }
+
     /** data merge storage <id> {snbt} — 컴파운드를 스토리지 루트에 깊은 병합. */
     public static void storageMergeSnbt(net.minecraft.server.MinecraftServer server, String id, String snbt) {
         try {
@@ -3982,6 +4024,31 @@ public final class KfcGen {
             e.writeNbt(nbt);
             if (putAtPath(nbt, path, val)) e.readNbt(nbt);   // NbtPath: 인덱스/필터 경로 정확
         } catch (Exception ignored) {}
+    }
+
+    /** entityPutSnbt 와 동일하되 "값이 실제로 바뀌었는지"를 반환(store success 용).
+     *  바닐라 /data modify entity 처럼 writeNbt→put→readNbt 라운드트립을 하되, put 반환(변경 개수)>0
+     *  으로 성공을 판정한다. display fast-path 는 건너뛰고 전체 라운드트립을 쓴다(변경 개수 필요·희소 경로).
+     *  vanilla store success 는 readNbt 가 나중에 경로를 버려도 put 개수 기준이므로 이 판정이 관측 동등. */
+    public static boolean entityPutSnbtChanged(net.minecraft.entity.Entity e, String path, String snbt) {
+        if (e == null) return false;
+        try {
+            net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
+                try {
+                    net.minecraft.nbt.NbtCompound w =
+                            net.minecraft.nbt.StringNbtReader.readCompound("{v:" + s + "}");
+                    net.minecraft.nbt.NbtElement v = w.get("v");
+                    return v == null ? SNBT_INVALID : v;
+                } catch (Exception ex) { return SNBT_INVALID; }
+            });
+            if (tmpl == SNBT_INVALID) return false;
+            net.minecraft.nbt.NbtElement val = tmpl.copy();
+            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(nbt);
+            int cnt = putAtPathCount(nbt, path, val);
+            if (cnt > 0) { invalidateSnapshot(e); e.readNbt(nbt); }
+            return cnt > 0;
+        } catch (Exception ignored) { return false; }
     }
 
     /** data merge entity <e> {snbt} — 컴파운드를 엔티티 NBT 에 깊은 병합(/data merge 시맨틱). */

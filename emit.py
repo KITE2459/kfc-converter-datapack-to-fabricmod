@@ -6202,6 +6202,67 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     return True
 
 
+def store_success_value_expr(tail: list[dict], em: Emitted,
+                             self_expr: str = "executor", src_expr: str = "source") -> str | None:
+    """execute store success ... run <소스> 의 성공(0/1) 값 식. data modify 소스만 네이티브 지원.
+       (data get/scoreboard get 등은 success 시맨틱이 값과 달라 여기서 미지원→폴백.)
+       - data modify ... set value <raw>  : NbtPath.put 변경 개수>0 (값이 실제 바뀌면 1)
+       - data modify ... <mode> from ...  : 소스 존재=성공 (기존 from 경로 재사용, dres 0/1)
+       바닐라: /data modify 의 store success = 수정된 노드가 1개 이상이면 1."""
+    if not tail:
+        em.reason = "store success 소스 없음"
+        return None
+    nodes, args = split_chain(tail)
+    nn = [n["node"] for n in nodes]
+    if nn[0] != "data" or "modify" not in nn:
+        em.reason = "store success <non-data-modify> 소스 1차 미지원"
+        return None
+    tgtkind = nn[2] if len(nn) > 2 else None
+    # set from ...: 기존 source_value_expr(dres=소스존재 0/1)가 곧 success 시맨틱과 동일
+    if "from" in nn:
+        return source_value_expr(tail, em, self_expr, src_expr)
+    mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
+    val = args.get("value", [{}])[0]
+    raw = val.get("raw")
+    if raw is None:
+        em.reason = "store success data modify 값 raw 없음"
+        return None
+    if tgtkind == "storage":
+        sid = first_arg(args, "target")
+        path = first_arg(args, "targetPath")
+        if sid is None or path is None:
+            em.reason = "store success storage 대상/경로 없음"
+            return None
+        return (f'(KfcGen.storagePutSnbtChanged(server, {jstr(sid)}, {jstr(path)}, '
+                f'{jstr(raw)}, {jstr(mode)}) ? 1 : 0)')
+    if tgtkind == "entity":
+        sel = first_arg(args, "target")
+        path = first_arg(args, "targetPath")
+        if path is None:
+            em.reason = "store success entity 경로 없음"
+            return None
+        if sel == "@s":
+            ent = self_expr
+        else:
+            ent = single_entity_expr(sel)
+            if ent is None:
+                em.reason = f"store success entity 대상({sel}) 미지원"
+                return None
+            if src_expr != "source":
+                ent = re.sub(r'\bsource\b', src_expr, ent)
+            if self_expr != "executor":
+                ent = re.sub(r'\bexecutor\b', self_expr, ent)
+        dres = _fresh_var("dres")
+        em.side_effects = [
+            f"int {dres} = 0;",
+            f"{{ net.minecraft.entity.Entity _se = {ent};",
+            f"  if (_se != null && KfcGen.entityPutSnbtChanged(_se, {jstr(path)}, {jstr(raw)})) {dres} = 1; }}",
+        ]
+        return dres
+    em.reason = f"store success data modify {tgtkind} 1차 미지원"
+    return None
+
+
 def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bool:
     """
     execute [as @s] store result score|storage <대상> [<type> <scale>] run <소스>
@@ -6245,10 +6306,12 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         em.reason = f"store 앞 수정자({bad}) - 1차 미지원"
         return False
 
-    # store result score|storage ...
-    if nn[si + 1] != "result":
-        em.reason = "store success (1차 미지원)"
+    # store result|success score|storage ...
+    store_verb = nn[si + 1]
+    if store_verb not in ("result", "success"):
+        em.reason = f"store {store_verb} (1차 미지원)"
         return False
+    is_success = (store_verb == "success")   # success 는 소스 커맨드의 성공(0/1)을 저장
     dst_kind = nn[si + 2]   # score | storage
 
     # 저장 대상 파싱
@@ -6340,7 +6403,9 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
     src_em = Emitted(line=line)
     if on_chain:
         # 재바인딩된 소스(_stSrc)/실행자(_stSelf) 기준으로 소스 평가
-        valexpr = source_value_expr(tail, src_em, self_expr="_stSelf", src_expr="_stSrc")
+        valexpr = (store_success_value_expr(tail, src_em, self_expr="_stSelf", src_expr="_stSrc")
+                   if is_success else
+                   source_value_expr(tail, src_em, self_expr="_stSelf", src_expr="_stSrc"))
         if valexpr is None:
             em.reason = src_em.reason
             return False
@@ -6357,7 +6422,8 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         em.kind = "native"
         return True
 
-    valexpr = source_value_expr(tail, src_em)
+    valexpr = (store_success_value_expr(tail, src_em) if is_success
+               else source_value_expr(tail, src_em))
     if valexpr is None:
         em.reason = src_em.reason
         return False

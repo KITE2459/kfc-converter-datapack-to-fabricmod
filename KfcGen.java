@@ -3722,6 +3722,21 @@ public final class KfcGen {
         if (putAtPath(root, path, v)) storageSave(server, id, root);
     }
 
+    /** store result|success ... run data modify storage <id> <path> set from ... 의 값.
+     *  바닐라 DataCommand.executeModify: i = NbtPath.put 이 실제 바꾼 종단 수(기존 값과 동일하면 0),
+     *  i==0 → 'Nothing changed' 실패(store→0), 성공 시 command result = i.
+     *  '소스 존재=1' 로 하면, 발판(점프대)의 표지판 줄 감지("빈 문자열 리셋 후 복사 — 변경 없으면
+     *  빈 줄" 트릭)가 항상 존재하는 sign messages[i] 때문에 오판되어 바닐라와 달라진다. */
+    public static int nbtSetStorageChanged(net.minecraft.server.MinecraftServer server, String id, String path,
+                                           net.minecraft.nbt.NbtElement v) {
+        if (v == null) return 0;
+        net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+        if (root == null) root = new net.minecraft.nbt.NbtCompound();
+        int n = putAtPathCount(root, path, v);
+        if (n > 0) storageSave(server, id, root);
+        return n;
+    }
+
     /** data modify ... append|prepend from ... : 경로의 리스트에 element 를 추가(없으면 리스트 생성).
      *  바닐라 DataCommand 의 getOrInit(NbtList::new) + add 와 동일. */
     private static boolean appendAtPath(net.minecraft.nbt.NbtElement root, String path,

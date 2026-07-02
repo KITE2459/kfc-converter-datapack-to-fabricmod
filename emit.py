@@ -4025,6 +4025,21 @@ def _data_target_write(tkind: str, args: dict, valvar: str):
     return None
 
 
+def _data_target_write_changed(tkind: str, args: dict, valvar: str):
+    """data modify <target> set 의 '변경 종단 수'(int) 를 반환하는 쓰기 식. storage 만 지원(그 외 None).
+       바닐라 DataCommand.executeModify: i = NbtPath.put 이 실제 바꾼 종단 수(값 불변 시 0),
+       i==0 → 'Nothing changed' 실패(store→0), 성공 시 command result = i (iload i / ireturn 확인)."""
+    tpath = first_arg(args, "targetPath")
+    if not tpath:
+        return None
+    if tkind == "storage":
+        tid = first_arg(args, "target")
+        if not tid:
+            return None
+        return f'KfcGen.nbtSetStorageChanged(server, {jstr(tid)}, {jstr(tpath)}, {valvar})'
+    return None
+
+
 def emit_data(nn: list[str], args: dict, em: Emitted) -> bool:
     op = nn[1] if len(nn) > 1 else None       # modify / get / merge / remove
     tgtkind = nn[2] if len(nn) > 2 else None   # entity / storage / block
@@ -6218,9 +6233,13 @@ def store_success_value_expr(tail: list[dict], em: Emitted,
         em.reason = "store success <non-data-modify> 소스 1차 미지원"
         return None
     tgtkind = nn[2] if len(nn) > 2 else None
-    # set from ...: 기존 source_value_expr(dres=소스존재 0/1)가 곧 success 시맨틱과 동일
+    # set from ...: source_value_expr(dres=실제 변경 종단 수)를 success(0/1) 로 접는다.
+    # (경로가 다중 종단에 매치되면 count>1 가능 — success 는 항상 0/1 이어야 한다.)
     if "from" in nn:
-        return source_value_expr(tail, em, self_expr, src_expr)
+        v = source_value_expr(tail, em, self_expr, src_expr)
+        if v is None:
+            return None
+        return f'(({v}) > 0 ? 1 : 0)'
     mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
     val = args.get("value", [{}])[0]
     raw = val.get("raw")
@@ -6513,7 +6532,10 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
             return _scaled_get(f'KfcGen.storageGetDouble(server, {jstr(sid)}, {jstr(path)})')
     elif cmd == "data" and ("modify" in nn) and ("from" in nn):
         # store result|success ... run data modify <dst> set from <src>
-        #  -> 소스 NBT 를 읽어 대상에 쓰고, 소스가 존재하면 1(변경 1건) else 0.
+        #  -> 바닐라 executeModify: result = NbtPath.put 이 실제 바꾼 종단 수(값 불변 시 0 → 실패, store 0).
+        #     '소스 존재=1' 은 오답 — 발판(점프대)의 표지판 3번줄 감지가 "빈 문자열 리셋 후 복사,
+        #     변경 없으면 0" 트릭이라, 항상 존재하는 sign messages[i] 소스에서 1 을 주면
+        #     빈 줄인데도 존재 판정되어 플레이어 Yaw 회전이 스킵된다(바닐라와 상이).
         mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
         if mode != "set":
             em.reason = f"store←data modify {mode} from 미지원"
@@ -6523,14 +6545,14 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
         tgtkind = nn[2]
         vsrc = _fresh_var("vsrc"); dres = _fresh_var("dres")
         read = _data_source_read_expr(skind, args)
-        write = _data_target_write(tgtkind, args, vsrc)
-        if read is None or write is None:
-            em.reason = "store←data modify from 소스/타겟 미지원"
+        wchg = _data_target_write_changed(tgtkind, args, vsrc)
+        if read is None or wchg is None:
+            em.reason = "store←data modify from 소스/타겟 미지원(변경 판정)"
             return None
         em.side_effects = [
             f"int {dres} = 0;",
             f"{{ net.minecraft.nbt.NbtElement {vsrc} = {read};",
-            f"  if ({vsrc} != null) {{ {write}; {dres} = 1; }} }}",
+            f"  if ({vsrc} != null) {dres} = {wchg}; }}",
         ]
         return dres
     elif cmd == "scoreboard" and "get" in nn:

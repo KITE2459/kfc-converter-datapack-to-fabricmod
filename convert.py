@@ -580,6 +580,16 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
                     if not p.exists():
                         p.write_text(c.text, encoding="utf-8")
 
+    # ── [pass-4] 상수 배열 호이스팅: 방출된 `new String[]{...}` 등 상수 리터럴을
+    #    클래스 static final 필드로 승격 — 실행당 할당 제거 + 메서드 바이트코드 축소.
+    #    (merge 유무와 무관하게 최종 디스크 산출 전체에 적용. KfcGen.java 제외.)
+    try:
+        import merge_pass as _hp_mod
+        hstats = _hp_mod.hoist_constants_tree(src_root, verbose=False)
+        print(f"[generate] pass-4 hoist-constants: {hstats}")
+    except Exception as _he:
+        print(f"[generate][warn] hoist pass skipped due to error: {_he}")
+
     print(f"[generate] {fn_count} classes -> {src_root}")
     tot = sum(stats.values())
     if tot:

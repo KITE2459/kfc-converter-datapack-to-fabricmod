@@ -587,3 +587,99 @@ def run_postpass(src_root: Path, group: str, pins: set | None = None,
         return st
     else:
         return {"bridged": bridged, "merged": 0}
+
+# ════════════════════════════════════════════════════════════════════
+#  [pass-4] 상수 배열 호이스팅 — 생성 자바의 속도/크기 최적화 (범용, 시맨틱 불변)
+#
+#  생성 코드가 호출 인자로 방출하는 `new String[]{...}` / `new EntityType<?>[]{...}`
+#  리터럴은 실행마다 힙 할당을 만든다(틱 함수에서 초당 수백~수천 회). 요소가 전부
+#  컴파일타임 상수(문자열 리터럴 / EntityType.상수)인 리터럴만 클래스 수준
+#  `private static final` 필드로 승격하고 사용처를 필드 참조로 바꾼다.
+#    · 할당 제거(GC 压), 메서드 바이트코드 축소(JIT 인라이닝 예산 확보)
+#    · 안전성: KfcGen 헬퍼는 배열 인자를 변형하지 않음(전수 확인) → 공유 안전.
+#    · 문자열/주석 내부의 우연한 패턴은 라인-로컬 따옴표/`//` 상태 검사로 제외.
+#    · KfcGen.java(수기 런타임)는 제외. 멱등: 이미 삽입된 필드 선언 라인은 건너뜀.
+# ════════════════════════════════════════════════════════════════════
+
+_STR_LIT = r'"(?:[^"\\]|\\.)*"'
+_SA_RE = re.compile(r'new String\[\]\{(' + _STR_LIT + r'(?:\s*,\s*' + _STR_LIT + r')*|\s*)\}')
+_ET_ELEM = r'(?:net\.minecraft\.entity\.)?EntityType\.[A-Z_][A-Z_0-9]*'
+_ET_RE = re.compile(r'new net\.minecraft\.entity\.EntityType<\?>\[\]\{(' + _ET_ELEM
+                    + r'(?:\s*,\s*' + _ET_ELEM + r')*)\}')
+_CLASS_OPEN_RE = re.compile(r'^[ \t]*public\s+(?:final\s+)?class\s+\w+[^{\n]*\{', re.M)
+
+def _code_pos_ok(text: str, pos: int) -> bool:
+    """pos 가 (라인 기준) 문자열 리터럴/라인주석 밖의 '코드 위치'인지 검사."""
+    ls = text.rfind('\n', 0, pos) + 1
+    in_str = False; esc = False
+    i = ls
+    while i < pos:
+        c = text[i]
+        if in_str:
+            if esc: esc = False
+            elif c == '\\': esc = True
+            elif c == '"': in_str = False
+        else:
+            if c == '"': in_str = True
+            elif c == '/' and i + 1 < pos and text[i+1] == '/':
+                return False          # 라인 주석 내부
+        i += 1
+    return not in_str
+
+def hoist_constants_text(text: str) -> tuple[str, int]:
+    """단일 클래스 소스에서 상수 배열 리터럴을 static final 필드로 호이스팅.
+       (변경된 텍스트, 치환 건수) 반환. 클래스 선언을 못 찾으면 무변경."""
+    mcls = _CLASS_OPEN_RE.search(text)
+    if mcls is None:
+        return text, 0
+    insert_at = mcls.end()
+
+    fields: dict[str, str] = {}      # 리터럴 원문 -> 필드명
+    decls: list[str] = []
+    n = 0
+
+    def _sub(regex: re.Pattern, prefix: str, ftype: str, src: str) -> str:
+        nonlocal n
+        out = []
+        last = 0
+        for m in regex.finditer(src):
+            # 우리가 만든 필드 선언 라인 자체는 재치환 금지(멱등)
+            ls = src.rfind('\n', 0, m.start()) + 1
+            line_head = src[ls:m.start()]
+            if 'private static final' in line_head or not _code_pos_ok(src, m.start()):
+                continue
+            lit = m.group(0)
+            name = fields.get(lit)
+            if name is None:
+                name = f"{prefix}{len([k for k in fields if fields[k].startswith(prefix)])}"
+                fields[lit] = name
+                decls.append(f"    private static final {ftype} {name} = {lit};")
+            out.append(src[last:m.start()]); out.append(name)
+            last = m.end(); n += 1
+        out.append(src[last:])
+        return ''.join(out)
+
+    body = text[insert_at:]
+    body = _sub(_SA_RE, "KFC_SA_", "String[]", body)
+    body = _sub(_ET_RE, "KFC_ET_", "net.minecraft.entity.EntityType<?>[]", body)
+    if n == 0:
+        return text, 0
+    return text[:insert_at] + "\n" + "\n".join(decls) + body, n
+
+def hoist_constants_tree(src_root: Path, verbose: bool = False) -> dict:
+    """src_root 아래 모든 생성 .java 에 호이스팅 적용(KfcGen.java 제외)."""
+    files = 0; repl = 0
+    for p in sorted(Path(src_root).rglob("*.java")):
+        if p.name == "KfcGen.java":
+            continue
+        try:
+            t = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        nt, k = hoist_constants_text(t)
+        if k:
+            p.write_text(nt, encoding="utf-8")
+            files += 1; repl += k
+            if verbose:
+                print(f"  [hoist] {p.name}: {k}")
+    return {"files": files, "hoisted": repl}

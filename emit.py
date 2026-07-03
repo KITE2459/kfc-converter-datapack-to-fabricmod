@@ -49,6 +49,75 @@ def _uid() -> int:
     _VAR_COUNTER[0] += 1
     return _VAR_COUNTER[0]
 
+
+def _nonnull_simplify(s: str, var: str) -> str:
+    """`var` 가 non-null 임이 구조적으로 보장된 문맥(enhanced-for 루프 변수, instanceof 패턴
+    바인딩, `if (var != null)` 가드 내부)에서 방출 자바의 죽은 널체크를 제거한다.
+    순수 단순화 — 관측 시맨틱 불변, 목적은 메서드 바이트코드 축소(JIT 인라이닝 예산)와 분기 제거:
+      · `(var != null ? A : B)` / `((var != null) ? A : B)`  →  `A`
+      · `var != null && X`                                    →  `X`
+      · `if (var != null) STMT`                               →  `STMT`
+    따옴표 상태를 추적해 문자열 리터럴 내부는 절대 건드리지 않는다."""
+    v = re.escape(var)
+    # 1) 삼항 제거 — 괄호/따옴표 인지 스캐너로 A 부분만 추출
+    tern = re.compile(r'\(\(?' + v + r' != null\)? \? ')
+    while True:
+        m = tern.search(s)
+        if m is None:
+            break
+        # m.start() 의 '(' 부터 균형 스캔: depth1 에서 만나는 '?' 다음 ':' 위치와 닫는 ')' 위치
+        i = m.end()          # A 시작
+        depth = 1            # 여는 '(' 하나 소비된 상태
+        in_str = False; esc = False
+        qdepth = 0           # depth1 에서의 중첩 삼항 카운터(외곽 '?' 는 정규식이 이미 소비)
+        colon = -1; close = -1
+        j = i
+        while j < len(s):
+            c = s[j]
+            if in_str:
+                if esc: esc = False
+                elif c == '\\': esc = True
+                elif c == '"': in_str = False
+            else:
+                if c == '"': in_str = True
+                elif c == '(': depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        close = j
+                        break
+                elif c == '?' and depth == 1:
+                    qdepth += 1
+                elif c == ':' and depth == 1:
+                    if qdepth > 0:
+                        qdepth -= 1
+                    elif colon < 0:
+                        colon = j
+            j += 1
+        if colon < 0 or close < 0:
+            break   # 형태 불일치 — 건드리지 않음(보수)
+        a_part = s[i:colon].strip()
+        s = s[:m.start()] + a_part + s[close + 1:]
+    # 2) `var != null && ` 접두 제거 (문자열 밖에서만 — 방출 코드의 이 패턴은 코드 위치에만 등장)
+    s = re.sub(r'\(' + v + r' != null && ', '(', s)
+    s = re.sub(v + r' != null && ', '', s)
+    # 3) `if (var != null) ` 문장 가드 제거
+    s = re.sub(r'if \(' + v + r' != null\) ', '', s)
+    return s
+
+
+def _nonnull_simplify_conds(conds: list, var: str) -> list:
+    """조건식 리스트 버전 — 각 항목 단순화 후, `var != null` 자체였던 죽은 항목은 제거."""
+    out = []
+    for c in conds:
+        c2 = _nonnull_simplify(c, var)
+        cc = c2.strip()
+        if cc in (f'{var} != null', f'({var} != null)'):
+            continue   # 루프 변수 non-null — 항상 참인 조건은 통째 제거
+        out.append(c2)
+    return out
+
+
 ALL_FIDS = set()
 def set_all_fids(s):
     """변환되는 모든 함수 id 집합 주입(동적 function 디스패치 후보 열거용)."""
@@ -5997,7 +6066,7 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     # 루프 본문: 각 엔티티의 소스 생성 후 본문. executor/source 참조를 루프 변수로 치환.
     body = inner.java
     # 본문 내 'executor' 는 as 의 self(_asE), 'source' 는 그 소스(_asSrc)
-    body = [re.sub(r'\bexecutor\b', _asE, b) for b in body]
+    body = [_nonnull_simplify(re.sub(r'\bexecutor\b', _asE, b), _asE) for b in body]
 
     out = list(loop_open)
     # 바닐라 as <셀렉터> 는 executor 만 교체하고 위치/회전/앵커/차원은 부모 소스에서 상속한다
@@ -6104,13 +6173,16 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         em.reason = f"as 루프 + {muns}"
         return False
     # 수정자 조건을 루프 변수 기준으로 치환 (대상별 평가)
-    mod_conds = [re.sub(r'\bsource\b', 'es', re.sub(r'\bexecutor\b', 'e', c)) for c in mconds]
+    # 루프 변수 e 는 모든 사용 경로에서 non-null 보장(enhanced-for / `if (e != null)` 가드 내부)
+    # → 치환으로 죽은 `e != null` 체크를 제거해 분기·바이트코드를 줄인다(시맨틱 불변).
+    mod_conds = _nonnull_simplify_conds(
+        [re.sub(r'\bsource\b', 'es', re.sub(r'\bexecutor\b', 'e', c)) for c in mconds], 'e')
     # 수정자 rebind 문장도 루프 변수(e/es) 기준으로 치환 - 조건이 이를 참조하므로 본문 선두에 배치
     mod_rebinds = []
     for stmt in mrebinds:
         s = re.sub(r'\bexecutor\b', 'e', stmt)
         s = re.sub(r'\bsource\b', 'es', s)
-        mod_rebinds.append(s)
+        mod_rebinds.append(_nonnull_simplify(s, 'e'))
 
     # 타겟 emit (루프 본문) - 셀렉터 컨텍스트에서 self = 루프 변수 e
     inner = Emitted(line=line)
@@ -6126,7 +6198,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     for stmt in inner.java:
         s = re.sub(r'\bexecutor\b', 'e', stmt)
         s = re.sub(r'\bsource\b', 'es', s)
-        body.append(s)
+        body.append(_nonnull_simplify(s, 'e'))
     # as 이후 수정자 리바인딩(positioned/rotated/at 등)의 최종 소스를 본문이 써야 한다.
     # (이전엔 리바인드 문장만 만들고 본문은 es 를 그대로 써서, `as @e ... positioned as @s
     #  rotated ~-90 run function X` 의 위치/회전이 X 에 전달되지 않았음 - 버텍스 배치 오작동.)
@@ -6182,7 +6254,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         if expr is None:
             em.reason = f"as 루프 predicate({pid}) 컴파일 불가"
             return False
-        conds.append(expr.replace("{E}", "en"))
+        conds.append(_nonnull_simplify(expr.replace("{E}", "en"), "en"))
     conds += _selector_extra_conds(sel, "en")
     filt = " && ".join(conds) if conds else "true"
 
@@ -6339,7 +6411,9 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         typeset = ", ".join(jtypes)
         if lim:
             out.append("{ int _lim = 0;")
-        out.append(f"for (EntityType<?> kfcType : java.util.Set.of({typeset})) {{")
+        # Set.of 는 매 실행 할당 + JVM-SALT 랜덤 순회순서(비결정). 배열 리터럴은 방출 순서
+        # (=타입태그 해소 순서) 그대로 순회 — 결정적이며 pass-4 상수 호이스팅 대상이 된다.
+        out.append(f"for (EntityType<?> kfcType : new net.minecraft.entity.EntityType<?>[]{{{typeset}}}) {{")
         out.append(f"    for (Entity e : ctx.world.getEntitiesByType(kfcType,")
         out.append(f"            en -> {filt})) {{")
         out.append("        " + src_line)

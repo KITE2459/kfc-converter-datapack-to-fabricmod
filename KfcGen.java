@@ -3882,21 +3882,24 @@ public final class KfcGen {
     /** data modify storage <id> <path> set string <src> [<start> [<end>]] — 부분 문자열 복사.
      *  바닐라(바이트코드 확인): asString = NbtString.value | NbtPrimitive.toString(그 외 실패),
      *  인덱스 = i<0 ? len+i : i (getSubstringIndex), start<0|end>len|start>end 는 실패(쓰기 없음),
-     *  결과 NbtString 을 put(값 불변이면 Nothing-changed — 저장 생략). end 센티널 MIN_VALUE = 끝까지. */
-    public static void nbtSetStorageString(net.minecraft.server.MinecraftServer server, String id, String path,
-                                           net.minecraft.nbt.NbtElement src, int start, int end) {
+     *  결과 NbtString 을 put(값 불변이면 Nothing-changed — 저장 생략). end 센티널 MIN_VALUE = 끝까지.
+     *  반환: store result 용 '변경 종단 수' — 실패(비문자열/범위 밖)나 값 불변이면 0
+     *  (바닐라: 실패 시 예외 → store 0, Nothing-changed 도 예외 → 0 — put count 0 과 동일). */
+    public static int nbtSetStorageString(net.minecraft.server.MinecraftServer server, String id, String path,
+                                          net.minecraft.nbt.NbtElement src, int start, int end) {
         String s;
         if (src instanceof net.minecraft.nbt.NbtString ns) s = ns.value();
         else if (src instanceof net.minecraft.nbt.NbtPrimitive) s = src.toString();
-        else return;
+        else return 0;
         int len = s.length();
         int a = start < 0 ? len + start : start;
         int b = (end == Integer.MIN_VALUE) ? len : (end < 0 ? len + end : end);
-        if (a < 0 || b > len || a > b) return;
+        if (a < 0 || b > len || a > b) return 0;
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
         if (root == null) root = new net.minecraft.nbt.NbtCompound();
-        if (putAtPathCount(root, path, net.minecraft.nbt.NbtString.of(s.substring(a, b))) > 0)
-            storageSave(server, id, root);
+        int n = putAtPathCount(root, path, net.minecraft.nbt.NbtString.of(s.substring(a, b)));
+        if (n > 0) storageSave(server, id, root);
+        return n;
     }
 
     /** data modify ... append|prepend from ... : 경로의 리스트에 element 를 추가(없으면 리스트 생성).
@@ -4261,6 +4264,20 @@ public final class KfcGen {
             } else if (!displaySetFast(e, k, patch.get(k))) return false;
         }
         return true;
+    }
+
+    /** UUID 리터럴 대상 해소 — 바닐라 EntitySelector(uuid) 와 동일하게 서버의 '모든 월드'에서
+     *  getEntity(uuid) 를 찾는다(EntitySelector.getEntities 바이트코드 확인). 축약 UUID
+     *  ("7437-0-a-0-0" 등)는 UUID.fromString 이 그룹별 16진 파싱으로 허용한다(바닐라 동일). */
+    public static net.minecraft.entity.Entity entityByUuid(GameContext ctx, String uuid) {
+        java.util.UUID id;
+        try { id = java.util.UUID.fromString(uuid); }
+        catch (IllegalArgumentException e) { return null; }
+        for (net.minecraft.server.world.ServerWorld w : ctx.server.getWorlds()) {
+            net.minecraft.entity.Entity e = w.getEntity(id);
+            if (e != null) return e;
+        }
+        return null;
     }
 
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {

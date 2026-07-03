@@ -1553,8 +1553,12 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 stmt = f'KfcGen.setGameMode(executor, {jstr(mode)});'
                 em.java.append(stmt if cond == "true" else f'if ({cond}) {stmt}')
                 em.kind = "native"; return True
-        em.reason = f"gamemode 대상({str(tgt)[:20]}) 1차 미지원"
-        return False
+            # 그 외 대상(@a/@p/@e[...] 등): 공통 3분기 전개. setGameMode 는 내부에서
+            # 플레이어 여부를 확인하므로(기존 @s 경로가 Entity 로 호출) 그대로 위임.
+            return _fanout_target(
+                tgt, "_gmE",
+                lambda e: f'KfcGen.setGameMode({e}, {jstr(mode)});',
+                em, "gamemode")
 
     if command == "tag":
         verb = "add" if "add" in nn else ("remove" if "remove" in nn else None)
@@ -1602,10 +1606,15 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 if not fid:
                     em.reason = "return run function 이름 없음"
                     return False
-                # 매크로 함수면 인자 동반 호출이 복잡 -> 1차로 무인자 executeReturn 만 지원
+                # 매크로 함수: with 인자 소스를 해소해 executeReturn(source, macroArgs) 값 전파.
                 if fid in MACRO_FNS:
-                    em.reason = "return run function(매크로) 1차 미지원"
-                    return False
+                    margs = _macro_args_expr(args, nn)
+                    if margs is None:
+                        em.reason = "return run function(매크로) 인자 소스 미지원"
+                        return False
+                    em.java.append(f"return {fqcn(fid)}.executeReturn(source, {margs});")
+                    em.terminal = True
+                    return True
                 if ALL_FIDS and fid not in ALL_FIDS:
                     _ns, _p = fid.split(":", 1) if ":" in fid else ("minecraft", fid)
                     em.java.append(f"return KfcGen.instantExecuteFunctionReturn(source, "
@@ -3965,6 +3974,45 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
             em.kind = "native"
             return True
     if d is None or s is None:
+        # 단일 '대상' × 다중 소스 - 바닐라 executeOperation 은 targets×sources 이중 루프로
+        # (target, source) 쌍마다 연산을 순차 적용한다. 대상이 단일이면 소스 루프만 돌면
+        # 모든 연산자(</>/+= 등은 누적, = 는 마지막 값)에서 바닐라와 동일 순서/결과.
+        # (complete-same-time 의 `#max < @a[tag=...]` min-누적이 이 형태.)
+        if s is None and d is not None:
+            ssel = parse_selector(sholder)
+            if ssel is not None and not ssel.predicates and ssel.base in ("e", "a"):
+                dexpr0, dguard0, dent0 = d
+                pre = []
+                if dent0 is not None:
+                    pre.append(f'net.minecraft.entity.Entity _opd = {dent0};')
+                    dname0 = '_opd.getNameForScoreboard()'; dguard0 = '_opd != null'
+                else:
+                    dname0 = dexpr0
+                lo = entity_loop_open(ssel, "_os") if ssel.base == "e" else None
+                if ssel.base == "a":
+                    body = ['for (net.minecraft.server.network.ServerPlayerEntity _os : ctx.allPlayers) {']
+                    cs = [f'_os.getCommandTags().contains({jstr(t)})' for t in ssel.tags_pos]
+                    cs += [f'!_os.getCommandTags().contains({jstr(t)})' for t in ssel.tags_neg]
+                    _vc = _volume_cond(ssel, "_os")
+                    if _vc: cs.append(_vc)
+                    if cs:
+                        body.append(f'    if (!({" && ".join(cs)})) continue;')
+                elif lo is not None:
+                    body = list(lo)
+                else:
+                    em.reason = f"scoreboard operation 다중 소스({sholder[:25]}) 타입 미해소"
+                    return False
+                for _c in _score_conds(ssel, '_os'):
+                    body.append(f'    if (!{_c}) continue;')
+                body.append(f'    KfcGen.opScore(sb, {dname0}, {jstr(do)}, {jstr(op)}, _os.getNameForScoreboard(), {jstr(so)});')
+                body.append("}")
+                if dguard0:
+                    body = [f'if ({dguard0}) {{'] + ["    " + b for b in body] + ["}"]
+                em.java.append("{ " + " ".join(pre) + (" " if pre else ""))
+                em.java.extend(body)
+                em.java.append("}")
+                em.kind = "native"
+                return True
         em.reason = "scoreboard operation 셀렉터 홀더(다중/predicate) 미지원"
         return False
     # 엔티티 식이 있으면 임시 변수로 뽑아 null 가드
@@ -5876,12 +5924,19 @@ def skip_after(nn, i, token):
     return len(nn)
 
 
-def _emit_as_loop_recursive(line, head, tail, em, sel):
+def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     """as <셀렉터> <컨텍스트 수정자...> run <타겟> 을, 셀렉터 루프 + 본문 재귀 emit 으로 변환.
-       각 엔티티 e 에 대해 그 커맨드 소스(es)를 만들고, as 이후 chain 을 es 기준으로 재귀."""
+       각 엔티티 e 에 대해 그 커맨드 소스(es)를 만들고, as 이후 chain 을 es 기준으로 재귀.
+       uuid_raw: as <UUID리터럴> 단일 대상(sel=None) — entityByUuid 로 해소해 1회 실행."""
     _asE = _fresh_var("_asE")
     _asSrc = _fresh_var("_asSrc")
-    loop_open = entity_loop_open(sel, _asE)
+    if uuid_raw is not None:
+        # UUID 단일 대상: as @s 케이스와 같은 '단일-open' 패턴(여는 중괄호 1개).
+        # instanceof 패턴 바인딩이 null 체크를 겸한다(Entity 는 항상 Entity → null 만 거름).
+        loop_open = [f'if (KfcGen.entityByUuid(ctx, {jstr(uuid_raw)}) '
+                     f'instanceof net.minecraft.entity.Entity {_asE}) {{']
+    else:
+        loop_open = entity_loop_open(sel, _asE)
     if loop_open is None:
         if _sel_has_extra(sel):
             em.reason = "as 셀렉터 추가필드(nbt/team/level/name/adv) 폴백경로 미지원"
@@ -5994,6 +6049,12 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         j += 1
     sel = parse_selector(sel_raw)
     if sel is None:
+        # UUID 리터럴 대상(as 7437-0-14-0-0 ... — stevemo 컷씬): 단일 엔티티 1회 실행.
+        # 재귀 경로가 as 이후 수정자(at/facing 등)까지 일괄 처리하므로 그리로 위임.
+        if sel_raw and re.fullmatch(
+                r'[0-9a-fA-F]{1,8}-[0-9a-fA-F]{1,4}-[0-9a-fA-F]{1,4}'
+                r'-[0-9a-fA-F]{1,4}-[0-9a-fA-F]{1,12}', sel_raw):
+            return _emit_as_loop_recursive(line, head, tail, em, None, uuid_raw=sel_raw)
         em.reason = f"as 셀렉터 파싱 실패: {sel_raw}"
         return False
 
@@ -6701,6 +6762,41 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
         elif tgtkind == "storage":
             sid = first_arg(args, "target")
             return _scaled_get(f'KfcGen.storageGetDouble(server, {jstr(sid)}, {jstr(path)})')
+    elif cmd == "data" and ("modify" in nn) and ("string" in nn):
+        # store result|success ... run data modify storage <t> <p> set string <src> [s [e]]
+        # 바닐라 result = NbtPath.put 변경 종단 수(비문자열/범위 밖/값 불변 = 실패 → 0).
+        si2 = nn.index("string")
+        skind = nn[si2 + 1] if si2 + 1 < len(nn) else None
+        if nn[2] != "storage":
+            em.reason = "store←data set string 비-storage 대상 미지원"
+            return None
+        read = _data_source_read_expr(skind, args)
+        tid = first_arg(args, "target"); tpath = first_arg(args, "targetPath")
+        if read is None or not tid or not tpath:
+            em.reason = "store←data set string 소스/대상 미지원"
+            return None
+        def _sidx2(v, dflt):
+            if v is None:
+                return dflt
+            if re.fullmatch(r'MACROVAR_\d+', str(v)):
+                return f'Integer.parseInt({jstr(v)})'
+            try:
+                int(v); return str(v)
+            except (ValueError, TypeError):
+                return None
+        s_e = _sidx2(first_arg(args, "start"), "0")
+        e_e = _sidx2(first_arg(args, "end"), "Integer.MIN_VALUE")
+        if s_e is None or e_e is None:
+            em.reason = "store←data set string 인덱스 미지원"
+            return None
+        vsrc = _fresh_var("vsrc"); dres = _fresh_var("dres")
+        em.side_effects = [
+            f"int {dres} = 0;",
+            f"{{ net.minecraft.nbt.NbtElement {vsrc} = {read};",
+            f"  if ({vsrc} != null) {dres} = KfcGen.nbtSetStorageString(server, "
+            f"{jstr(tid)}, {jstr(tpath)}, {vsrc}, {s_e}, {e_e}); }}",
+        ]
+        return dres
     elif cmd == "data" and ("modify" in nn) and ("from" in nn):
         # store result|success ... run data modify <dst> set from <src>
         #  -> 바닐라 executeModify: result = NbtPath.put 이 실제 바꾼 종단 수(값 불변 시 0 → 실패, store 0).
@@ -6920,9 +7016,18 @@ def single_entity_expr(raw: str) -> str | None:
        @s[tag,type] -> executor (태그/타입 가드를 삼항으로)
        @n / @e[limit=1] -> KfcGen.nearestEntity(...)
        @p[...] -> KfcGen.nearestPlayer(...)
+       <UUID 리터럴> -> KfcGen.entityByUuid(...)
     """
     sel = parse_selector(raw)
     if sel is None:
+        # UUID 리터럴 대상: 바닐라 EntitySelector 는 uuid 지정 시 서버의 '모든 월드'에서
+        # getEntity(uuid) 로 찾는다(EntitySelector.getEntities 바이트코드 확인).
+        # 컷씬(stevemo:frame, chagogo:chago_frame1/*)이 프레임마다 `data merge entity <uuid>`
+        # / `as <uuid>` 를 쓰는데, 이 미지원이 틱 도달 함수 폴백 61개 중 55개의 원인이었다.
+        if raw and re.fullmatch(
+                r'[0-9a-fA-F]{1,8}-[0-9a-fA-F]{1,4}-[0-9a-fA-F]{1,4}'
+                r'-[0-9a-fA-F]{1,4}-[0-9a-fA-F]{1,12}', raw):
+            return f'KfcGen.entityByUuid(ctx, {jstr(raw)})'
         return None
     if _sel_has_extra(sel):
         return None  # nbt/advancements/team/level/name: 최근접 탐색 미수용 -> 폴백(정확성)

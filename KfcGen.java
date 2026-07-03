@@ -2671,6 +2671,19 @@ public final class KfcGen {
         return v >= min && v <= max;
     }
 
+    /** if score <엔티티> <obj> matches — 엔티티 ScoreHolder 직접(미설정=불일치, 바닐라 동일).
+     *  (getScoreOfEntity 는 미설정을 0으로 돌려줘 matches 0 판정이 틀어진다 — 조건엔 이걸 쓸 것.) */
+    public static boolean scoreMatchesEntity(ServerScoreboard sb, net.minecraft.entity.Entity e,
+                                             String o, int min, int max) {
+        if (e == null) return false;
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return false;
+        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        return v >= min && v <= max;
+    }
+
     /** if score <a> OP <b> (비교형). 둘 중 하나라도 값 없으면 false(=mcfunction 시맨틱). */
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, String hb, String ob) {
@@ -3339,6 +3352,95 @@ public final class KfcGen {
             if (stackMatches(ref.get(), itemId, customDataSnbt)) return true;
         }
         return false;
+    }
+
+    // ── if items <slot> <복합 술어(컴포넌트/서브술어)> — 바닐라 파서 위임 경로 ──
+    // 간이 파서(itemId+custom_data)가 못 푸는 임의 술어(minecraft:leather_helmet[
+    // minecraft:dyed_color=255,enchantments={...}] 등)를 위 parseItemPredicate(clear 매크로와
+    // 공용, 바닐라 ItemPredicateArgumentType)로 '런타임 파싱' 해 Predicate<ItemStack> 그대로 사용.
+    // 바닐라 ExecuteCommand.countMatchingItems 와 동일: SlotRange 의 각 슬롯 스택에
+    // predicate.test — 조건으로는 매치 존재 여부(count>0)만 필요.
+    // 캐시하지 않음: 술어가 reloadable 데이터(아이템 태그, 1.21+ 데이터드리븐 인챈트 등)에
+    // 바인딩될 수 있어 /reload 후 stale 참조 위험 — 기존 parseItemPredicate 정책과 동일.
+
+    /** if items entity <e> <slot> <임의 술어> — 바닐라 술어 시맨틱 그대로(매치 존재 여부). */
+    public static boolean itemsMatchSlotsPred(net.minecraft.server.MinecraftServer server,
+                                              net.minecraft.entity.Entity e,
+                                              String slotName, String predStr) {
+        if (e == null) return false;
+        java.util.function.Predicate<net.minecraft.item.ItemStack> pred = parseItemPredicate(server, predStr);
+        if (pred == null) return false;   // 무효 술어: 바닐라도 파싱 실패로 조건 불성립(함수 내 무피드백)
+        net.minecraft.inventory.SlotRange r;
+        try { r = net.minecraft.inventory.SlotRanges.fromName(slotName); }
+        catch (Exception ex) { return false; }
+        if (r == null) return false;
+        it.unimi.dsi.fastutil.ints.IntList ids = r.getSlotIds();
+        for (int k = 0; k < ids.size(); k++) {
+            net.minecraft.inventory.StackReference ref = e.getStackReference(ids.getInt(k));
+            if (ref == net.minecraft.inventory.StackReference.EMPTY) continue;
+            net.minecraft.item.ItemStack st = ref.get();
+            if (st != null && pred.test(st)) return true;
+        }
+        return false;
+    }
+
+    // ── if/unless items 의 '조건' 시맨틱 헬퍼 ──
+    // 바닐라(ExecuteCommand): items entity 는 EntityArgumentType.getEntities — 셀렉터가 아무도
+    // 못 찾으면 ENTITY_NOT_FOUND_EXCEPTION 으로 '조건 명령 자체가 실패' → if 든 unless 든
+    // 그 분기는 실행되지 않는다(바이트코드 확인). 따라서 negate(unless)를 조건식 바깥에서
+    // !(...) 로 감싸면 '대상 없음' 이 unless 참으로 둔갑한다(팀모자 매틱 재장착 버그의 원인).
+    // 이 헬퍼들은 negate 를 '아이템 매치' 에만 적용하고, 대상 없음은 무조건 false 를 돌려준다.
+
+    /** 단일 대상 items 조건. e == null(셀렉터 매치 실패) → false (negate 무관, 바닐라 예외 동등). */
+    public static boolean itemsCond(net.minecraft.entity.Entity e, String slotName,
+                                    String itemId, String customDataSnbt, boolean negate) {
+        if (e == null) return false;
+        boolean m = itemsMatchSlots(e, slotName, itemId, customDataSnbt);
+        return negate ? !m : m;
+    }
+
+    /** 단일 대상 + 복합 술어(바닐라 파서) items 조건. e == null → false (negate 무관). */
+    public static boolean itemsCondPred(net.minecraft.server.MinecraftServer server,
+                                        net.minecraft.entity.Entity e, String slotName,
+                                        String predStr, boolean negate) {
+        if (e == null) return false;
+        boolean m = itemsMatchSlotsPred(server, e, slotName, predStr);
+        return negate ? !m : m;
+    }
+
+    /** 멀티 플레이어(@a/@p/@r 태그필터) items 조건 — 바닐라: 매치 엔티티 0명이면 예외(미실행),
+     *  1명 이상이면 '아이템 매치 합>0' 을 negate 적용해 판정. */
+    public static boolean anyPlayerItemsCond(GameContext ctx, String[] tagsPos, String[] tagsNeg,
+                                             String slot, String itemId, String customNbt, boolean negate) {
+        boolean anyEntity = false, found = false;
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            boolean ok = true;
+            for (String t : tagsPos) if (!p.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok) for (String t : tagsNeg) if (p.getCommandTags().contains(t)) { ok = false; break; }
+            if (!ok) continue;
+            anyEntity = true;
+            if (!found && itemsMatchSlots(p, slot, itemId, customNbt)) found = true;
+            if (found && !negate) return true;   // if: 조기 종료 가능
+        }
+        if (!anyEntity) return false;            // 대상 없음 = 바닐라 예외 = 미실행
+        return negate ? !found : found;
+    }
+
+    /** 멀티 엔티티(@e/@n 태그필터) items 조건 — anyPlayerItemsCond 와 동일 시맨틱. */
+    public static boolean anyEntityItemsCond(GameContext ctx, String[] tagsPos, String[] tagsNeg,
+                                             String slot, String itemId, String customNbt, boolean negate) {
+        boolean anyEntity = false, found = false;
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+            boolean ok = true;
+            for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
+            if (ok) for (String t : tagsNeg) if (e.getCommandTags().contains(t)) { ok = false; break; }
+            if (!ok) continue;
+            anyEntity = true;
+            if (!found && itemsMatchSlots(e, slot, itemId, customNbt)) found = true;
+            if (found && !negate) return true;
+        }
+        if (!anyEntity) return false;
+        return negate ? !found : found;
     }
 
     /** if items entity @a <slot> <pred> : 어떤 플레이어든 슬롯에 일치 아이템 보유.

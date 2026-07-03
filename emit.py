@@ -5041,9 +5041,21 @@ def _emit_store_cond(head, em) -> bool:
     _, dargs = split_chain(directive)
     holder, obj = store_score_dst(dargs)
     h = holder_expr(holder) if holder else None
-    if h is None:
-        em.reason = f"store 대상 셀렉터({holder}) <조건> 미지원"
-        return False
+    dst_pre = []
+    if h is not None:
+        dst_write = lambda valexpr: f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {valexpr});'
+    else:
+        # 대상이 셀렉터(@n[...] 등 단일 해소형) — 바닐라 store 는 인자 해소 시점(값 조건
+        # 평가 전)에 타깃을 확정하므로, 먼저 해소해 두고 값 계산 후 기록한다.
+        dent = single_entity_expr(holder) if holder else None
+        if dent is None:
+            em.reason = f"store 대상 셀렉터({holder}) <조건> 미지원"
+            return False
+        dv = _fresh_var("_stDst")
+        dst_pre.append(f'net.minecraft.entity.Entity {dv} = {dent};')
+        dst_write = lambda valexpr: (
+            f'if ({dv} != null) KfcGen.setScore(sb, {dv}.getNameForScoreboard(), '
+            f'{jstr(obj)}, {valexpr});')
 
     vnn = [s["node"] for s in value_part if "node" in s]
     _, vargs = split_chain(value_part)
@@ -5098,13 +5110,19 @@ def _emit_store_cond(head, em) -> bool:
         sh = first_arg(vargs, "target")
         so = first_arg(vargs, "targetObjective")
         shg = holder_expr(sh) if sh else None
-        if shg is None or not so:
-            em.reason = f"store if score 셀렉터홀더({sh}) 미지원"
-            return False
         slo, shi = parse_range(first_arg(vargs, "range") or "")
         lo_j = _scbound(slo, "Integer.MIN_VALUE")
         hi_j = _scbound(shi, "Integer.MAX_VALUE")
-        basec = f"KfcGen.scoreMatches(sb, {shg}, {jstr(so)}, {lo_j}, {hi_j})"
+        if shg is not None and so:
+            basec = f"KfcGen.scoreMatches(sb, {shg}, {jstr(so)}, {lo_j}, {hi_j})"
+        else:
+            # 홀더가 셀렉터(@n[...] 등 단일 해소형) — 엔티티 ScoreHolder 로 직접 매칭
+            # (미설정 = 불일치, 바닐라 동일). 해소 실패(대상 없음)도 불일치.
+            sent = single_entity_expr(sh) if sh else None
+            if sent is None or not so:
+                em.reason = f"store if score 셀렉터홀더({sh}) 미지원"
+                return False
+            basec = f"KfcGen.scoreMatchesEntity(sb, {sent}, {jstr(so)}, {lo_j}, {hi_j})"
         valexpr = f"(!({basec}) ? 1 : 0)" if negate else f"({basec} ? 1 : 0)"
     elif ctype == "data":
         # store result ... if data <entity|storage> <path> (run 없음) -> 매칭 원소 수 저장
@@ -5141,7 +5159,8 @@ def _emit_store_cond(head, em) -> bool:
         em.reason = f"store if {ctype} <조건> 미지원"
         return False
 
-    body.append(f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {valexpr});')
+    body = dst_pre + body
+    body.append(dst_write(valexpr))
     if guard_lines:
         em.java.extend(guard_lines)
         em.java.extend(["    " + b for b in body])
@@ -5612,33 +5631,78 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 pred = next_arg("item_predicate")
                 if not ent or not slot:
                     return ("UNS", [], "if items 대상/슬롯 없음", [])
+                # ── if/unless items 시맨틱(바닐라 바이트코드 확인): 대상 셀렉터가 아무도
+                #    못 찾으면 ENTITY_NOT_FOUND 예외 = '조건 명령 실패' → if/unless 모두 미실행.
+                #    따라서 negate(unless)는 반드시 '아이템 매치'에만 적용해야 하며(KfcGen.itemsCond*
+                #    헬퍼가 소비), 조건식 전체를 !() 로 감싸면 '대상 없음'이 unless 참으로 둔갑한다
+                #    (@s[scores=팀] 팀모자 매틱 재장착 버그의 원인).
+                neg_j = "true" if neg else "false"
                 parsed = parse_clear_item(pred["raw"] if pred else "*")
+                slot_j = jstr(slot["raw"])
                 if parsed is None:
-                    return ("UNS", [], f"if items 술어 미지원: {pred and pred['raw'][:40]}", [])
+                    # 간이 파서가 못 푸는 복합 술어(컴포넌트/enchantments/서브술어) —
+                    # 바닐라 ItemPredicateArgumentType 런타임 파싱 경로로 위임(관측 동등).
+                    pred_j = jstr(pred["raw"]) if pred else jstr("*")
+                    def _pred_call(eexpr):
+                        return (f'KfcGen.itemsCondPred({cur_src}.getServer(), '
+                                f'{eexpr}, {slot_j}, {pred_j}, {neg_j})')
+                    if ent["raw"] == "@s":
+                        c = _pred_call("executor")
+                    else:
+                        psel = parse_selector(ent["raw"])
+                        if psel is not None and psel.base == "s":
+                            g = selector_cond(psel, cur_src)
+                            if g is None:
+                                return ("UNS", [], f"if items @s[{ent['raw'][:20]}] 가드 미해소", [])
+                            # 필터 불통과 = 대상 없음 = 미실행(가드는 negate 바깥, 항상 양성)
+                            c = f'({g} && {_pred_call("executor")})'
+                        else:
+                            eexpr = single_entity_expr(ent["raw"])
+                            if eexpr is None:
+                                return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소(복합 술어)", [])
+                            c = _pred_call(eexpr)
+                    conds.append(c)
+                    i = skip_after(nn, i, "item_predicate")
+                    continue
                 item_id, custom_nbt = parsed
                 nbt_j = "null" if custom_nbt is None else jstr(custom_nbt)
                 iid_j = "null" if item_id == "*" else jstr(item_id)
-                slot_j = jstr(slot["raw"])
                 if ent["raw"] == "@s":
-                    c = f'KfcGen.itemsMatchSlots(executor, {slot_j}, {iid_j}, {nbt_j})'
+                    c = f'KfcGen.itemsCond(executor, {slot_j}, {iid_j}, {nbt_j}, {neg_j})'
+                    conds.append(c)
+                    i = skip_after(nn, i, "item_predicate")
+                    continue
                 else:
+                    _psel0 = parse_selector(ent["raw"])
+                    if _psel0 is not None and _psel0.base == "s":
+                        # @s[필터] — 셀렉터는 실행자 자신만 가리킴. 필터(가드)는 negate 바깥.
+                        g0 = selector_cond(_psel0, cur_src)
+                        if g0 is None:
+                            return ("UNS", [], f"if items @s[{ent['raw'][:20]}] 가드 미해소", [])
+                        c = (f'({g0} && KfcGen.itemsCond(executor, '
+                             f'{slot_j}, {iid_j}, {nbt_j}, {neg_j}))')
+                        conds.append(c)
+                        i = skip_after(nn, i, "item_predicate")
+                        continue
                     eexpr = single_entity_expr(ent["raw"])
                     if eexpr is not None:
-                        c = f'KfcGen.itemsMatchSlots({eexpr}, {slot_j}, {iid_j}, {nbt_j})'
+                        # 단일 셀렉터(@n/@p/…): 해소 실패(null) = 대상 없음 = 미실행 — itemsCond 가 처리
+                        c = f'KfcGen.itemsCond({eexpr}, {slot_j}, {iid_j}, {nbt_j}, {neg_j})'
                     else:
                         # 멀티 타겟(@a/@e/@n …) 존재검사. 태그만 있는 셀렉터는 네이티브,
                         # 복잡 필터(scores/distance/type 등)는 정확성 위해 브릿지.
+                        # 매치 엔티티 0명 = 바닐라 예외(미실행) — anyXxxItemsCond 가 처리.
                         _isel = parse_selector(ent["raw"])
                         if _isel is None or not _sel_tags_only(_isel):
                             return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
                         _tp = java_str_array(_isel.tags_pos); _tn = java_str_array(_isel.tags_neg)
                         if _isel.base in ("a", "p", "r"):
-                            c = f'KfcGen.anyPlayerItemsMatch(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j})'
+                            c = f'KfcGen.anyPlayerItemsCond(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j}, {neg_j})'
                         elif _isel.base in ("e", "n"):
-                            c = f'KfcGen.anyEntityItemsMatch(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j})'
+                            c = f'KfcGen.anyEntityItemsCond(ctx, {_tp}, {_tn}, {slot_j}, {iid_j}, {nbt_j}, {neg_j})'
                         else:
                             return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소", [])
-                conds.append(f'!({c})' if neg else c)
+                conds.append(c)
                 i = skip_after(nn, i, "item_predicate")
                 continue
             elif sub == "data":

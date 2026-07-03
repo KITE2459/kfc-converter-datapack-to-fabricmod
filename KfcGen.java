@@ -206,7 +206,7 @@ public final class KfcGen {
     public static java.util.List<net.minecraft.entity.Entity> entitiesByTypeBox(
             GameContext ctx, net.minecraft.entity.EntityType<?> t, net.minecraft.util.math.Box box,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
-        return ctx.world.getOtherEntities(null, box, e -> e.getType() == t && pred.test(e));
+        return ctx.world.getOtherEntities(null, box, e -> e.isAlive() && e.getType() == t && pred.test(e));
     }
 
     /** 네이티브화하지 못한 명령을 런타임에 1회 파싱·실행하는 브릿지 폴백. */
@@ -379,7 +379,7 @@ public final class KfcGen {
     public static boolean anyEntityWhere(GameContext ctx,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (pred.test(e)) return true;
+            if (e.isAlive() && pred.test(e)) return true;   // @e/@n: 바닐라 기본 isAlive 술어
         }
         return false;
     }
@@ -655,7 +655,7 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!posInRange(origin, e.getPos(), minDist, maxDist)) continue;
             out.add(e);
         }
@@ -708,10 +708,10 @@ public final class KfcGen {
                                            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
             return !ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             return true;
         }
@@ -727,14 +727,14 @@ public final class KfcGen {
         net.minecraft.util.math.Vec3d o = origin != null ? origin.getPos() : null;
         if (o != null && maxDist >= 0) {
             for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(o, maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                 double d = e.getPos().squaredDistanceTo(o);
                 if (d < bestD) { bestD = d; best = e; }
             }
             return best;
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             double d = (o == null) ? 0 : e.getPos().squaredDistanceTo(o);
             if (d < bestD) { bestD = d; best = e; }
@@ -1117,7 +1117,7 @@ public final class KfcGen {
         double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
         net.minecraft.util.math.Box box = new net.minecraft.util.math.Box(x1, y1, z1, x2, y2, z2);
         return ctx.world.getOtherEntities(null, box,
-                en -> matchTags(en, tagsPos, tagsNeg) && kfcTypeIn(en, types));
+                en -> matchTagsAlive(en, tagsPos, tagsNeg) && kfcTypeIn(en, types));
     }
     public static boolean posInBox(net.minecraft.util.math.Vec3d o, double dx, double dy, double dz,
                                    net.minecraft.util.math.Vec3d p) {
@@ -2742,6 +2742,15 @@ public final class KfcGen {
         return true;
     }
 
+    /** @e/@n 셀렉터 해소 전용 매치 — 바닐라 EntitySelectorReader 는 @e/@n 에만 기본 술어
+     *  Entity::isAlive 를 추가한다(바이트코드 확인: readAtVariable 의 e/n 케이스만 플래그=1).
+     *  LivingEntity.isAlive = !isRemoved && health>0 이라 /kill 직후(시체 애니메이션 20틱 동안)
+     *  즉시 선택에서 제외 — 컷씬 spectate 가 죽은 주민과 새 주민 사이를 오가던 플리커의 원인 수정.
+     *  (@a/@p/@r/@s 는 dead 포함이므로 플레이어 경로는 matchTags 를 그대로 사용해야 한다.) */
+    private static boolean matchTagsAlive(net.minecraft.entity.Entity e, String[] pos, String[] neg) {
+        return e.isAlive() && matchTags(e, pos, neg);
+    }
+
     private static boolean inRange(net.minecraft.entity.Entity origin, net.minecraft.entity.Entity e,
                                    double minDist, double maxDist) {
         if (origin == null || (minDist < 0 && maxDist < 0)) return true;
@@ -2770,11 +2779,11 @@ public final class KfcGen {
         // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
         if (QUERY_BOX && origin != null && maxDist >= 0) {
             return !entitiesByTypeBox(ctx, type, rangeBox(origin, maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
         for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
-            if (matchTags(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
         }
         return false;
     }
@@ -2784,10 +2793,10 @@ public final class KfcGen {
                                            double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
             return !ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             return true;
         }
@@ -2800,12 +2809,12 @@ public final class KfcGen {
                                              double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
             return !ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
-                    en -> entityInTypeTag(en, tagId) && matchTags(en, tagsPos, tagsNeg)
+                    en -> entityInTypeTag(en, tagId) && matchTagsAlive(en, tagsPos, tagsNeg)
                           && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!entityInTypeTag(e, tagId)) continue;
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             return true;
         }
@@ -2824,7 +2833,7 @@ public final class KfcGen {
             net.minecraft.util.math.Box _bx = rangeBox(origin, maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
                 for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
-                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                     double d = e.getPos().squaredDistanceTo(origin);
                     if (d < bestD) { bestD = d; best = e; }
                 }
@@ -2833,7 +2842,7 @@ public final class KfcGen {
         }
         for (net.minecraft.entity.EntityType<?> t : types) {
             for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
-                if (!matchTags(e, tagsPos, tagsNeg)) continue;
+                if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
                 if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
                 if (d < bestD) { bestD = d; best = e; }
@@ -2849,14 +2858,14 @@ public final class KfcGen {
         double bestD = Double.MAX_VALUE;
         if (origin != null && maxDist >= 0) {
             for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                 double d = e.getPos().squaredDistanceTo(origin);
                 if (d < bestD) { bestD = d; best = e; }
             }
             return best;
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
             if (d < bestD) { bestD = d; best = e; }
@@ -2920,10 +2929,10 @@ public final class KfcGen {
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
                 out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
-                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
                 out.addAll(ctx.world.getEntitiesByType(t,
-                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             }
         }
         return out;
@@ -2975,11 +2984,11 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
             return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
         }
@@ -3032,11 +3041,11 @@ public final class KfcGen {
                                     double minDist, double maxDist) {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
             return !entitiesByTypeBox(ctx, type, rangeBox(origin.getPos(), maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
         for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
-            if (matchTags(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
         }
         return false;
     }
@@ -3169,7 +3178,7 @@ public final class KfcGen {
             net.minecraft.util.math.Box _bx = rangeBox(origin.getPos(), maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
                 for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
-                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                     double d = origin.squaredDistanceTo(e);
                     if (d < bestD) { bestD = d; best = e; }
                 }
@@ -3178,7 +3187,7 @@ public final class KfcGen {
         }
         for (net.minecraft.entity.EntityType<?> t : types) {
             for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
-                if (!matchTags(e, tagsPos, tagsNeg)) continue;
+                if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
                 if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : origin.squaredDistanceTo(e);
                 if (d < bestD) { bestD = d; best = e; }
@@ -3431,6 +3440,7 @@ public final class KfcGen {
                                              String slot, String itemId, String customNbt, boolean negate) {
         boolean anyEntity = false, found = false;
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+            if (!e.isAlive()) continue;                      // @e/@n: 바닐라 기본 isAlive 술어
             boolean ok = true;
             for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
             if (ok) for (String t : tagsNeg) if (e.getCommandTags().contains(t)) { ok = false; break; }
@@ -3460,6 +3470,7 @@ public final class KfcGen {
     public static boolean anyEntityItemsMatch(GameContext ctx, String[] tagsPos, String[] tagsNeg,
                                               String slot, String itemId, String customNbt) {
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+            if (!e.isAlive()) continue;                      // @e/@n: 바닐라 기본 isAlive 술어
             boolean ok = true;
             for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
             if (ok) for (String t : tagsNeg) if (e.getCommandTags().contains(t)) { ok = false; break; }
@@ -3470,7 +3481,7 @@ public final class KfcGen {
 
     /** 엔티티가 요구 태그(tagsPos 전부)·배제 태그(tagsNeg 없음)를 만족하는지. */
     public static boolean entityHasTags(net.minecraft.entity.Entity e, String[] tagsPos, String[] tagsNeg) {
-        if (e == null) return false;
+        if (e == null || !e.isAlive()) return false;   // @e 대상 해소 전용 — 바닐라 isAlive 술어
         for (String t : tagsPos) if (!e.getCommandTags().contains(t)) return false;
         for (String t : tagsNeg) if (e.getCommandTags().contains(t)) return false;
         return true;
@@ -3500,10 +3511,10 @@ public final class KfcGen {
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
                 out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin.getPos(), maxDist),
-                        en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
                 out.addAll(ctx.world.getEntitiesByType(t,
-                        en -> matchTags(en, tagsPos, tagsNeg)
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg)
                               && (origin == null || inRange(origin, en, minDist, maxDist))));
             }
         }
@@ -3516,11 +3527,11 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
             return ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
-                    en -> matchTags(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-            if (!matchTags(e, tagsPos, tagsNeg)) continue;
+            if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
         }

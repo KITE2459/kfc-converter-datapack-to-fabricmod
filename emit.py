@@ -6439,7 +6439,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             # 공유 스냅샷을 '복사' 해서 돈다 → 고증 정확 + ConcurrentModificationException 방지.
             # (복사는 얕은 참조 복사라 저렴; 필터/태그/위치는 참조에서 라이브로 읽어 영향 없음.)
             out.append("for (Entity e : KfcGen.passengerFirst(KfcGen.entitiesSnapshot(ctx))) {")
-            out.append(f"    Entity en = e; if (!({filt})) continue;")
+            # 바닐라 @e/@n 기본 술어 Entity::isAlive (kill 직후 시체 20틱 제외 — 바이트코드 확인)
+            out.append(f"    Entity en = e; if (!(en.isAlive() && ({filt}))) continue;")
             out.append("    " + src_line)
             out.extend(mr1)
             if mod_guard:

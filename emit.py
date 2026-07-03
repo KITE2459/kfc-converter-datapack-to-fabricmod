@@ -7309,7 +7309,10 @@ def emit_macro(obj: dict, em: Emitted) -> Emitted:
 
 def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
     """수치 매크로 파싱(Integer/Double/Float.parse*(...macroArgs.get...))을 포함한 자바 문장을
-       try-catch 로 감싸, 빈/비수치/null 인자일 때 그 줄만 스킵한다.
+       try-catch 로 감싸, 빈/비수치/null 인자일 때 KfcGen.MACRO_FAIL 을 던진다.
+       바닐라(Macro$VariableLine.instantiate, 바이트코드 확인)는 치환 라인 파싱 실패 시
+       MacroException 으로 함수 호출 '전체'가 실패한다(어떤 줄도 미실행) — 매크로 함수의
+       executeReturn 본문 전체 try 가 이 신호를 잡아 즉시 return 0 한다.
        (Integer.parseInt(null)->NumberFormatException, Double/Float.parseXxx(null)->NullPointerException
         이므로 둘 다 잡아야 double/float 매크로 인자 null 시 서버 크래시를 막을 수 있다.)
        단, 변수 선언문(`Type var = expr;`)은 그 변수가 이후 줄에서 참조될 수 있으므로
@@ -7329,14 +7332,14 @@ def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
                 indent = s[:len(s) - len(s.lstrip())]
                 cvar = f"_mcond{_uid()}"
                 out.append(f'{indent}boolean {cvar} = false;'
-                           f' try {{ {cvar} = ({mif.group(1)}); }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
+                           f' try {{ {cvar} = ({mif.group(1)}); }} catch (NumberFormatException | NullPointerException _nfe) {{ throw KfcGen.MACRO_FAIL; }}')
                 out.append(f'{indent}if ({cvar}) {{')
                 continue
             # 한 줄에서 완결된 블록(`{ ...; }` — 여는/닫는 중괄호 수 균형)은 통째로 감싸도
             # 중괄호 짝이 유지된다. 균형이 안 맞으면(블록이 다음 줄로 이어짐) 감싸지 않는다.
             if st.count("{") == st.count("}") and st.endswith("}"):
                 indent = s[:len(s) - len(s.lstrip())]
-                out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
+                out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{ throw KfcGen.MACRO_FAIL; }}')
                 continue
             out.append(s)
             continue
@@ -7349,11 +7352,11 @@ def _wrap_macro_numeric_parse(stmts: list[str]) -> list[str]:
                 default = "0" if jtype in ("int", "long", "short", "byte") else (
                     "0.0" if jtype in ("double", "float") else "null")
                 out.append(f'{indent}{jtype} {name} = {default};'
-                           f' try {{ {name} = {expr}; }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
+                           f' try {{ {name} = {expr}; }} catch (NumberFormatException | NullPointerException _nfe) {{ throw KfcGen.MACRO_FAIL; }}')
                 continue
         # 단순 문장(세미콜론 종료, 중괄호 없음)만 통째로 감싼다.
         if st.endswith(";"):
-            out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{}}')
+            out.append(f'{indent}try {{ {st} }} catch (NumberFormatException | NullPointerException _nfe) {{ throw KfcGen.MACRO_FAIL; }}')
         else:
             out.append(s)
     return out

@@ -1601,10 +1601,25 @@ public final class KfcGen {
     /** 명령 좌표 리터럴 파싱(바닐라 WorldCoordinate.parseDouble 의 centerIntegers 규칙).
      *  center=true(x/z 축)이고 토큰이 정수 리터럴(소수점 '.' 없음)이면 블록 중심으로 +0.5.
      *  (매크로 변수 좌표처럼 확장 문자열을 런타임에 받는 경우에 사용; 리터럴은 코드젠 시점에 처리된다.) */
+    /** 바닐라 매크로 인스턴스화 실패(치환 후 파싱 불가) 재현용 신호 예외.
+     *  바닐라 Macro$VariableLine.instantiate 는 치환 라인의 CommandFunction.parse 실패 시
+     *  MacroException 을 던지고, 함수 호출 전체가 실패한다 — 어떤 줄도 실행되지 않는다
+     *  (jar 바이트코드 확인). 매크로 함수의 executeReturn 본문 전체가 이 예외를 잡아 즉시
+     *  return 0 하는 것으로 재현한다(detect-exist-item 이 이 시맨틱으로 아이템 유효성을 판정).
+     *  한계: 실패 줄 '이전' 줄의 부수효과는 이미 실행됨 — 바닐라는 사전 인스턴스화라 0줄 실행.
+     *  이 팩에서 파싱 실패가 실제 발생하는 함수(detect-exist-item)는 실패 줄이 첫 줄이라 완전 동등. */
+    public static final class MacroParseFail extends RuntimeException {
+        MacroParseFail() { super(null, null, false, false); }   // 스택트레이스 억제(핫패스 안전)
+    }
+    public static final MacroParseFail MACRO_FAIL = new MacroParseFail();
+
     public static double coord(String tok, boolean center) {
-        if (tok == null) return 0.0;
+        // 매크로 좌표 전용($(x) 등) — 비수치/누락이면 바닐라 매크로 인스턴스화 실패와 동일하게
+        // 함수 전체 중단 신호를 던진다(줄 스킵이 아님).
+        if (tok == null) throw MACRO_FAIL;
         String t = tok.trim();
-        double v = Double.parseDouble(t);
+        double v;
+        try { v = Double.parseDouble(t); } catch (NumberFormatException e) { throw MACRO_FAIL; }
         if (center && t.indexOf('.') < 0) v += 0.5;   // 정수 리터럴만 센터링(소수점 있으면 정확값)
         return v;
     }
@@ -1670,9 +1685,9 @@ public final class KfcGen {
      *  파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등). */
     public static void tpMacroDest(net.minecraft.server.command.ServerCommandSource source,
                                    net.minecraft.entity.Entity t, String dest) {
-        if (t == null || dest == null) return;
+        if (t == null || dest == null) return;   // 대상 없음은 파싱 실패가 아님(빈 셀렉터)
         String[] p = dest.trim().split("\\s+");
-        if (p.length != 3 && p.length != 5) return;
+        if (p.length != 3 && p.length != 5) throw MACRO_FAIL;   // 좌표 형식 불일치 = 치환 라인 파싱 실패
         net.minecraft.util.math.Vec3d base = source.getPosition();
         double[] c = new double[3];
         for (int i = 0; i < 3; i++) {
@@ -1686,7 +1701,7 @@ public final class KfcGen {
                     if (i != 1 && s.indexOf('.') < 0) v += 0.5;   // 정수 x/z 센터링
                     c[i] = v;
                 }
-            } catch (NumberFormatException ex) { return; }
+            } catch (NumberFormatException ex) { throw MACRO_FAIL; }
         }
         float yaw = t.getYaw(), pitch = t.getPitch();
         if (p.length == 5) {
@@ -1698,7 +1713,7 @@ public final class KfcGen {
                 pitch = p[4].equals("~") ? rot.x
                         : p[4].startsWith("~") ? rot.x + Float.parseFloat(p[4].substring(1))
                         : Float.parseFloat(p[4]);
-            } catch (NumberFormatException ex) { return; }
+            } catch (NumberFormatException ex) { throw MACRO_FAIL; }
         }
         teleportToWithRot(t, c[0], c[1], c[2], yaw, pitch);
     }
@@ -3275,7 +3290,7 @@ public final class KfcGen {
         if (!(e instanceof net.minecraft.entity.player.PlayerEntity p)) return 0;
         java.util.function.Predicate<net.minecraft.item.ItemStack> pred =
                 parseItemPredicate(source.getServer(), predStr);
-        if (pred == null) return 0;
+        if (pred == null) throw MACRO_FAIL;   // 바닐라: 치환 라인 파싱 실패 = 함수 전체 실패
         net.minecraft.entity.player.PlayerInventory inv = p.getInventory();
         int matched = 0;
         for (int i = 0; i < inv.size(); i++) {

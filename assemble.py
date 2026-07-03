@@ -219,7 +219,29 @@ def _idchar(c):
     return bool(c) and bool(re.match(r'\w', c))
 
 def _fa_strip_comments(code):
-    return "\n".join(l for l in code.split("\n") if not l.lstrip().startswith("//"))
+    """// 라인주석(트레일링 포함)과 /* */ 블록주석을 제거한다(문자열/char 리터럴 내부 보호).
+       기존 구현은 '줄 시작 //' 라인만 걸러서, `return 0;   // 설명` 의 트레일링 주석이
+       _fa_top_statements 에서 별도 '문장'으로 살아남았다 — 그 주석 문장이 블록의 마지막
+       문장이 되면 _stmt_completes 기본값(True)으로 흘러 완료성 판정이 오염된다
+       (매크로 골격 catch 의 `return 0; // …` 가 정상완료로 오판 → audit MISSING 오탐)."""
+    out = []; i = 0; n = len(code)
+    while i < n:
+        c = code[i]
+        if c in '"\'':
+            j = _fa_skip_string(code, i)
+            out.append(code[i:j]); i = j; continue
+        if c == '/' and i + 1 < n and code[i + 1] == '/':
+            while i < n and code[i] != '\n':
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and code[i + 1] == '*':
+            i += 2
+            while i + 1 < n and not (code[i] == '*' and code[i + 1] == '/'):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        out.append(c); i += 1
+    return ''.join(out)
 
 def _fa_skip_string(s, i):
     q = s[i]; i += 1; n = len(s)
@@ -346,6 +368,32 @@ def _stmt_completes(stmt):
     if s.startswith('{'):
         inners = _fa_top_statements(s[1:_fa_balanced(s, 0) - 1])
         return _stmt_completes(inners[-1]) if inners else True
+    if re.match(r'try\b', s):
+        # JLS 14.21: try-catch(-finally) 문의 정상 완료 =
+        #   finally 가 비정상 완료면 전체 비정상, 아니면 (try 블록 정상) ∨ (어떤 catch 블록 정상).
+        # 이 규칙이 없으면 try 문이 항상 '정상 완료'(기본값 True)로 오판된다 — catch 가 빈
+        # 블록이던 시절엔 우연히 참이었지만, 매크로 파싱 실패 래핑이 `catch { throw MACRO_FAIL; }`
+        # 가 되면서 마지막 문장이 `try { ... return X; } catch { throw; }` 인 함수에 trailing
+        # return 이 붙어 javac 'unreachable statement' 가 났다(Bucket 컴파일 실패의 근본 원인).
+        i = s.index('{')
+        e = _fa_balanced(s, i)
+        try_ok = _stmt_completes(s[i:e])
+        rest = s[e:].lstrip()
+        any_catch_ok = False
+        while rest.startswith('catch'):
+            p = rest.index('(')
+            pe = _fa_balanced(rest, p)
+            b = rest.index('{', pe)
+            be = _fa_balanced(rest, b)
+            if _stmt_completes(rest[b:be]):
+                any_catch_ok = True
+            rest = rest[be:].lstrip()
+        if rest.startswith('finally'):
+            b = rest.index('{')
+            be = _fa_balanced(rest, b)
+            if not _stmt_completes(rest[b:be]):
+                return False
+        return try_ok or any_catch_ok
     if re.match(r'while\s*\(\s*true\s*\)', s):
         return 'break' in s
     if re.match(r'(for|while|switch|do)\b', s):
@@ -715,13 +763,23 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     if is_macro_fn:
         # int executeReturn(source, macroArgs) 가 본문(return 값 전파), void execute 는 래퍼.
         # → `store result score X run function <macro> with ...` 가 반환값을 캡처 가능.
+        # 본문 전체 try: 바닐라 Macro$VariableLine.instantiate 는 치환 라인 파싱 실패 시
+        # MacroException 으로 함수 호출 '전체'를 실패시킨다(어떤 줄도 미실행 — jar 확인).
+        # 런타임 매크로 파싱 지점(coord/clearItemsPred/tpMacroDest/수치 래퍼)이 던지는
+        # KfcGen.MACRO_FAIL 을 여기서 잡아 즉시 return 0 으로 재현한다.
+        # (한계: 실패 줄 이전의 부수효과는 이미 실행 — 이 팩의 실제 실패 함수는
+        #  detect-exist-item 뿐이고 실패 줄이 첫 줄이라 바닐라와 완전 동등.)
         methods = f"""    public static void execute(ServerCommandSource source, Map<String, String> macroArgs) {{
         executeReturn(source, macroArgs);
     }}
 
     public static int executeReturn(ServerCommandSource source, Map<String, String> macroArgs) {{
+        try {{
         {prelude}
 {indented_body}{tail_return}
+        }} catch (KfcGen.MacroParseFail _mf) {{
+            return 0;   // 바닐라: 매크로 인스턴스화 실패 = 함수 전체 미실행
+        }}
     }}"""
     else:
         # 일반 함수: int executeReturn(source) 가 실제 본문(return 값 전파),

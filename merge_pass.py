@@ -606,6 +606,16 @@ _SA_RE = re.compile(r'new String\[\]\{(' + _STR_LIT + r'(?:\s*,\s*' + _STR_LIT +
 _ET_ELEM = r'(?:net\.minecraft\.entity\.)?EntityType\.[A-Z_][A-Z_0-9]*'
 _ET_RE = re.compile(r'new net\.minecraft\.entity\.EntityType<\?>\[\]\{(' + _ET_ELEM
                     + r'(?:\s*,\s*' + _ET_ELEM + r')*)\}')
+# 불변 값 객체 생성 호출 — 인자가 전부 리터럴이면 호출마다 검증/할당이 낭비 → static 필드로.
+#   · Identifier.of("ns","path"): 호출당 네임스페이스/경로 문자 검증 + 할당. Identifier 불변.
+#   · new Vec3d(x,y,z) (숫자 리터럴): 순수 불변 수학 객체.
+_ID_RE = re.compile(r'(?<![\w.])(?:net\.minecraft\.util\.)?Identifier\.of\(\s*'
+                    + _STR_LIT + r'\s*,\s*' + _STR_LIT + r'\s*\)')
+_NUM_LIT = r'-?\d+(?:\.\d+)?(?:[eE]-?\d+)?[fFdD]?'
+_V3_RE = re.compile(r'new net\.minecraft\.util\.math\.Vec3d\(\s*' + _NUM_LIT
+                    + r'\s*,\s*' + _NUM_LIT + r'\s*,\s*' + _NUM_LIT + r'\s*\)')
+_V2_RE = re.compile(r'new net\.minecraft\.util\.math\.Vec2f\(\s*' + _NUM_LIT
+                    + r'\s*,\s*' + _NUM_LIT + r'\s*\)')   # Vec2f: public final x,y — 불변 확인
 _CLASS_OPEN_RE = re.compile(r'^[ \t]*public\s+(?:final\s+)?class\s+\w+[^{\n]*\{', re.M)
 
 def _code_pos_ok(text: str, pos: int) -> bool:
@@ -662,6 +672,9 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     body = text[insert_at:]
     body = _sub(_SA_RE, "KFC_SA_", "String[]", body)
     body = _sub(_ET_RE, "KFC_ET_", "net.minecraft.entity.EntityType<?>[]", body)
+    body = _sub(_ID_RE, "KFC_ID_", "net.minecraft.util.Identifier", body)
+    body = _sub(_V3_RE, "KFC_V3_", "net.minecraft.util.math.Vec3d", body)
+    body = _sub(_V2_RE, "KFC_V2_", "net.minecraft.util.math.Vec2f", body)
     if n == 0:
         return text, 0
     return text[:insert_at] + "\n" + "\n".join(decls) + body, n

@@ -387,7 +387,11 @@ public final class ParseDumper implements ModInitializer {
 
     /** 재파싱 더미 후보(전략/백트랙/수리 공용). 자리 타입별: 정수/실수/문자열/식별자/리소스id/NBT맵. */
     private static final String[] CANDS =
-            {"0", "0.0001", "\"MACROVAR\"", "MACROVARID", "minecraft:stone", "{}"};
+            {"0", "1", "0.0001", "\"MACROVAR\"", "MACROVARID", "minecraft:stone", "{}", "true", "@s"};
+    // "1": limit=$(n) 등 0 이 invalid 인 정수 자리 / "true": boolean 자리 /
+    // "@s": 셀렉터 통째($(target)) 자리 — 재파싱만 뚫으면 emit 미지원 자리도 브릿지가
+    // 파싱실패-시맨틱 없이(=유효 라인으로) 정확히 실행한다. 후보 9개: 전조합 백트랙은
+    // 9^4=6561 파싱(빌드타임, 실패 라인 한정), tryRepair 는 O(변수×9) 로 여전히 수렴.
 
     private static String[] buildStrategies(String line, List<String> varNames) {
         return new String[] {
@@ -397,6 +401,8 @@ public final class ParseDumper implements ModInitializer {
                 replaceVarsAll(line, "\"MACROVAR\""),   // 문자열
                 replaceVarsAll(line, "minecraft:stone"),// 블록/아이템 id 자리(setblock/fill/give 등)
                 replaceVarsAll(line, "{}"),             // NBT 맵/컴포넌트 자리(loot components 등)
+                replaceVarsAll(line, "true"),           // boolean 자리(hideParticles 등)
+                replaceVarsAll(line, "@s"),             // 셀렉터 통째 자리($(target))
         };
     }
 

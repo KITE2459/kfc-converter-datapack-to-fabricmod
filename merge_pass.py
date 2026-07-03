@@ -23,6 +23,15 @@ from __future__ import annotations
 import re, hashlib
 from pathlib import Path
 
+def _write_if_changed(path, text):
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.write_text(text, encoding="utf-8")
+    return True
+
 MERGE_MAX = 40 * 1024
 METHOD_CAP = 64 * 1024
 CLASS_CAP = 600 * 1024
@@ -33,13 +42,17 @@ CLS_RE = re.compile(r'public final class (\w+)')
 MACRO_SIG_RE = re.compile(r'executeReturn\(ServerCommandSource\s+\w+,\s*Map<String,\s*String>')
 
 class Cls:
-    def __init__(self, path: Path, text: str):
+    def __init__(self, path: Path, text: str, *, fid=None, package=None, cls_name=None):
         self.path = path
         self.text = text
-        self.fid = (FID_RE.search(text) or [None, None])[1] if FID_RE.search(text) else None
-        m = FID_RE.search(text); self.fid = m.group(1) if m else None
-        self.package = PKG_RE.search(text).group(1)
-        self.cls = CLS_RE.search(text).group(1)
+        # 메타(fid/package/cls)는 convert 의 워커 결과에 이미 있으므로, 주어지면 191k×3 회의
+        # 정규식 재추출을 생략한다(메인 직렬 절감). 미지정 호출(디스크 경로)은 기존대로 파싱.
+        if fid is not None and package is not None and cls_name is not None:
+            self.fid = fid; self.package = package; self.cls = cls_name
+        else:
+            m = FID_RE.search(text); self.fid = m.group(1) if m else None
+            self.package = PKG_RE.search(text).group(1)
+            self.cls = CLS_RE.search(text).group(1)
         self.fqcn = f"{self.package}.{self.cls}"
         self.is_macro = bool(MACRO_SIG_RE.search(text))
         self.size = len(text.encode("utf-8"))
@@ -213,7 +226,7 @@ def run_merge(src_root: Path, group: str, pins: set | None = None,
     for f, c in list(classes.items()):
         if c.size > method_cap:
             new = bridge_oversized(c)
-            c.path.write_text(new, encoding="utf-8")
+            _write_if_changed(c.path, new)
             c.text = new; c.size = len(new.encode()); c.callees = set()
             c.has_bridge = True
             stats["bridged"] += 1
@@ -247,7 +260,7 @@ def run_merge(src_root: Path, group: str, pins: set | None = None,
             newp = absorb(parent, c)
             if newp is None: continue
             parent.text = newp
-            parent.path.write_text(newp, encoding="utf-8")
+            _write_if_changed(parent.path, newp)
             parent.size = len(newp.encode())
             # 말단 파일 제거
             try: c.path.unlink()
@@ -405,7 +418,7 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
                 f"public final class {cls_name} {{\n"
                 f"    private {cls_name}() {{ throw new UnsupportedOperationException(); }}\n\n"
                 + "\n\n".join(body_methods) + "\n}\n")
-        (bucket_dir / f"{cls_name}.java").write_text(code, encoding="utf-8")
+        _write_if_changed(bucket_dir / f"{cls_name}.java", code)
         written += 1
 
     # 5) 원본 per-함수 파일 제거
@@ -422,7 +435,7 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
             continue
         nt = rewrite_calls(t)
         if nt != t:
-            jf.write_text(nt, encoding="utf-8")
+            _write_if_changed(jf, nt)
 
     # 7) 비워진 패키지 폴더 정리(병합 후 per-함수 .java 가 전부 사라진 디렉터리들)
     _prune_empty_dirs(src_root, verbose=verbose)
@@ -522,7 +535,7 @@ def bucketize_records(records, src_root: Path, group: str,
                 f"public final class {cls_name} {{\n"
                 f"    private {cls_name}() {{ throw new UnsupportedOperationException(); }}\n\n"
                 + "\n\n".join(body_methods) + "\n}\n")
-        (bucket_dir / f"{cls_name}.java").write_text(code, encoding="utf-8")
+        _write_if_changed(bucket_dir / f"{cls_name}.java", code)
         written += 1
 
     # 7) 비생성 on-disk 파일(ModEntry/stub 등) 호출 재작성 (KfcGen·버킷 제외) — 파일 기반과 동일
@@ -534,7 +547,7 @@ def bucketize_records(records, src_root: Path, group: str,
         t = jf.read_text(encoding="utf-8")
         nt = rewrite_calls(t)
         if nt != t:
-            jf.write_text(nt, encoding="utf-8")
+            _write_if_changed(jf, nt)
 
     if verbose:
         print(f"[bucketize:mem] {len(records)} functions -> {written} bucket classes "
@@ -567,7 +580,7 @@ def run_postpass(src_root: Path, group: str, pins: set | None = None,
     for f, c in list(classes.items()):
         if c.size > METHOD_CAP:
             new = bridge_oversized(c)
-            c.path.write_text(new, encoding="utf-8")
+            _write_if_changed(c.path, new)
             c.text = new; c.size = len(new.encode())
             bridged += 1
             if verbose: print(f"  [bridge>64KB] {c.fid}")

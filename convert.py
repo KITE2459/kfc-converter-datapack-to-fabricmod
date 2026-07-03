@@ -180,6 +180,19 @@ def _mp_convert_local(item, group):
 # 개선: 메인은 raw 문자열만 함수 경계로 묶고(json.loads 안 함), 워커가 json.loads + emit 을
 # 모두 수행 → 파싱까지 코어 수만큼 병렬화. (출력은 기존 경로와 바이트 동일.)
 
+def write_if_changed(path, text: str, encoding="utf-8") -> bool:
+    """내용이 기존 파일과 동일하면 기록하지 않는다(mtime 보존).
+       emit 이 함수 단위 결정적 출력이므로, 데이터팩 일부만 바뀌는 반복 변환에서
+       불변 버킷/리소스의 mtime 이 유지 → gradle 증분 컴파일이 그 컴파일을 스킵한다."""
+    try:
+        if path.exists() and path.read_text(encoding=encoding) == text:
+            return False
+    except OSError:
+        pass
+    path.write_text(text, encoding=encoding)
+    return True
+
+
 def _scan_fid(line: str):
     """JSONL 한 줄에서 function 값만 싸게 추출(json.loads 회피).
        형식: ...,"function":"ns:path"}  — fid 에는 따옴표/역슬래시가 없다."""
@@ -253,9 +266,10 @@ def _mp_convert_raw(item):
     fid, raws = item
     objs = [_json.loads(r) for r in raws]
     jc = _f2c(fid, objs, group=_W_GROUP)
+    from assemble import audit_executeReturn as _aud
     return (fid, jc.package, jc.cls, jc.code,
             jc.native_lines, jc.gated_lines, jc.bridge_lines, jc.fully_converted,
-            _collect_called(objs))
+            _collect_called(objs), _aud(jc.code))
 
 
 def _mp_convert_local_raw(item, group):
@@ -265,9 +279,10 @@ def _mp_convert_local_raw(item, group):
     fid, raws = item
     objs = [_json.loads(r) for r in raws]
     jc = _f2c(fid, objs, group=group)
+    from assemble import audit_executeReturn as _aud
     return (fid, jc.package, jc.cls, jc.code,
             jc.native_lines, jc.gated_lines, jc.bridge_lines, jc.fully_converted,
-            _collect_called(objs))
+            _collect_called(objs), _aud(jc.code))
 
 
 def _trees_is_jsonl(trees_path: str) -> bool:
@@ -433,16 +448,19 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             called.update(res[8])          # raw 워커가 모은 호출대상 합치기
         if _records is not None:
             # [A] 디스크 미기록: 메모리 누적(Cls 가 code 텍스트에서 fid/pkg/cls/macro 파싱).
-            _records.append(_mp_mod.Cls(None, code))
+            _records.append(_mp_mod.Cls(None, code, fid=fid, package=pkg, cls_name=cls))
         else:
             pkg_dir = src_root / Path(*pkg.split("."))
             pkg_dir.mkdir(parents=True, exist_ok=True)
-            (pkg_dir / f"{cls}.java").write_text(code, encoding="utf-8")
+            write_if_changed(pkg_dir / f"{cls}.java", code)
         stats["native"] += nat
         stats["gated"] += gat
         stats["bridge"] += br
         fn_meta.append((fid, pkg, cls, nat, gat, br, full))
-        _au = audit_executeReturn(code)
+        if len(res) > 9:
+            _au = res[9]            # 워커가 수행한 감사(메인 직렬 ~95s → 병렬부로 이동)
+        else:
+            _au = audit_executeReturn(code)
         if _au:
             audit_violations.append((fid, _au))
         generated_fids.add(fid)
@@ -516,7 +534,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         pkg_dir.mkdir(parents=True, exist_ok=True)
         f = pkg_dir / f"{jc.cls}.java"
         if not f.exists():
-            f.write_text(jc.code, encoding="utf-8")
+            write_if_changed(f, jc.code)
             stub_count += 1
     if stub_count:
         print(f"[generate] generated {stub_count} additional stub classes for call targets (macro/unparsed functions)")
@@ -529,7 +547,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         kg = re.sub(r'^package\s+[\w.]+;', f'package {group}.generated;', kg, count=1, flags=re.M)
         gen_dir = src_root / Path(*f"{group}.generated".split("."))
         gen_dir.mkdir(parents=True, exist_ok=True)
-        (gen_dir / "KfcGen.java").write_text(kg, encoding="utf-8")
+        write_if_changed(gen_dir / "KfcGen.java", kg)
         print(f"[generate] KfcGen.java -> {group}.generated")
     else:
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
@@ -578,7 +596,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
                     pkg_dir.mkdir(parents=True, exist_ok=True)
                     p = pkg_dir / f"{c.cls}.java"
                     if not p.exists():
-                        p.write_text(c.text, encoding="utf-8")
+                        write_if_changed(p, c.text)
 
     # ── [pass-4] 상수 배열 호이스팅: 방출된 `new String[]{...}` 등 상수 리터럴을
     #    클래스 static final 필드로 승격 — 실행당 할당 제거 + 메서드 바이트코드 축소.
@@ -909,7 +927,7 @@ public final class ModEntry implements ModInitializer {{
 }}
 """
     (src_root / Path(*group.split("."))).mkdir(parents=True, exist_ok=True)
-    (src_root / Path(*group.split(".")) / "ModEntry.java").write_text(code, encoding="utf-8")
+    write_if_changed(src_root / Path(*group.split(".")) / "ModEntry.java", code)
     print(f"[generate] entrypoint ModEntry.java (load {len(tags.get('load',[]))} / tick {len(tags.get('tick',[]))})")
 
 

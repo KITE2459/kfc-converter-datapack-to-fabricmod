@@ -37,6 +37,14 @@ def set_group(g):
 MACRO_FNS: set = set()
 
 _VAR_COUNTER = [0]
+
+def reset_var_counter():
+    """함수 단위 변수 카운터 리셋 — 같은 입력이면 같은 출력(결정적 산출물).
+       변수 유일성은 '함수 내(자바 스코프)'만 필요하므로 함수 시작마다 0 으로 되돌려도 안전.
+       결정적 출력이어야 '내용 불변 파일 미기록'이 성립해 gradle 증분 컴파일이 동작한다
+       (반복 개발에서 빌드가 변경 버킷만 재컴파일 → 수 초)."""
+    _VAR_COUNTER[0] = 0
+
 def _fresh_var(prefix: str) -> str:
     """함수 내 임시변수 충돌 방지용 전역 유니크 이름."""
     _VAR_COUNTER[0] += 1

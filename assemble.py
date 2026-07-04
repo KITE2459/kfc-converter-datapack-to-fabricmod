@@ -530,6 +530,73 @@ def _tco_rewrite(body: str, self_fqcn: str) -> str:
     return "\n".join(out)
 
 
+# ═══ 거대 메서드 세그먼트 분할 (JIT HugeMethodLimit 대응) ═══
+# HotSpot 은 기본 DontCompileHugeMethods=true, HugeMethodLimit=8000(바이트코드 바이트)로
+# 8KB 초과 메서드를 '영원히 인터프리터로만' 실행한다. pushslowly-rectangle(충돌 물리)·
+# boost-sound 등 핫패스 틱 함수가 이 한계를 넘으면 다른 모든 최적화가 무의미해진다.
+# (기존 bridge_oversized 는 javac 64KB 한계만 처리 — 8KB~64KB 구간이 사각지대였다.)
+# 해법: executeReturn 본문을 '라인 그룹'(mcfunction 한 줄 = 자체 스코프 블록) 경계에서
+# Integer 반환 조각(private static executeReturn_seg<k>)으로 분할한다.
+#   · return 시맨틱 무손실: 조각 반환형이 Integer 라 본문의 `return <int식>;` 이 자동박싱으로
+#     무수정 컴파일되고, 정상 완료는 `return null;` — 본체가 null 아니면 즉시 전파.
+#   · MacroParseFail(unchecked) 은 조각에서 던져도 본체 try 가 그대로 잡는다.
+#   · CSE(_selN/_eset) 캐시는 조각 경계에서 clear 되어 조각-로컬로 격리(경계는 조립 전 확정).
+#   · TCO/브릿지/거부/trace 함수는 분할 제외(기존 경로 그대로).
+_SEG_TRIGGER = 9000   # 주석 제외 코드 문자수 — 초과 시에만 분할 발동
+_SEG_TARGET  = 5500   # 조각 목표 코드 문자수(바이트코드 최악 ~1.2x 가정에도 8000B 안전권)
+_SEG_MARK    = "// __KFC_SEG_BOUNDARY__"   # 조립-렌더 간 조각 경계 전달용(최종 출력서 제거)
+
+def _seg_strip_str(l: str) -> str:
+    """문자열 리터럴 '내부' 제거 — 문자열은 상수풀로 빠져 바이트코드에 미포함(ldc 참조뿐)."""
+    out=[]; ins=False; esc=False
+    for ch in l:
+        if ins:
+            if esc: esc=False
+            elif ch=='\\': esc=True
+            elif ch=='"':
+                ins=False; out.append('"')
+        else:
+            out.append(ch)
+            if ch=='"': ins=True
+    return ''.join(out)
+
+def _code_chars(lines) -> int:
+    """주석/공백/문자열내용 제외 실질 코드 문자수(메서드 바이트코드 근사).
+       거대 SNBT 문자열 한 줄짜리 모델 함수가 불필요하게 분할되지 않도록 문자열은 제외."""
+    return sum(len(_seg_strip_str(l)) for l in lines
+               if l.strip() and not l.lstrip().startswith("//"))
+
+def _seg_bounds_for(emitted) -> set[int]:
+    """emitted 그룹별 코드량 누적으로 분할 경계(그룹 시작 인덱스) 사전 계산."""
+    bounds=set(); acc=0
+    for i, em in enumerate(emitted):
+        g=_code_chars(em.java)
+        if acc>0 and acc+g>_SEG_TARGET:
+            bounds.add(i); acc=0
+        acc+=g
+    return bounds
+
+def _seg_prelude(seg_body: str) -> str:
+    """조각 본문 텍스트가 실제 사용하는 표준 로컬만 재파생(본체 prelude 로직 미러).
+       (_exName/_pos 치환은 전체 body 에서 이미 수행된 뒤라 여기선 '사용'만 존재.)"""
+    scan="\n".join(l for l in seg_body.split("\n") if not l.lstrip().startswith("//"))
+    used=set(re.findall(r"\b[A-Za-z_]\w*\b", scan))
+    out=[]
+    need_ex = "executor" in used or "_exName" in used
+    if need_ex: out.append("Entity executor = source.getEntity();")
+    if "_exName" in used:
+        out.append("String _exName = executor == null ? null : executor.getNameForScoreboard();")
+    if "_pos" in used:
+        out.append("net.minecraft.util.math.Vec3d _pos = source.getPosition();")
+    if "ctx" in used or "sb" in used:
+        out.append("KfcGen.GameContext ctx = KfcGen.getOrCreateContext(source);")
+    if "sb" in used:
+        out.append("ServerScoreboard sb = ctx.scoreboard;")
+    if "server" in used:
+        out.append("net.minecraft.server.MinecraftServer server = source.getServer();")
+    return "\n        ".join(out)
+
+
 def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartriderpack") -> JavaClass:
     """한 함수의 파스트리 줄들 -> 자바 클래스 코드."""
     reset_var_counter()   # 함수 단위 결정적 변수 번호(같은 입력 = 같은 출력 바이트)
@@ -569,13 +636,26 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             reject_reason = em.reason
             break
 
+    # ── 세그먼트 분할 사전 판정(JIT HugeMethodLimit 대응) ──
+    # 폴백/거부/TCO/trace 함수는 기존 경로 그대로(분할 없음). 경계는 조립 '전'에 확정해
+    # CSE(_selN/_eset) 재사용이 조각 경계를 넘지 않도록 루프에서 캐시를 끊는다.
+    _will_fallback = (rejected or (is_self_recursive and not tco) or _is_force_bridged(fid)
+                      or any(_em.kind in ("bridge", "dispatch") for _em in emitted))
+    _total_code = sum(_code_chars(_em.java) for _em in emitted)
+    do_split = (not _will_fallback) and (not tco) and (not _is_traced(fid)) \
+               and _total_code > _SEG_TRIGGER
+    seg_bounds = _seg_bounds_for(emitted) if do_split else set()
     cse_cache: dict[str, str] = {}   # scan_expr -> _selN  (현재 유효한 바인딩)
     cse_set_cache: dict[str, str] = {}  # full-set expr -> _esetN (재사용 구간 내 1회 수집)
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
     cse_seq = [0]
     cse_set_seq = [0]   # _eset 전용 카운터(기존 _sel 번호 불변 → 순수 가산적)
     hit_terminal = False
-    for obj, em in zip(parse_trees, emitted):
+    for _gi, (obj, em) in enumerate(zip(parse_trees, emitted)):
+        if _gi in seg_bounds and not hit_terminal:
+            body_lines.append(_SEG_MARK)        # 조각 경계 마커(렌더에서 분할 후 제거)
+            cse_cache.clear()                   # CSE 를 조각-로컬로 격리
+            cse_set_cache.clear()
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
         if hit_terminal:
@@ -755,9 +835,37 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         mc = sorted(set(mc) | {"java.util.Map"})
     import_block = "\n".join(f"import {i};" for i in proj + mc)
 
+    # ── 세그먼트 렌더(분할 발동 시): 마커로 조각화 → 앞 조각들은 Integer 반환 메서드,
+    #    마지막 조각은 본체 인라인(기존 tail_return 흐름분석 그대로 적용). ──
+    seg_methods = ""
+    seg_calls = ""
+    if do_split and fully_converted and _SEG_MARK in body:
+        parts = [p.strip("\n") for p in body.split(_SEG_MARK)]
+        macro_sig = ", Map<String, String> macroArgs" if is_macro_fn else ""
+        macro_pass = ", macroArgs" if is_macro_fn else ""
+        rendered = []
+        calls = []
+        for k, part in enumerate(parts[:-1]):
+            pre_k = _seg_prelude(part)
+            pre_k_block = ("        " + pre_k + "\n") if pre_k else ""
+            ind = "\n".join("        " + l if l else "" for l in part.split("\n"))
+            rendered.append(
+                f"    private static Integer executeReturn_seg{k}(ServerCommandSource source{macro_sig}) {{\n"
+                f"{pre_k_block}{ind}\n"
+                f"        return null;   // 정상 완료(반환 없음) — 본체가 다음 조각으로 진행\n"
+                f"    }}")
+            calls.append(f"{{ Integer _sr = executeReturn_seg{k}(source{macro_pass}); "
+                         f"if (_sr != null) return _sr; }}")
+        seg_methods = "\n\n" + "\n\n".join(rendered)
+        seg_calls = "\n        ".join(calls) + "\n        "
+        body = parts[-1]              # 본체 인라인부(마지막 조각)만 남긴다
+    elif _SEG_MARK in body:
+        body = body.replace(_SEG_MARK + "\n", "").replace(_SEG_MARK, "")
+
     prelude = "\n        ".join(prelude_stmts)
     indented_body = "\n".join("        " + l if l else "" for l in body.split("\n"))
     tail_return = _tail_return_str(indented_body)   # 흐름분석 일원화: 매크로/비-TCO/TCO 공통
+    indented_body_stripped = indented_body.lstrip()   # seg_calls 연결 시 첫 줄 이중 들여쓰기 방지
 
     macro_note = f"\n *  매크로 함수 - 변수: {', '.join(macro_params)}." if is_macro_fn else ""
 
@@ -777,7 +885,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     public static int executeReturn(ServerCommandSource source, Map<String, String> macroArgs) {{
         try {{
         {prelude}
-{indented_body}{tail_return}
+        {seg_calls}{indented_body_stripped}{tail_return}
         }} catch (KfcGen.MacroParseFail _mf) {{
             return 0;   // 바닐라: 매크로 인스턴스화 실패 = 함수 전체 미실행
         }}
@@ -816,7 +924,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
 
     public static int executeReturn(ServerCommandSource source) {{
         {prelude}
-{indented_body}{tail_return}
+        {seg_calls}{indented_body_stripped}{tail_return}
     }}"""
 
     code = f"""package {package};
@@ -828,7 +936,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
 public final class {cls} {{
     private {cls}() {{ throw new UnsupportedOperationException(); }}
 
-{methods}
+{methods}{seg_methods}
 }}
 """
     jc = JavaClass(fid, package, cls, code, n_native, n_gated, n_bridge)

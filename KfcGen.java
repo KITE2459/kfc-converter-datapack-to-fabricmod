@@ -2734,6 +2734,17 @@ public final class KfcGen {
     }
 
     // ──────────────── if entity <selector> 존재 검사 ────────────────
+    /** 거대 SNBT 문자열 연결 — 클래스파일 상수(CONSTANT_Utf8) 65535B 한계를 넘는 리터럴을
+     *  emit 이 청크로 분할해 이 메서드로 연결한다("a"+"b"는 컴파일타임 폴딩되므로 불가).
+     *  호출부는 pass-4 가 private static final 로 호이스팅해 클래스로드 시 1회만 연결된다. */
+    public static String cat(String... parts) {
+        int n = 0;
+        for (String p : parts) n += p.length();
+        StringBuilder sb = new StringBuilder(n);
+        for (String p : parts) sb.append(p);
+        return sb.toString();
+    }
+
     private static boolean matchTags(net.minecraft.entity.Entity e, String[] pos, String[] neg) {
         if (pos.length == 0 && neg.length == 0) return true;   // 태그 필터 없음 — getCommandTags 호출조차 생략
         java.util.Set<String> tags = e.getCommandTags();        // 1회만 조회(매 태그마다 호출 안 함)
@@ -3091,6 +3102,67 @@ public final class KfcGen {
     }
 
     /** 타입 미지정 + 술어 동반 최근접 엔티티 (커스텀 타입태그/모드 타입/type=!X 런타임 가드용). */
+    // ── sort 미지정 limit=N 셀렉터(arbitrary)용 first-match 해소 ──
+    // 바닐라 @e[limit=1](sort 미지정)은 sort=arbitrary: 정렬 없이 월드 순회 순서의 첫 매치라
+    // '사실상 항상 같은 엔티티'가 뽑힌다(EntitySelectorReader 바이트코드: e/n 케이스 sorter 미설정
+    // 시 ARBITRARY). 이를 nearest 로 해소하면 소스 위치에 따라 대상이 틱마다 스위칭돼
+    // (예: logmain 모델 2대가 번갈아 전진 → 전진속도 절반/겹침) 관측이 어긋난다.
+    // first* 는 스냅샷/타입인덱스(생성 순서 기반 — 틱 간 안정) 순회의 첫 매치를 반환한다.
+    public static net.minecraft.entity.Entity firstEntity(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {
+                if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
+            }
+        }
+        return null;
+    }
+
+    public static net.minecraft.entity.Entity firstEntityAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        for (net.minecraft.entity.Entity e : allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist)) {
+            return e;
+        }
+        return null;
+    }
+
+    public static net.minecraft.entity.Entity firstEntityWhere(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {
+                if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)
+                        && pred.test(e)) return e;
+            }
+        }
+        return null;
+    }
+
+    public static net.minecraft.entity.Entity firstEntityAnyTypeWhere(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        for (net.minecraft.entity.Entity e : allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist)) {
+            if (pred.test(e)) return e;
+        }
+        return null;
+    }
+
+    /** @a[limit=1](sort 미지정 = arbitrary)용 — 접속 순서(allPlayers) 첫 매치. */
+    public static net.minecraft.entity.Entity firstPlayer(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (matchTags(p, tagsPos, tagsNeg) && inRange(origin, p, minDist, maxDist)) return p;
+        }
+        return null;
+    }
+
     public static net.minecraft.entity.Entity nearestEntityAnyTypeWhere(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,

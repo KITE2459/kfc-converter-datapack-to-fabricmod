@@ -184,9 +184,34 @@ def _scbound(v, sentinel):
     return sv if sv.lstrip("-").isdigit() else f"Integer.parseInt({sv})"
 
 
+_JSTR_LIMIT = 55000   # 클래스파일 CONSTANT_Utf8 한계(65535B) 대비 안전 여유
+_JSTR_CHUNK = 24000   # 분할 청크(원문 기준 — 이스케이프/UTF-8 팽창을 감안해도 한계 미만)
+
+def _jesc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
 def jstr(s: str) -> str:
-    """자바 문자열 리터럴."""
-    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """자바 문자열 리터럴. 거대 문자열(모델링 summon SNBT 등)은 클래스파일 상수 한계
+       (CONSTANT_Utf8 = 65535 바이트)를 넘어 javac 가 실패하므로, 원문을 청크로 나눠
+       KfcGen.cat("p1","p2",…) 런타임 연결식으로 방출한다. ("a"+"b" 는 컴파일타임
+       상수 폴딩으로 다시 한 상수가 되어 소용없음 — 메서드 연결이 필요.)
+       청크 경계는 MACROVAR_n 토큰을 자르지 않도록 보정(매크로 후처리 치환 보호).
+       짧은 문자열(사실상 전부)은 기존과 동일한 단일 리터럴 — case 라벨 등 상수 문맥 안전."""
+    esc = _jesc(s)
+    if len(esc.encode("utf-8")) <= _JSTR_LIMIT:
+        return '"' + esc + '"'
+    parts = []
+    i, n = 0, len(s)
+    while i < n:
+        j = min(n, i + _JSTR_CHUNK)
+        if j < n:
+            k = s.rfind("MACROVAR_", max(i, j - 16), j)
+            if k != -1:
+                mm = re.match(r'MACROVAR_\d+', s[k:])
+                if mm and k + len(mm.group(0)) > j:
+                    j = k              # 토큰 시작 앞에서 절단
+        parts.append(s[i:j]); i = j
+    return "KfcGen.cat(" + ", ".join('"' + _jesc(p) + '"' for p in parts) + ")"
 
 
 def _jnum(tok, parse_fn, suffix=""):
@@ -1292,7 +1317,11 @@ def _want_nearest(sel: "Selector") -> bool:
 
 
 def nearest_entity_java(sel: "Selector") -> str | None:
-    """비-@s 엔티티 소스 셀렉터 -> 최근접 엔티티 자바 식(없으면 null 반환식). 불가 시 None."""
+    """비-@s 엔티티 소스 셀렉터 -> '단일 엔티티' 자바 식(없으면 null 반환식). 불가 시 None.
+       바닐라 sort 규칙(_want_nearest)에 따라: @n/@p/sort=nearest 는 최근접,
+       @e/@a[limit=1](sort 미지정 = ARBITRARY)는 first-match(월드 순회 순서 첫 매치 —
+       틱 간 안정적으로 같은 엔티티)로 해소한다. nearest 로 잘못 해소하면 소스 위치에 따라
+       대상이 스위칭돼(logmain 모델 2대 번갈아 전진 등) 관측이 어긋난다."""
     if sel is None or sel.scores or getattr(sel, "predicates", None) or _sel_has_extra(sel):
         return None
     lo = hi = "-1"
@@ -1302,16 +1331,20 @@ def nearest_entity_java(sel: "Selector") -> str | None:
         hi = _dist_arg(dhi)
     tp = java_str_array(sel.tags_pos)
     tn = java_str_array(sel.tags_neg)
+    near = _want_nearest(sel)
     if sel.base in ("a", "p", "r"):
-        return f'KfcGen.nearestPlayer(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
+        fnp = "nearestPlayer" if (near or sel.base == "r") else "firstPlayer"
+        return f'KfcGen.{fnp}(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
     jt = resolve_entity_types(sel)
     if jt is None:
-        # 타입 미지정(@n[tag=...]/@e[tag=...]) -> 전 엔티티 중 최근접
+        # 타입 미지정(@n[tag=...]/@e[tag=...]) -> 전 엔티티 대상
         if not getattr(sel, "type_id", None) and not getattr(sel, "type_is_tag", False):
-            return f'KfcGen.nearestEntityAnyType(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
+            fne = "nearestEntityAnyType" if near else "firstEntityAnyType"
+            return f'KfcGen.{fne}(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
         return None
     arr = "new net.minecraft.entity.EntityType[]{" + ", ".join(jt) + "}"
-    return f'KfcGen.nearestEntity(ctx, source.getPosition(), {arr}, {tp}, {tn}, {lo}, {hi})'
+    fnt = "nearestEntity" if near else "firstEntity"
+    return f'KfcGen.{fnt}(ctx, source.getPosition(), {arr}, {tp}, {tn}, {lo}, {hi})'
 
 
 def block_pos_java(raw: str | None) -> str | None:
@@ -2897,10 +2930,12 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
                 return False
             if types:
                 arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
-                ent = (f'KfcGen.nearestEntityWhere(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
+                _fnw3 = "nearestEntityWhere" if _want_nearest(sel) else "firstEntityWhere"
+                ent = (f'KfcGen.{_fnw3}(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
                        f'{dmin}, {dmax}, _ee -> ({pred}))')
             else:
-                ent = (f'KfcGen.nearestEntityAnyTypeWhere(ctx, source.getPosition(), {tp}, {tn}, '
+                _fnw4 = "nearestEntityAnyTypeWhere" if _want_nearest(sel) else "firstEntityAnyTypeWhere"
+                ent = (f'KfcGen.{_fnw4}(ctx, source.getPosition(), {tp}, {tn}, '
                        f'{dmin}, {dmax}, _ee -> ({pred}))')
             em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
                            f' if (_t != null) _t.{fn}({jstr(name)}); }}')
@@ -7264,7 +7299,8 @@ def single_entity_expr(raw: str) -> str | None:
             return f'KfcGen.nearestPlayerWhere(ctx, source.getPosition(), _pe -> ({body5}))'
         if _is_arbitrary:
             return f'KfcGen.firstPlayer(ctx, {tp}, {tn}, {dmin}, {dmax}, source.getPosition())'
-        return f'KfcGen.nearestPlayer(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
+        _fnp = "nearestPlayer" if (_want_nearest(sel) or sel.base == "r") else "firstPlayer"
+        return f'KfcGen.{_fnp}(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
     if sel.base in ("n", "e"):
         types = resolve_entity_types(sel)
         if sel.type_id and not sel.type_is_tag:
@@ -7297,7 +7333,8 @@ def single_entity_expr(raw: str) -> str | None:
             _vc = _volume_cond(sel, "_ee")
             if _vc: extra.append(_vc)
             body6 = " && ".join(extra) if extra else "true"
-            return (f'KfcGen.nearestEntityAnyTypeWhere(ctx, source.getPosition(), {tp}, {tn}, '
+            _fnw = "nearestEntityAnyTypeWhere" if _want_nearest(sel) else "firstEntityAnyTypeWhere"
+            return (f'KfcGen.{_fnw}(ctx, source.getPosition(), {tp}, {tn}, '
                     f'{dmin}, {dmax}, _ee -> ({body6}))')
         arr = "new net.minecraft.entity.EntityType<?>[]{" + ", ".join(types) + "}"
         if sel.gamemode is not None:
@@ -7316,9 +7353,11 @@ def single_entity_expr(raw: str) -> str | None:
         _vc = _volume_cond(sel, "_ee")
         if _vc: ec.append(_vc)
         if ec:
-            return (f'KfcGen.nearestEntityWhere(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
+            _fnw2 = "nearestEntityWhere" if _want_nearest(sel) else "firstEntityWhere"
+            return (f'KfcGen.{_fnw2}(ctx, source.getPosition(), {arr}, {tp}, {tn}, '
                     f'{dmin}, {dmax}, _ee -> ({" && ".join(ec)}))')
-        return f'KfcGen.nearestEntity(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})'
+        _fnt2 = "nearestEntity" if _want_nearest(sel) else "firstEntity"
+        return f'KfcGen.{_fnt2}(ctx, source.getPosition(), {arr}, {tp}, {tn}, {dmin}, {dmax})'
     return None
 
 

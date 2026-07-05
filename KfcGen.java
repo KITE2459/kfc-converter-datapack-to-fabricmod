@@ -4502,16 +4502,21 @@ public final class KfcGen {
         return null;
     }
 
-    // ── DisplayEntity 병합 경로 선택 ──
-    // [확정된 사실] display 병합의 fast 경로(displayMergeFast)는 바닐라(writeNbt→copyFrom→
-    // readNbt)와 관측이 어긋나 애니메이션 프레임에서 롤백성 튐을 만든다(인게임 A/B 로 확인:
-    // slow 경로에선 튐이 사라짐). 원인은 바닐라 Entity.readNbt 가 병합 시 부수적으로 하는
-    // 위치/속도/회전·보간 baseline 재적용을 fast 가 생략하는 데 있으며, 이 상호작용은 클라이언트
-    // 렌더 타이밍에 의존해 서버측 정적 분석만으로는 완전 재현이 어렵다.
-    // → display 병합은 '바닐라 정확' 경로(slow)를 기본으로 쓴다. 이 병합들은 컷씬/애니 빈도라
-    //   writeNbt/readNbt 비용이 문제되지 않는다. 나머지 병합(스코어보드/스토리지/비-display)은
-    //   fast 를 그대로 유지하므로 전체 성능 영향은 국소적이다.
-    // 실험/프로파일 목적이면 -Dkfc.displaymerge=fast 로 (튐 있는) 기존 fast 경로를 켤 수 있다.
+    // ── DisplayEntity 병합 경로 (기본 slow = 바닐라 정확) ──
+    // [확정된 결론] display 병합의 fast 경로(displayMergeFast)는 바닐라(writeNbt→copyFrom→
+    // readNbt)와 관측이 어긋나 애니 프레임에 롤백성 튐을 만든다(인게임 A/B: slow 에선 사라짐).
+    // 원인 분해 시도 결과(모두 배제됨):
+    //   · 위치/속도/회전 재적용(resetPosition/refreshPositionAndAngles/setVelocity): 인게임 3종
+    //     실험 모두 튐 지속 → 델타 아님.
+    //   · DisplayEntity 나머지 8개 setter(billboard/brightness/width/height/glow/shadow×2/
+    //     viewRange): 전부 equality-check(2-arg) set 이라 현재값 재호출 시 no-op → 델타 아님.
+    //   · 패신저/vehicle 재확립: 대상은 단독 display(패신저 없음) → 델타 아님.
+    // 남은 유일 차이는 writeNbt→copyFrom→readNbt '라운드트립 구조 자체'로, 구성요소를 fast 에
+    // 개별 추가하는 방식으론 재현 불가(라운드트립을 하면 그것이 곧 slow). 따라서 display 병합은
+    // slow(바닐라 정확)를 확정 채택한다. 이 병합들은 컷씬/애니 및 1회성 모델 셋업 빈도라
+    // writeNbt/readNbt 비용이 문제되지 않으며(매틱 racing 핫패스엔 display 병합 없음),
+    // 스코어보드/스토리지/비-display 병합은 fast 를 그대로 유지한다.
+    // (연구/프로파일용으로만 -Dkfc.displaymerge=fast 로 튐 있는 fast 경로를 켤 수 있다.)
     private static final boolean DISPLAY_MERGE_SLOW =
             !"fast".equalsIgnoreCase(System.getProperty("kfc.displaymerge", "slow"));
 

@@ -6152,7 +6152,41 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
                 return False
 
     # as 이후 chain 재구성: execute + (as/targets 제거한 head 나머지) + run + tail
-    as_idx = next(i for i, s in enumerate(head) if s.get("node") == "as")
+    # ── as 앞 수정자/조건 보존 ──
+    # [버그 수정] 기존엔 head[:as_idx] 를 통째로 버려 `execute if score ... as <UUID> at @s run tp ...`
+    # 의 score 가드가 탈락 — ani1/stevemo:frame 컷씬에서 tp 가 매 틱 무조건 실행돼
+    # 리그가 밀려나거나(^.1/^.074/^21 창), 추락(~-.5)하거나, 절대좌표로 스냅백(272)했다
+    # (= "스티브 안 보임" + 매 틱 전진→스냅백 "롤백" 증상의 원인).
+    # 바닐라 의미: as 앞 수정자/조건은 바깥 실행자·소스 기준으로 평가되므로,
+    # parse_modifiers 로 조건(pconds)·재바인딩(prebinds)을 뽑아 루프 밖을 감싼다.
+    # positioned/rotated 의 as 는 실행자 전환이 아니므로 emit_as_loop 과 동일하게 건너뛴다.
+    as_idx = None
+    _prev_node = None
+    for _i, _s in enumerate(head):
+        _nd = _s.get("node")
+        if _nd == "as" and _prev_node not in ("positioned", "rotated"):
+            as_idx = _i
+            break
+        if _nd is not None:
+            _prev_node = _nd
+    if as_idx is None:
+        em.reason = "as 루프(재귀): 실행자 전환 as 없음"
+        return False
+    pre_conds, pre_rebinds = [], []
+    pre_src = "source"
+    pre_head = head[:as_idx]
+    if pre_head:
+        pconds, ploops, puns, prebinds = parse_modifiers(pre_head)
+        if puns is not None or ploops:
+            # as 앞 루프/미지원 수정자(at <루프셀렉터>, on 등)는 바깥 감싸기로 표현 불가
+            # → 명시 거부(브릿지 폴백). 침묵 탈락보다 항상 안전하다.
+            em.reason = f"as 루프(재귀) 앞 수정자 미지원: {puns or 'loops'}"
+            return False
+        pre_conds, pre_rebinds = pconds, prebinds
+        if pre_rebinds:
+            m = re.match(r'.*ServerCommandSource (kfcSrc\d+)', pre_rebinds[-1])
+            if m:
+                pre_src = m.group(1)
     rest = []
     rm_tn = rm_ta = False
     for item in head[as_idx + 1:]:
@@ -6179,10 +6213,22 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     # 바닐라 as <셀렉터> 는 executor 만 교체하고 위치/회전/앵커/차원은 부모 소스에서 상속한다
     # (엔티티의 getCommandSource 로 새로 만들면 위치/회전이 엔티티 기본값으로 리셋돼 잘못됨).
     # source 는 호출 컨텍스트(on/at 등)에서 적절한 부모 소스로 치환된다.
-    out.append(f'    ServerCommandSource {_asSrc} = source.withEntity({_asE});')
+    # as 앞 rebind(positioned 등)가 있으면 그 소스(pre_src)를 부모로 사용한다.
+    out.append(f'    ServerCommandSource {_asSrc} = {pre_src}.withEntity({_asE});')
     for b in body:
         out.append("    " + b)
     out.append("}")
+    # ── as 앞 조건/재바인딩으로 루프 전체를 감싼다(바닐라: 조건 불통과 시 0회 실행) ──
+    if pre_conds or pre_rebinds:
+        wrapped = ["{"]
+        wrapped += ["    " + s for s in pre_rebinds]
+        if pre_conds:
+            wrapped.append(f'    if ({" && ".join(pre_conds)}) {{')
+        wrapped += ["    " + s for s in out]
+        if pre_conds:
+            wrapped.append("    }")
+        wrapped.append("}")
+        out = wrapped
     em.java.extend(out)
     em.kind = "native"
     return True

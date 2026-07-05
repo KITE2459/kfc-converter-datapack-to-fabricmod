@@ -542,11 +542,8 @@ def _tco_rewrite(body: str, self_fqcn: str) -> str:
 #   · MacroParseFail(unchecked) 은 조각에서 던져도 본체 try 가 그대로 잡는다.
 #   · CSE(_selN/_eset) 캐시는 조각 경계에서 clear 되어 조각-로컬로 격리(경계는 조립 전 확정).
 #   · TCO/브릿지/거부/trace 함수는 분할 제외(기존 경로 그대로).
-# [정상 시점 일치] seg 분할은 JIT HugeMethodLimit(성능) 대응 장치일 뿐 correctness 와 무관하며,
-# 검증된 정상 소스에는 존재하지 않았다. 회귀 방지를 위해 기본 비활성화(트리거를 사실상 무한대로)
-# — 생성 네이티브 코드를 정상 시점과 동일하게 유지한다. 필요 시 이 값만 낮춰 재활성화 가능.
-_SEG_TRIGGER = 10**9  # 분할 비활성(정상 시점 동작 복원). 재활성화하려면 예: 9000 으로.
-_SEG_TARGET  = 5500   # 조각 목표 코드 문자수(재활성화 시 사용)
+_SEG_TRIGGER = 9000   # 주석 제외 코드 문자수 — 초과 시에만 분할 발동
+_SEG_TARGET  = 5500   # 조각 목표 코드 문자수(바이트코드 최악 ~1.2x 가정에도 8000B 안전권)
 _SEG_MARK    = "// __KFC_SEG_BOUNDARY__"   # 조립-렌더 간 조각 경계 전달용(최종 출력서 제거)
 
 def _seg_strip_str(l: str) -> str:

@@ -85,9 +85,15 @@ _LIT_NUM_RE = re.compile(r'(?<![\w.])-?\d+(?:\.\d+)?(?:[eE]-?\d+)?[fFdDlL]?(?![\
 _LIT_STR_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 def _oversized(text: str) -> bool:
-    """브릿지 필요 판정: (a) 최대 메서드 바이트코드 근사 > METHOD_BC_CAP,
-       또는 (b) 고유 리터럴(문자열+수치) 근사가 상수풀 한계를 위협."""
-    if _bc_proxy_max_method(text) > METHOD_BC_CAP:
+    """브릿지 필요 판정.
+       [정상 동작 시점 복원] 원본 소스가 METHOD_CAP(64KB)를 넘으면 무조건 브릿지 —
+       거대 애니메이션 디스패처(stevemo:frame 598KB, endcredit:ani 148KB 등)는 네이티브
+       실행에 잠재 결함이 있어 과거엔 전부 브릿지로 정확히 동작했다. bc근사만으로 이들을
+       네이티브 전환했더니 스티브 미출현·엑셀 롤백 등이 노출됐으므로, 분기 결정은
+       '검증된 과거(소스 크기 기준)'와 동일하게 되돌린다(성능상 이 함수들은 점수-게이트
+       디스패처라 브릿지 오버헤드가 사실상 0).
+       추가로 상수풀 엔트리 한계(65535) 가드도 유지(문자열 다수 클래스 방어)."""
+    if len(text.encode("utf-8")) > METHOD_CAP:
         return True
     pool = len(set(_LIT_STR_RE.findall(text))) + len(set(_LIT_NUM_RE.findall(text)))
     return pool > CONST_POOL_GUARD

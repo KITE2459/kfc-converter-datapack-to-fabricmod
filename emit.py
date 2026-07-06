@@ -752,7 +752,7 @@ def at_s_selecteditem_cond(raw: str) -> str | None:
             lo, hi = parse_range(rng)
             lo_j = _scbound(lo, "Integer.MIN_VALUE")
             hi_j = _scbound(hi, "Integer.MAX_VALUE")
-            parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(obj)}, {lo_j}, {hi_j})')
+            parts.append(f'KfcGen.scoreMatchesEntity(sb, executor, {jstr(obj)}, {lo_j}, {hi_j})')
     # SelectedItemSlot nbt + scores 외 다른 필터가 있으면 처리 불가(정확성 우선)
     leftover = re.sub(r'nbt=\{[^}]*\}', '', inner)
     leftover = re.sub(r'scores=\{[^}]*\}', '', leftover)
@@ -2546,14 +2546,20 @@ def _tag_conds(sel, var: str) -> list:
 
 
 def _score_conds(sel, var: str) -> list:
-    """sel.scores -> [scoreMatches(sb, var.getNameForScoreboard(), obj, lo, hi)] 조건 리스트."""
+    """sel.scores -> [scoreMatchesEntity(sb, var, obj, lo, hi)] 조건 리스트.
+       [GC 최적화] var 는 항상 Entity 로컬(executor/_pp/_k/_t/evar/en/_ee/…)이므로
+       var.getNameForScoreboard()(비플레이어면 String 신규 할당 — 실측 ~33만 곳/빌드,
+       최다 할당원)로 문자열을 만들지 않고 Entity 를 직접 넘긴다. scoreMatchesEntity 는
+       sb.getScore(e, ob) 로 홀더 문자열·HOLDER_CACHE 조회까지 건너뛴다(관측 동일:
+       ScoreHolder.fromName(name) 과 Entity 자신은 같은 홀더). 개구간은 _scbound 가
+       Integer.MIN/MAX_VALUE primitive 로 채워 (…,int,int) 오버로드와 정합."""
     if not sel:
         return []
     out = []
     for obj_name, (slo, shi) in (sel.scores or {}).items():
         lo_j = _scbound(slo, "Integer.MIN_VALUE")
         hi_j = _scbound(shi, "Integer.MAX_VALUE")
-        out.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), '
+        out.append(f'KfcGen.scoreMatchesEntity(sb, {var}, '
                    f'{jstr(obj_name)}, {lo_j}, {hi_j})')
     return out
 

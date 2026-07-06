@@ -689,6 +689,24 @@ public final class KfcGen {
 
     /** distance 상한이 있을 때 섹션 스캔을 한정하는 AABB.
      *  바닐라 셀렉터의 distance=..N 최적화와 동일 — 전 월드 엔티티 섹션 순회를 막는다(벽충돌 핫패스). */
+    // ── limit=1(arbitrary) 셀렉터의 조기종료 첫-매치 조회 ──
+    // firstEntityAnyType* 는 기존에 allEntitiesAnyType 로 '범위 내 전체'를 리스트로 모은 뒤
+    // 첫 매치를 골랐다(리스트 할당 + 전체 순회). 충돌 핫패스에서 같은 @e[carB,limit=1] 이
+    // 한 틱에 수십 번 해소되며 매번 전체 리스트를 만들어 GC/CPU 를 크게 먹었다.
+    // collectEntitiesByType(..., maxCount=1) 은 동일한 엔티티 인덱스를 같은 순서로 순회하되
+    // '첫 매치에서 즉시 중단'한다(관측 동일: arbitrary limit=1 = 순회 첫 매치). getOtherEntities
+    // 도 동일 인덱스(forEachIntersects)를 쓰므로 첫 요소가 일치한다.
+    private static final net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, net.minecraft.entity.Entity>
+            ENTITY_ANY = net.minecraft.util.TypeFilter.instanceOf(net.minecraft.entity.Entity.class);
+
+    private static net.minecraft.entity.Entity firstInBox(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin, double maxDist,
+            java.util.function.Predicate<net.minecraft.entity.Entity> fullPred) {
+        java.util.ArrayList<net.minecraft.entity.Entity> tmp = new java.util.ArrayList<>(1);
+        ctx.world.collectEntitiesByType(ENTITY_ANY, rangeBox(origin, maxDist), fullPred, tmp, 1);
+        return tmp.isEmpty() ? null : tmp.get(0);
+    }
+
     public static net.minecraft.util.math.Box rangeBox(net.minecraft.util.math.Vec3d o, double maxDist) {
         return new net.minecraft.util.math.Box(o.x - maxDist, o.y - maxDist, o.z - maxDist,
                                                o.x + maxDist, o.y + maxDist, o.z + maxDist);
@@ -3123,8 +3141,12 @@ public final class KfcGen {
     public static net.minecraft.entity.Entity firstEntityAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
-        for (net.minecraft.entity.Entity e : allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist)) {
-            return e;
+        if (origin != null && maxDist >= 0) {   // 범위 한정: 박스 조기종료(리스트 미생성)
+            return firstInBox(ctx, origin, maxDist,
+                    e -> matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist));
+        }
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {   // 무한범위: 스냅샷 조기종료
+            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
         }
         return null;
     }
@@ -3147,8 +3169,12 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
-        for (net.minecraft.entity.Entity e : allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist)) {
-            if (pred.test(e)) return e;
+        if (origin != null && maxDist >= 0) {   // 범위 한정: 박스 조기종료(리스트 미생성)
+            return firstInBox(ctx, origin, maxDist,
+                    e -> matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e));
+        }
+        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {   // 무한범위: 스냅샷 조기종료
+            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e)) return e;
         }
         return null;
     }

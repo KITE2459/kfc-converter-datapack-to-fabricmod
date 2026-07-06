@@ -752,7 +752,7 @@ def at_s_selecteditem_cond(raw: str) -> str | None:
             lo, hi = parse_range(rng)
             lo_j = _scbound(lo, "Integer.MIN_VALUE")
             hi_j = _scbound(hi, "Integer.MAX_VALUE")
-            parts.append(f'KfcGen.scoreMatchesEntity(sb, executor, {jstr(obj)}, {lo_j}, {hi_j})')
+            parts.append(f'KfcGen.scoreMatches(sb, executor.getNameForScoreboard(), {jstr(obj)}, {lo_j}, {hi_j})')
     # SelectedItemSlot nbt + scores 외 다른 필터가 있으면 처리 불가(정확성 우선)
     leftover = re.sub(r'nbt=\{[^}]*\}', '', inner)
     leftover = re.sub(r'scores=\{[^}]*\}', '', leftover)
@@ -2546,20 +2546,14 @@ def _tag_conds(sel, var: str) -> list:
 
 
 def _score_conds(sel, var: str) -> list:
-    """sel.scores -> [scoreMatchesEntity(sb, var, obj, lo, hi)] 조건 리스트.
-       [GC 최적화] var 는 항상 Entity 로컬(executor/_pp/_k/_t/evar/en/_ee/…)이므로
-       var.getNameForScoreboard()(비플레이어면 String 신규 할당 — 실측 ~33만 곳/빌드,
-       최다 할당원)로 문자열을 만들지 않고 Entity 를 직접 넘긴다. scoreMatchesEntity 는
-       sb.getScore(e, ob) 로 홀더 문자열·HOLDER_CACHE 조회까지 건너뛴다(관측 동일:
-       ScoreHolder.fromName(name) 과 Entity 자신은 같은 홀더). 개구간은 _scbound 가
-       Integer.MIN/MAX_VALUE primitive 로 채워 (…,int,int) 오버로드와 정합."""
+    """sel.scores -> [scoreMatches(sb, var.getNameForScoreboard(), obj, lo, hi)] 조건 리스트."""
     if not sel:
         return []
     out = []
     for obj_name, (slo, shi) in (sel.scores or {}).items():
         lo_j = _scbound(slo, "Integer.MIN_VALUE")
         hi_j = _scbound(shi, "Integer.MAX_VALUE")
-        out.append(f'KfcGen.scoreMatchesEntity(sb, {var}, '
+        out.append(f'KfcGen.scoreMatches(sb, {var}.getNameForScoreboard(), '
                    f'{jstr(obj_name)}, {lo_j}, {hi_j})')
     return out
 
@@ -4822,8 +4816,7 @@ def _v2_fanout_posrot(mode, sel_raw, exe, src, depth):
 
     def _rebind_expr(tv):
         if mode == "at":
-            return (f"{src}.withPosition({tv}.getPos())"
-                    f".withRotation(new net.minecraft.util.math.Vec2f({tv}.getPitch(), {tv}.getYaw()))")
+            return f"KfcGen.atEntity({src}, {tv})"
         elif mode == "rotated_as":
             return (f"{src}.withRotation("
                     f"new net.minecraft.util.math.Vec2f({tv}.getPitch(), {tv}.getYaw()))")
@@ -5336,8 +5329,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
             guard = "executor != null" if g == "true" else f"executor != null && ({g})"
             out = [f'if ({guard}) {{',
                    f'    net.minecraft.server.command.ServerCommandSource {av} = '
-                   f'source.withPosition(executor.getPos()).withRotation('
-                   f'new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw()));']
+                   f'KfcGen.atEntity(source, executor);']
             for b in inner.java:
                 out.append("    " + b)
             out.append("}")
@@ -5363,8 +5355,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
             return False
         _on_depth -= 1
         out = list(loop_open)  # for (Entity _atEN : ...) {
-        out.append(f'    ServerCommandSource {av} = source.withPosition(_atE{depth}.getPos())'
-                   f'.withRotation(new net.minecraft.util.math.Vec2f(_atE{depth}.getPitch(), _atE{depth}.getYaw()));')
+        out.append(f'    ServerCommandSource {av} = KfcGen.atEntity(source, _atE{depth});')
         for b in inner.java:
             out.append("    " + b)
         out.append("}")
@@ -5892,8 +5883,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 # 회전을 쓴다. (이전 no-op 은 모델이 카트(초기)방향으로 스냅하는 버그를 유발했음.)
                 nv = f"kfcSrc{_uid()}"
                 rebinds.append(
-                    f'ServerCommandSource {nv} = (executor != null ? {cur_src}.withPosition(executor.getPos())'
-                    f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) : {cur_src});')
+                    f'ServerCommandSource {nv} = (executor != null ? KfcGen.atEntity({cur_src}, executor) : {cur_src});')
                 cur_src = nv
                 i += 1
                 continue
@@ -5907,8 +5897,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 nv = f"kfcSrc{_uid()}"
                 guard = "executor != null" if g == "(executor != null)" else g
                 rebinds.append(
-                    f'ServerCommandSource {nv} = (({guard}) ? {cur_src}.withPosition(executor.getPos())'
-                    f'.withRotation(new net.minecraft.util.math.Vec2f(executor.getPitch(), executor.getYaw())) : null);')
+                    f'ServerCommandSource {nv} = (({guard}) ? KfcGen.atEntity({cur_src}, executor) : null);')
                 cur_src = nv
                 src_nullable = True
                 i += 1
@@ -5923,8 +5912,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
             nv = f"kfcSrc{_uid()}"
             rebinds.append(f'net.minecraft.entity.Entity {ev} = {ent};')
             rebinds.append(
-                f'ServerCommandSource {nv} = ({ev} != null ? {cur_src}.withPosition({ev}.getPos())'
-                f'.withRotation(new net.minecraft.util.math.Vec2f({ev}.getPitch(), {ev}.getYaw())) : null);')
+                f'ServerCommandSource {nv} = ({ev} != null ? KfcGen.atEntity({cur_src}, {ev}) : null);')
             cur_src = nv
             src_nullable = True
             i += 1
@@ -6158,7 +6146,41 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
                 return False
 
     # as 이후 chain 재구성: execute + (as/targets 제거한 head 나머지) + run + tail
-    as_idx = next(i for i, s in enumerate(head) if s.get("node") == "as")
+    # ── as 앞 수정자/조건 보존 ──
+    # [버그 수정] 기존엔 head[:as_idx] 를 통째로 버려 `execute if score ... as <UUID> at @s run tp ...`
+    # 의 score 가드가 탈락 — ani1/stevemo:frame 컷씬에서 tp 가 매 틱 무조건 실행돼
+    # 리그가 밀려나거나(^.1/^.074/^21 창), 추락(~-.5)하거나, 절대좌표로 스냅백(272)했다
+    # (= "스티브 안 보임" + 매 틱 전진→스냅백 "롤백" 증상의 원인).
+    # 바닐라 의미: as 앞 수정자/조건은 바깥 실행자·소스 기준으로 평가되므로,
+    # parse_modifiers 로 조건(pconds)·재바인딩(prebinds)을 뽑아 루프 밖을 감싼다.
+    # positioned/rotated 의 as 는 실행자 전환이 아니므로 emit_as_loop 과 동일하게 건너뛴다.
+    as_idx = None
+    _prev_node = None
+    for _i, _s in enumerate(head):
+        _nd = _s.get("node")
+        if _nd == "as" and _prev_node not in ("positioned", "rotated"):
+            as_idx = _i
+            break
+        if _nd is not None:
+            _prev_node = _nd
+    if as_idx is None:
+        em.reason = "as 루프(재귀): 실행자 전환 as 없음"
+        return False
+    pre_conds, pre_rebinds = [], []
+    pre_src = "source"
+    pre_head = head[:as_idx]
+    if pre_head:
+        pconds, ploops, puns, prebinds = parse_modifiers(pre_head)
+        if puns is not None or ploops:
+            # as 앞 루프/미지원 수정자(at <루프셀렉터>, on 등)는 바깥 감싸기로 표현 불가
+            # → 명시 거부(브릿지 폴백). 침묵 탈락보다 항상 안전하다.
+            em.reason = f"as 루프(재귀) 앞 수정자 미지원: {puns or 'loops'}"
+            return False
+        pre_conds, pre_rebinds = pconds, prebinds
+        if pre_rebinds:
+            m = re.match(r'.*ServerCommandSource (kfcSrc\d+)', pre_rebinds[-1])
+            if m:
+                pre_src = m.group(1)
     rest = []
     rm_tn = rm_ta = False
     for item in head[as_idx + 1:]:
@@ -6185,10 +6207,22 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     # 바닐라 as <셀렉터> 는 executor 만 교체하고 위치/회전/앵커/차원은 부모 소스에서 상속한다
     # (엔티티의 getCommandSource 로 새로 만들면 위치/회전이 엔티티 기본값으로 리셋돼 잘못됨).
     # source 는 호출 컨텍스트(on/at 등)에서 적절한 부모 소스로 치환된다.
-    out.append(f'    ServerCommandSource {_asSrc} = source.withEntity({_asE});')
+    # as 앞 rebind(positioned 등)가 있으면 그 소스(pre_src)를 부모로 사용한다.
+    out.append(f'    ServerCommandSource {_asSrc} = {pre_src}.withEntity({_asE});')
     for b in body:
         out.append("    " + b)
     out.append("}")
+    # ── as 앞 조건/재바인딩으로 루프 전체를 감싼다(바닐라: 조건 불통과 시 0회 실행) ──
+    if pre_conds or pre_rebinds:
+        wrapped = ["{"]
+        wrapped += ["    " + s for s in pre_rebinds]
+        if pre_conds:
+            wrapped.append(f'    if ({" && ".join(pre_conds)}) {{')
+        wrapped += ["    " + s for s in out]
+        if pre_conds:
+            wrapped.append("    }")
+        wrapped.append("}")
+        out = wrapped
     em.java.extend(out)
     em.kind = "native"
     return True

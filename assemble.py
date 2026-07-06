@@ -542,11 +542,8 @@ def _tco_rewrite(body: str, self_fqcn: str) -> str:
 #   · MacroParseFail(unchecked) 은 조각에서 던져도 본체 try 가 그대로 잡는다.
 #   · CSE(_selN/_eset) 캐시는 조각 경계에서 clear 되어 조각-로컬로 격리(경계는 조립 전 확정).
 #   · TCO/브릿지/거부/trace 함수는 분할 제외(기존 경로 그대로).
-# [정상 시점 일치] seg 분할은 JIT HugeMethodLimit(성능) 대응 장치일 뿐 correctness 와 무관하며,
-# 검증된 정상 소스에는 존재하지 않았다. 회귀 방지를 위해 기본 비활성화(트리거를 사실상 무한대로)
-# — 생성 네이티브 코드를 정상 시점과 동일하게 유지한다. 필요 시 이 값만 낮춰 재활성화 가능.
-_SEG_TRIGGER = 10**9  # 분할 비활성(정상 시점 동작 복원). 재활성화하려면 예: 9000 으로.
-_SEG_TARGET  = 5500   # 조각 목표 코드 문자수(재활성화 시 사용)
+_SEG_TRIGGER = 9000   # 주석 제외 코드 문자수 — 초과 시에만 분할 발동
+_SEG_TARGET  = 5500   # 조각 목표 코드 문자수(바이트코드 최악 ~1.2x 가정에도 8000B 안전권)
 _SEG_MARK    = "// __KFC_SEG_BOUNDARY__"   # 조립-렌더 간 조각 경계 전달용(최종 출력서 제거)
 
 def _seg_strip_str(l: str) -> str:
@@ -579,25 +576,34 @@ def _seg_bounds_for(emitted) -> set[int]:
         acc+=g
     return bounds
 
-def _seg_prelude(seg_body: str) -> str:
-    """조각 본문 텍스트가 실제 사용하는 표준 로컬만 재파생(본체 prelude 로직 미러).
+def _seg_params(seg_body: str) -> tuple[str, str]:
+    """조각 본문이 사용하는 표준 로컬을 '파라미터 수취'로 전환하기 위한
+       (시그니처 추가분, 호출 전달분) 생성.
+       [GC 압박 제거] 기존엔 각 조각이 자체 prelude 로 executor/_exName/_pos/ctx/sb/server 를
+       재계산했다 — 본체 + N 조각이 매 실행마다 getOrCreateContext / getPosition(새 Vec3d 할당) /
+       getNameForScoreboard(비플레이어면 String 할당) 등을 조각 수만큼 중복 호출해 할당·GC 압력이
+       분할 이전 대비 배가됐다. 본체 prelude 는 이미 '분할 전 전체 body 기준(합집합)'으로 이 로컬들을
+       1회 선언하므로(used/cache_* 가 전체 body 로 계산됨), 조각은 재계산 대신 인자로 받는다.
        (_exName/_pos 치환은 전체 body 에서 이미 수행된 뒤라 여기선 '사용'만 존재.)"""
-    scan="\n".join(l for l in seg_body.split("\n") if not l.lstrip().startswith("//"))
-    used=set(re.findall(r"\b[A-Za-z_]\w*\b", scan))
-    out=[]
-    need_ex = "executor" in used or "_exName" in used
-    if need_ex: out.append("Entity executor = source.getEntity();")
-    if "_exName" in used:
-        out.append("String _exName = executor == null ? null : executor.getNameForScoreboard();")
-    if "_pos" in used:
-        out.append("net.minecraft.util.math.Vec3d _pos = source.getPosition();")
-    if "ctx" in used or "sb" in used:
-        out.append("KfcGen.GameContext ctx = KfcGen.getOrCreateContext(source);")
-    if "sb" in used:
-        out.append("ServerScoreboard sb = ctx.scoreboard;")
-    if "server" in used:
-        out.append("net.minecraft.server.MinecraftServer server = source.getServer();")
-    return "\n        ".join(out)
+    scan = "\n".join(l for l in seg_body.split("\n") if not l.lstrip().startswith("//"))
+    used = set(re.findall(r"\b[A-Za-z_]\w*\b", scan))
+    # (파라미터명, 자바 타입) — 본체 prelude 선언 타입과 1:1. 순서는 결정적(같은 입력 = 같은 출력).
+    order = [
+        ("executor", "Entity"),
+        ("_exName",  "String"),
+        ("_pos",     "net.minecraft.util.math.Vec3d"),
+        ("ctx",      "KfcGen.GameContext"),
+        ("sb",       "ServerScoreboard"),
+        ("server",   "net.minecraft.server.MinecraftServer"),
+    ]
+    sig, args = [], []
+    for name, jtype in order:
+        if name in used:
+            sig.append(f"{jtype} {name}")
+            args.append(name)
+    if not sig:
+        return "", ""
+    return ", " + ", ".join(sig), ", " + ", ".join(args)
 
 
 def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartriderpack") -> JavaClass:
@@ -849,15 +855,14 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         rendered = []
         calls = []
         for k, part in enumerate(parts[:-1]):
-            pre_k = _seg_prelude(part)
-            pre_k_block = ("        " + pre_k + "\n") if pre_k else ""
+            sig_k, pass_k = _seg_params(part)
             ind = "\n".join("        " + l if l else "" for l in part.split("\n"))
             rendered.append(
-                f"    private static Integer executeReturn_seg{k}(ServerCommandSource source{macro_sig}) {{\n"
-                f"{pre_k_block}{ind}\n"
+                f"    private static Integer executeReturn_seg{k}(ServerCommandSource source{macro_sig}{sig_k}) {{\n"
+                f"{ind}\n"
                 f"        return null;   // 정상 완료(반환 없음) — 본체가 다음 조각으로 진행\n"
                 f"    }}")
-            calls.append(f"{{ Integer _sr = executeReturn_seg{k}(source{macro_pass}); "
+            calls.append(f"{{ Integer _sr = executeReturn_seg{k}(source{macro_pass}{pass_k}); "
                          f"if (_sr != null) return _sr; }}")
         seg_methods = "\n\n" + "\n\n".join(rendered)
         seg_calls = "\n        ".join(calls) + "\n        "

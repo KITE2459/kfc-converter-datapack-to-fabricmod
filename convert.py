@@ -659,6 +659,21 @@ sourceSets {
     main { java { srcDirs = ['src/main/java'] } }
 }
 
+// ── dev 실행(gradlew runServer/runClient) JVM 튜닝 ──
+// 데이터팩을 네이티브 자바로 변환하면 일부 함수(충돌 물리 등 핫패스)가 8KB 를 넘는 대형
+// 메서드가 된다. HotSpot 기본값(DontCompileHugeMethods=true, HugeMethodLimit=8000B)은
+// 그런 메서드를 JIT 컴파일하지 않고 인터프리터로만 돌려 매 틱 성능을 크게 떨어뜨린다.
+// 아래 플래그로 대형 메서드까지 전부 JIT 컴파일되게 한다(코드 변경 없이 성능 회복).
+// (프로덕션 서버는 이 플래그를 서버 실행 스크립트에 직접 넣어야 한다 — gradle.properties 참고.)
+loom {
+    runs {
+        configureEach {
+            vmArgs '-XX:-DontCompileHugeMethods'   // 8KB 초과 대형 메서드도 JIT 컴파일 허용
+            vmArgs '-XX:+UseG1GC'                  // 엔티티 스캔 등 대량 단명 객체에 유리
+        }
+    }
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
@@ -712,6 +727,15 @@ fabric_version=@FABRIC@
 # Gradle/JVM (컴파일러는 build.gradle 에서 별도 포크되므로 데몬 힙은 작게)
 org.gradle.jvmargs=-Xmx2G
 org.gradle.parallel=true
+
+# ───────────────────────────────────────────────────────────────────
+# [프로덕션 서버 실행 권장 JVM 플래그]  ※ 빌드가 아니라 '서버 구동 스크립트'에 넣으세요
+#   java -XX:-DontCompileHugeMethods -XX:+UseG1GC -jar fabric-server-launch.jar nogui
+# 네이티브 변환으로 일부 함수(충돌 물리 등)가 8KB 를 넘는 대형 메서드가 됩니다.
+# HotSpot 기본값은 그런 메서드를 JIT 컴파일하지 않고 인터프리터로만 돌려 틱 성능이
+# 떨어집니다. 위 첫 플래그가 이를 해제해 전부 JIT 컴파일되게 합니다(무위험).
+# (gradlew runServer 로 테스트할 때는 build.gradle 의 loom.runs 에 이미 적용돼 있습니다.)
+# ───────────────────────────────────────────────────────────────────
 
 # ───────────────────────────────────────────────────────────────────
 # [중요] 마인크래프트 @MC@ 는 Java @JAVA@ 이 필요합니다.

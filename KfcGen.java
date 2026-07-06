@@ -4428,62 +4428,25 @@ public final class KfcGen {
     /** display fast 머지가 가능한 키들 — 전부 직접 setter 가 있는 DataTracker 필드. */
     private static boolean displayMergeFast(net.minecraft.entity.Entity e,
                                             net.minecraft.nbt.NbtCompound patch) {
-        if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity d)) return false;
-        // fast 처리 가능한 키만 있는지 먼저 검증(혼재 시 전체 폴백).
+        if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity)) return false;
         for (String k : patch.getKeys()) {
             switch (k) {
                 case "transformation": case "interpolation_duration":
                 case "start_interpolation": case "teleport_duration": break;
-                case "item":
+                case "item":   // item 은 item_display 만 fast 처리(아래 deep-merge)
                     if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity)) return false;
                     break;
-                default: return false;
+                default: return false;   // fast 불가 키 혼재 → 전체 폴백
             }
         }
-        // ── 바닐라 /data merge 시맨틱을 '정확히' 미러한다 ──
-        // /data merge = writeNbt(현재) → 패치 병합 → readNbt(병합본). readNbt 는 고정 순서로
-        //   transformation → interpolation_duration → start_interpolation → teleport_duration
-        // 를 '각 1회' 호출한다(DisplayEntity.readCustomDataFromNbt 바이트코드 확인). 특히
-        // setStartInterpolation 은 force-dirty 라 매번 보간을 재트리거하는데, 병합본의
-        // start_interpolation 값은 '패치에 있으면 그 값, 없으면 현재값'이다.
-        //
-        // 기존 구현은 patch.getKeys()(해시 순서=비결정) 로 displaySetFast 에 위임했고,
-        // displaySetFast 의 transformation 케이스가 자체적으로 setStartInterpolation 을
-        // 재트리거하기 때문에 patch 에 start_interpolation 이 함께 있으면 '한 틱에 2회'
-        // 호출되고 그 순서가 프레임마다 달라져, 일부 프레임에서 보간 시작 스냅샷이 어긋나
-        // 롤백성 튐이 발생했다. 여기서는 각 setter 를 고정 순서로 정확히 1회만 호출한다.
-        if (patch.contains("transformation")) {
-            net.minecraft.nbt.NbtElement tv = patch.get("transformation");
-            net.minecraft.util.math.AffineTransformation at = TRANSFORM_CACHE.get(tv);
-            if (at == null) {
-                java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
-                        net.minecraft.util.math.AffineTransformation.ANY_CODEC
-                                .parse(net.minecraft.nbt.NbtOps.INSTANCE, tv).result();
-                if (r.isEmpty()) return false;
-                at = r.get();
-                if (TRANSFORM_CACHE.size() < 8192) TRANSFORM_CACHE.put(tv.copy(), at);
-            }
-            d.setTransformation(at);
-        }
-        if (patch.contains("interpolation_duration"))
-            d.setInterpolationDuration((int) nbtNum(patch.get("interpolation_duration")));
-        // start_interpolation: 바닐라 readNbt 는 getInt("start_interpolation", 0) 을 '무조건'
-        // setStartInterpolation 에 넘긴다(바이트코드 확인). 그리고 writeCustomDataToNbt 는
-        // start_interpolation 을 '쓰지 않으므로', /data merge 병합본에는 패치가 준 경우에만
-        // 이 키가 존재한다 → 패치에 있으면 그 값, 없으면 default 0. setStartInterpolation 은
-        // 유일하게 force-dirty(항상 패킷)이라 이 '무조건 1회 호출'이 곧 보간 재트리거이며,
-        // 매 data merge 마다 일어나는 바닐라 동작이다. (setTransformation/Interpolation/Teleport
-        //  Duration 은 equality-check set 이라 패치에 없으면 현재값=무변경이므로 생략해도 동일.)
-        d.setStartInterpolation(patch.contains("start_interpolation")
-                ? (int) nbtNum(patch.get("start_interpolation")) : 0);
-        if (patch.contains("teleport_duration"))
-            d.setTeleportDuration(net.minecraft.util.math.MathHelper.clamp(
-                    (int) nbtNum(patch.get("teleport_duration")), 0, 59));   // 바닐라 clamp[0,59]
-        if (patch.contains("item")) {
-            net.minecraft.nbt.NbtElement _iv = patch.get("item");
-            if (!(_iv instanceof net.minecraft.nbt.NbtCompound _ic)) return false;
-            if (!applyItemDisplayNbt(
-                    (net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) e, _ic, true)) return false;
+        for (String k : patch.getKeys()) {
+            if (k.equals("item")) {
+                // data merge {item:{...}} = 현재 표시 아이템에 deep merge(바닐라 /data merge 의미).
+                net.minecraft.nbt.NbtElement _iv = patch.get("item");
+                if (!(_iv instanceof net.minecraft.nbt.NbtCompound _ic)) return false;
+                if (!applyItemDisplayNbt(
+                        (net.minecraft.entity.decoration.DisplayEntity.ItemDisplayEntity) e, _ic, true)) return false;
+            } else if (!displaySetFast(e, k, patch.get(k))) return false;
         }
         return true;
     }
@@ -4502,24 +4465,6 @@ public final class KfcGen {
         return null;
     }
 
-    // ── DisplayEntity 병합 경로 (기본 slow = 바닐라 정확) ──
-    // [확정된 결론] display 병합의 fast 경로(displayMergeFast)는 바닐라(writeNbt→copyFrom→
-    // readNbt)와 관측이 어긋나 애니 프레임에 롤백성 튐을 만든다(인게임 A/B: slow 에선 사라짐).
-    // 원인 분해 시도 결과(모두 배제됨):
-    //   · 위치/속도/회전 재적용(resetPosition/refreshPositionAndAngles/setVelocity): 인게임 3종
-    //     실험 모두 튐 지속 → 델타 아님.
-    //   · DisplayEntity 나머지 8개 setter(billboard/brightness/width/height/glow/shadow×2/
-    //     viewRange): 전부 equality-check(2-arg) set 이라 현재값 재호출 시 no-op → 델타 아님.
-    //   · 패신저/vehicle 재확립: 대상은 단독 display(패신저 없음) → 델타 아님.
-    // 남은 유일 차이는 writeNbt→copyFrom→readNbt '라운드트립 구조 자체'로, 구성요소를 fast 에
-    // 개별 추가하는 방식으론 재현 불가(라운드트립을 하면 그것이 곧 slow). 따라서 display 병합은
-    // slow(바닐라 정확)를 확정 채택한다. 이 병합들은 컷씬/애니 및 1회성 모델 셋업 빈도라
-    // writeNbt/readNbt 비용이 문제되지 않으며(매틱 racing 핫패스엔 display 병합 없음),
-    // 스코어보드/스토리지/비-display 병합은 fast 를 그대로 유지한다.
-    // (연구/프로파일용으로만 -Dkfc.displaymerge=fast 로 튐 있는 fast 경로를 켤 수 있다.)
-    private static final boolean DISPLAY_MERGE_SLOW =
-            !"fast".equalsIgnoreCase(System.getProperty("kfc.displaymerge", "slow"));
-
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {
         if (e == null) return;
         invalidateSnapshot(e);
@@ -4535,7 +4480,7 @@ public final class KfcGen {
             // v.copy() 로 캐시 저장, 부분경로는 새 root 객체에만 기록, applyItemDisplayNbt 는
             // 새 itemNbt 에 copyFrom(patch) 한다(patch 미변경). 따라서 캐시 템플릿을 copy 없이
             // 직접 넘겨 매 호출 NbtCompound 깊은 복사(~1.87만회/틱)를 제거한다. 관측 동일.
-            if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) return;
+            if (displayMergeFast(e, tc)) return;
             // 느린 경로(non-display/혼합키, 드묾)만 방어적 copy — writeNbt/readNbt 가 nbt 하위를
             // 엔티티에 참조 보관할 수 있어 캐시 원본 보호가 필요하다.
             net.minecraft.nbt.NbtCompound patch = tc.copy();

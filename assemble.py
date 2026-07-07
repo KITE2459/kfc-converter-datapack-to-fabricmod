@@ -124,6 +124,7 @@ _CSE_SAFE_HELPERS = frozenset({
     "storageGetDouble", "nbtGetEntity", "entityGetDouble", "nbtGetBlock",
     # 스캔/읽기 셀렉터(변형 없음)
     "nearestEntityAnyType", "nearestEntity", "nearestPlayer", "nearestN", "nearestPlayerWhere",
+    "firstEntity", "firstEntityAnyType", "anyEntityInTypeTag", "entityByUuid",
     "allEntitiesAnyType", "allEntities", "allEntitiesAny", "allEntitiesInBox",
     "anyPlayer", "anyPlayerWhere", "anyEntity", "anyEntityAnyType", "anyEntityInBox",
     "facingEntity", "localOffset", "anchorEyes",
@@ -158,6 +159,13 @@ _CSE_SCAN_RE = re.compile(
 # CSE 대상(전체-집합): List<Entity> 반환 쿼리. base-source 반복 시 1회 수집해 재사용.
 _CSE_SET_RE = re.compile(
     r'KfcGen\.(?:allEntitiesAnyType|allEntitiesInBox|allEntities|nearestN)\((?:[^()]|\([^()]*\))*\)')
+# CSE 대상(태그 스캔형): firstEntity/nearestEntity 의 태그 기반 단일 스캔. 데이터팩이 줄마다
+# 같은 @e[tag=…,limit=1] 을 재탐색하는 걸(실측: 동일식 인접 반복쌍 509 중 508 이 함수호출
+# 없이 무관한 tag추가/setScore 사이에 있음) 그 태그를 실제 add/remove·멤버 스폰/킬 하기 전까지
+# 재사용한다. origin 은 _pos/source.getPosition()/es.getPosition() 등 무엇이든(캐시 키에 포함).
+_CSE_TAG_RE = re.compile(
+    r'KfcGen\.(?:firstEntity|nearestEntity)\((?:[^()]|\([^()]*\))*\)')
+ENTITY_TAG_CSE = True   # 회귀 시 즉시 차단용 단일 토글
 
 
 def _cse_is_barrier(em) -> bool:
@@ -184,6 +192,93 @@ def _cse_scan_eligible(expr: str) -> bool:
     if "->" in expr:  # 술어 람다 형태(점수/게임모드 필터) 제외
         return False
     return True
+
+
+_CSE_TAG_ARR_RE = re.compile(r'(new String\[\]\{[^}]*\}|KfcGen\.NO_TAGS)')
+
+def _cse_tag_eligible(expr: str):
+    """태그 스캔 CSE 적격이면 (양성태그 frozenset, 음성태그 frozenset) 반환, 아니면 None.
+       - 술어 람다(->) 없음(점수/조건 필터는 상태 의존이라 제외).
+       - 양성 태그 1개 이상(집합이 태그로 결정돼 무효화를 추적 가능).
+       - origin 이 '메서드/세그먼트 전체 스코프'에서 유효한 것만: source.getPosition() 또는
+         세그먼트 prelude 로컬 _pos. es/_on1/_asSrc 같은 블록-지역 origin 은 제외한다 —
+         hoist 된 `Entity _tselN = ...` 선언이 그 블록 밖(본문 최상위)에 놓여 지역변수 origin 을
+         못 찾는 컴파일 에러(cannot find symbol)를 유발하기 때문. (블록 지역 origin 반복은
+         애초에 같은 블록 안에서만 반복되므로 hoist 이득도 작다.)
+       캐시 키는 스캔식 문자열 전체(origin 표현·maxDist 포함)이므로 nearestEntity 최근접 정렬/
+       거리필터도 origin 표현이 같은 한 결과가 같다."""
+    if "->" in expr:
+        return None
+    # origin 인자(ctx 다음): 메서드-스코프 표현만 hoist 안전. 뒤 인자 형태(인라인 new[] 이든
+    # 상수심볼 KFC_ET_ 이든)와 무관하게 'ctx, <ORIGIN>,' 만 추출한다.
+    m = re.match(r'KfcGen\.\w+\(\s*ctx\s*,\s*([^,]+?)\s*,', expr)
+    origin = m.group(1).strip() if m else None
+    if origin not in ("source.getPosition()", "_pos"):
+        return None
+    arrs = _CSE_TAG_ARR_RE.findall(expr)
+    if len(arrs) < 2:
+        return None
+    def _tags(s):
+        s = s.strip()
+        if s == "KfcGen.NO_TAGS":
+            return frozenset()
+        inner = s[s.index("{") + 1:s.rindex("}")]
+        return frozenset(t.strip().strip('"') for t in inner.split(",") if t.strip())
+    pos = _tags(arrs[-2]); neg = _tags(arrs[-1])
+    if not pos:
+        return None
+    return (pos, neg)
+
+
+_TAG_MUTATE_RE = re.compile(r'\.(?:addCommandTag|removeCommandTag)\("([^"]*)"\)')
+
+def _cse_tags_mutated(em):
+    """이 명령이 건드리는 커맨드태그 집합. 태그 변형 없으면 빈 set.
+       집합이 미지로 변할 수 있으면(함수호출/미지헬퍼/멤버 스폰·킬/위치외 변형·origin 재대입) None."""
+    if em.kind != "native":
+        return None
+    code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+    if ".execute(" in code or ".executeReturn(" in code:
+        return None
+    # origin 로컬(_pos 등) 재대입은 origin-의존 스캔의 캐시를 깨야 함 → 전량 무효화(보수적)
+    if re.search(r'\b_pos\s*=', code) or re.search(r'\bVec3d\s+_pos\b', code):
+        return None
+    mutated = set(_TAG_MUTATE_RE.findall(code))
+    for p in (".remove(", ".discard(", ".kill(", "KfcGen.summon", "KfcGen.killEntity"):
+        if p in code:
+            return None                   # 멤버 스폰/킬 = 집합 크기 변동
+    for hm in _CSE_HELPER_RE.finditer(code):
+        if hm.group(1) not in _CSE_SAFE_HELPERS:
+            return None                   # 미지 헬퍼 = 보수적 전량 무효화
+    for p in _CSE_INLINE_BARRIER:
+        if p in code and "CommandTag(" not in p:
+            return None
+    return mutated
+
+
+def _find_reused_tag_exprs(emitted) -> set:
+    """태그 스캔이 '그 태그를 변형·집합변동하는 배리어 사이'에 2회+ 등장하면 hoist 대상.
+       단일 사용은 지역변수 churn 만 늘어 제외."""
+    reused: set = set()
+    seen: dict = {}
+    for em in emitted:
+        code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+        for m in _CSE_TAG_RE.finditer(code):
+            e = m.group(0)
+            if _cse_tag_eligible(e) is None:
+                continue
+            seen[e] = seen.get(e, 0) + 1
+            if seen[e] >= 2:
+                reused.add(e)
+        mut = _cse_tags_mutated(em)
+        if mut is None:
+            seen.clear()
+        elif mut:
+            for e in list(seen):
+                el = _cse_tag_eligible(e)
+                if el and ((el[0] & mut) or (el[1] & mut)):
+                    seen.pop(e, None)
+    return reused
 
 
 def _find_reused_set_exprs(emitted) -> set:
@@ -656,15 +751,20 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     seg_bounds = _seg_bounds_for(emitted) if do_split else set()
     cse_cache: dict[str, str] = {}   # scan_expr -> _selN  (현재 유효한 바인딩)
     cse_set_cache: dict[str, str] = {}  # full-set expr -> _esetN (재사용 구간 내 1회 수집)
+    cse_tag_cache: dict[str, str] = {}  # 태그스캔 expr -> _tselN (태그/멤버 변동 전까지 배리어 관통)
+    cse_tag_tags: dict[str, tuple] = {}  # _tselN 이 의존하는 (pos, neg) 태그집합
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
+    reused_tags = _find_reused_tag_exprs(emitted) if ENTITY_TAG_CSE else set()
     cse_seq = [0]
     cse_set_seq = [0]   # _eset 전용 카운터(기존 _sel 번호 불변 → 순수 가산적)
+    cse_tag_seq = [0]   # _tsel 전용 카운터
     hit_terminal = False
     for _gi, (obj, em) in enumerate(zip(parse_trees, emitted)):
         if _gi in seg_bounds and not hit_terminal:
             body_lines.append(_SEG_MARK)        # 조각 경계 마커(렌더에서 분할 후 제거)
             cse_cache.clear()                   # CSE 를 조각-로컬로 격리
             cse_set_cache.clear()
+            cse_tag_cache.clear(); cse_tag_tags.clear()  # _tsel 은 세그먼트 지역변수 → 경계 못 넘음
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
         if hit_terminal:
@@ -718,14 +818,50 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 line = _CSE_SET_RE.sub(_repl_set, line)  # 전체-집합 반복(신규, 재사용만)
                 new_java.append(line)
 
+        # 태그 스캔 CSE: barrier 여부와 무관하게 항상 적용(무관 tag추가/setScore 배리어 관통이 목적).
+        # 무효화는 아래 _cse_tags_mutated 로 정밀 처리(해당 태그 변형·멤버변동·함수호출에서만).
+        tag_mut = _cse_tags_mutated(em) if ENTITY_TAG_CSE else None
+        if ENTITY_TAG_CSE and reused_tags:
+            def _repl_tag(m):
+                e = m.group(0)
+                if e not in reused_tags:
+                    return e
+                el = _cse_tag_eligible(e)
+                if el is None:
+                    return e
+                v = cse_tag_cache.get(e)
+                if v is None:
+                    v = f"_tsel{cse_tag_seq[0]}"
+                    cse_tag_seq[0] += 1
+                    cse_tag_cache[e] = v
+                    cse_tag_tags[e] = el
+                    decls.append(f"net.minecraft.entity.Entity {v} = {e};")
+                return v
+            _nj2 = []
+            for line in new_java:
+                if line.lstrip().startswith("//"):
+                    _nj2.append(line); continue
+                _nj2.append(_CSE_TAG_RE.sub(_repl_tag, line))
+            new_java = _nj2
+
         body_lines.append(f'// {obj["line"]}')
         body_lines.extend(decls)      # 스캔 1회 평가(메서드 본문 레벨, 사용 직전)
         body_lines.extend(new_java)
         body_lines.append("")
 
         if barrier:
-            cse_cache.clear()         # 변형 후 모든 캐시 무효화
+            cse_cache.clear()         # 변형 후 base-source nearest 캐시 무효화
             cse_set_cache.clear()
+        # 태그 캐시 정밀 무효화: 이 명령이 변형한 태그(tag_mut)에 의존하는 바인딩만 제거.
+        # None = 함수호출/미지헬퍼/멤버변동/origin 재대입 → 전량 무효화.
+        if ENTITY_TAG_CSE and cse_tag_cache:
+            if tag_mut is None:
+                cse_tag_cache.clear(); cse_tag_tags.clear()
+            elif tag_mut:
+                for e in list(cse_tag_cache):
+                    pos, neg = cse_tag_tags.get(e, (frozenset(), frozenset()))
+                    if (pos & tag_mut) or (neg & tag_mut):
+                        cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
 
         if em.terminal:
             hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리

@@ -2998,17 +2998,42 @@ public final class KfcGen {
         return best;
     }
 
+    /** 무한거리(박스 없음) 단일 타입 조회. getEntitiesByType 의 제네릭 T 를 Entity 로 바인딩해
+     *  List<? extends T> 캡처를 List<Entity> 로 안전하게 흡수한다(entitiesByTypeBox 의 무한거리 짝).
+     *  EntityType<?> → TypeFilter<Entity,Entity> 캐스팅은 런타임 안전: 술어에서 타입이 이미 t 로
+     *  좁혀지고, 필터 자체가 t 인스턴스만 통과시키므로 반환 원소는 모두 t(⊆ Entity) 다. */
+    @SuppressWarnings("unchecked")
+    public static java.util.List<net.minecraft.entity.Entity> entitiesByType(
+            GameContext ctx, net.minecraft.entity.EntityType<?> t,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, net.minecraft.entity.Entity> tf =
+                (net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, net.minecraft.entity.Entity>)
+                        (net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, ?>) t;
+        return (java.util.List<net.minecraft.entity.Entity>) ctx.world.getEntitiesByType(tf, pred);
+    }
+
     public static java.util.List<net.minecraft.entity.Entity> allEntities(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        // 단일 타입(생성물의 226개 중 209개)은 조회 결과를 그대로 반환 — new ArrayList+addAll 로
+        // 한 번 더 복사하던 중간 리스트 할당을 제거한다(내용·순서 동일, 복사만 생략).
+        if (types.length == 1) {
+            net.minecraft.entity.EntityType<?> t = types[0];
+            if (origin != null && maxDist >= 0) {
+                return entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
+                        en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+            }
+            return entitiesByType(ctx, t,
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
                 out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
                         en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
-                out.addAll(ctx.world.getEntitiesByType(t,
+                out.addAll(entitiesByType(ctx, t,
                         en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             }
         }
@@ -3664,7 +3689,7 @@ public final class KfcGen {
                 out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin.getPos(), maxDist),
                         en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
             } else {
-                out.addAll(ctx.world.getEntitiesByType(t,
+                out.addAll(entitiesByType(ctx, t,
                         en -> matchTagsAlive(en, tagsPos, tagsNeg)
                               && (origin == null || inRange(origin, en, minDist, maxDist))));
             }

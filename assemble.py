@@ -128,6 +128,9 @@ _CSE_SAFE_HELPERS = frozenset({
     "allEntitiesAnyType", "allEntities", "allEntitiesAny", "allEntitiesInBox",
     "anyPlayer", "anyPlayerWhere", "anyEntity", "anyEntityAnyType", "anyEntityInBox",
     "facingEntity", "localOffset", "anchorEyes",
+    # 조회/박스/소스 생성(태그·위치 모두 불변 — 완전 안전). entitiesByTypeBox/anyEntityScored 는
+    # 읽기, atEntity 는 소스 리바인드, rangeBox 는 박스 생성이라 엔티티 상태를 바꾸지 않는다.
+    "entitiesByTypeBox", "atEntity", "rangeBox", "anyEntityScored",
     # 스코어보드(점수만)
     "setScore", "addScore", "resetScore", "opScore", "ensureObjective", "removeObjective",
     "setObjectiveDisplay", "enableTrigger",
@@ -209,11 +212,21 @@ def _cse_tag_eligible(expr: str):
        거리필터도 origin 표현이 같은 한 결과가 같다."""
     if "->" in expr:
         return None
-    # origin 인자(ctx 다음): 메서드-스코프 표현만 hoist 안전. 뒤 인자 형태(인라인 new[] 이든
-    # 상수심볼 KFC_ET_ 이든)와 무관하게 'ctx, <ORIGIN>,' 만 추출한다.
+    # origin 인자(ctx 다음) 추출.
     m = re.match(r'KfcGen\.\w+\(\s*ctx\s*,\s*([^,]+?)\s*,', expr)
     origin = m.group(1).strip() if m else None
-    if origin not in ("source.getPosition()", "_pos"):
+    # origin 무관 여부(firstEntity + min/max dist 둘 다 <0): inRange 가 origin 을 안 쓰므로
+    # 결과가 origin 값과 무관하다. 이 경우 블록-지역 origin(_asSrc_N.getPosition() 등)이어도
+    # 적격이며, hoist 시 origin 을 메서드-스코프 _pos 로 정규화해 여러 origin 의 동일 스캔을
+    # 하나로 합친다(결과 동일 보장).
+    origin_free = False
+    mm2 = re.search(r',\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*$', expr)
+    if mm2 and expr.startswith("KfcGen.firstEntity(") \
+            and int(mm2.group(1)) < 0 and int(mm2.group(2)) < 0:
+        origin_free = True
+    # origin-의존 스캔은 메서드-스코프 origin 만 hoist 안전(블록-지역은 스코프 밖 컴파일 에러).
+    # origin-무관 스캔은 origin 을 _pos 로 정규화하므로 이 제한을 면제한다.
+    if not origin_free and origin not in ("source.getPosition()", "_pos"):
         return None
     arrs = _CSE_TAG_ARR_RE.findall(expr)
     if len(arrs) < 2:
@@ -227,10 +240,14 @@ def _cse_tag_eligible(expr: str):
     pos = _tags(arrs[-2]); neg = _tags(arrs[-1])
     if not pos:
         return None
-    return (pos, neg)
+    return (pos, neg, origin_free)
 
 
 _TAG_MUTATE_RE = re.compile(r'\.(?:addCommandTag|removeCommandTag)\("([^"]*)"\)')
+
+# _pos(origin 로컬) 재대입 전용 무효화 신호: origin-의존 태그 스캔만 캐시에서 제거하라는 의미.
+# (origin-무관 스캔 — firstEntity 이고 min/max dist 둘 다 <0 — 은 _pos 변화와 결과가 무관해 유지.)
+POS_REBIND = "__POS_REBIND__"
 
 def _cse_tags_mutated(em):
     """이 명령이 건드리는 커맨드태그 집합. 태그 변형 없으면 빈 set.
@@ -240,13 +257,23 @@ def _cse_tags_mutated(em):
     code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
     if ".execute(" in code or ".executeReturn(" in code:
         return None
-    # origin 로컬(_pos 등) 재대입은 origin-의존 스캔의 캐시를 깨야 함 → 전량 무효화(보수적)
+    # origin 로컬(_pos) 재대입은 origin-'의존' 스캔만 캐시를 깨야 한다(origin-무관 스캔은 유효).
+    # 전량 무효화(None) 대신 전용 센티넬을 반환해 호출부가 선별 제거하게 한다.
     if re.search(r'\b_pos\s*=', code) or re.search(r'\bVec3d\s+_pos\b', code):
-        return None
+        return POS_REBIND
     mutated = set(_TAG_MUTATE_RE.findall(code))
     for p in (".remove(", ".discard(", ".kill(", "KfcGen.summon", "KfcGen.killEntity"):
         if p in code:
             return None                   # 멤버 스폰/킬 = 집합 크기 변동
+    # 위치 변경 헬퍼(teleportTo/movePosition): 커맨드태그는 불변이나 엔티티 위치가 바뀌므로
+    # origin-의존 스캔(거리 필터/최근접) 결과가 달라질 수 있다. origin-무관 스캔은 영향 없음.
+    # → 태그 변형이 없으면 POS_REBIND(origin-의존만 무효화)로 처리해 origin-무관 캐시를 살린다.
+    #   (태그 변형이 함께 있으면 아래 미지 헬퍼 경로로 안 빠지고 mutated 를 반환하되, 위치도
+    #    바뀌므로 보수적으로 None 을 반환한다.)
+    if "KfcGen.teleportTo(" in code or "KfcGen.movePosition(" in code:
+        if mutated:
+            return None                   # 태그+위치 동시 변경 = 보수적 전량 무효화
+        return POS_REBIND
     for hm in _CSE_HELPER_RE.finditer(code):
         if hm.group(1) not in _CSE_SAFE_HELPERS:
             return None                   # 미지 헬퍼 = 보수적 전량 무효화
@@ -256,28 +283,50 @@ def _cse_tags_mutated(em):
     return mutated
 
 
+def _cse_tag_key(expr: str) -> str:
+    """CSE 캐시 키. origin-무관 스캔(firstEntity·거리무제한)은 origin 인자만 달라도 결과가
+       동일하므로, origin 을 source.getPosition() 으로 정규화해 서로 다른 origin 의 동일 스캔을
+       하나로 합친다. source 는 모든 executeReturn(_seg) 의 파라미터라 어떤 스코프에서도 유효
+       (_pos 는 세그먼트에만 있고 비세그먼트 함수엔 없어 스코프 위반을 유발 → source 사용).
+       origin-의존 스캔은 origin 이 결과에 영향을 주므로 원식을 그대로 키로 쓴다."""
+    el = _cse_tag_eligible(expr)
+    if el and el[2]:   # origin_free
+        return re.sub(r'(KfcGen\.firstEntity\(\s*ctx\s*,\s*)[^,]+?(\s*,)',
+                      r'\1source.getPosition()\2', expr, count=1)
+    return expr
+
+
 def _find_reused_tag_exprs(emitted) -> set:
     """태그 스캔이 '그 태그를 변형·집합변동하는 배리어 사이'에 2회+ 등장하면 hoist 대상.
        단일 사용은 지역변수 churn 만 늘어 제외."""
     reused: set = set()
-    seen: dict = {}
+    seen: dict = {}       # 정규화 키 -> 등장 횟수
+    key_variants: dict = {}  # 정규화 키 -> 원식 집합
     for em in emitted:
         code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
         for m in _CSE_TAG_RE.finditer(code):
             e = m.group(0)
             if _cse_tag_eligible(e) is None:
                 continue
-            seen[e] = seen.get(e, 0) + 1
-            if seen[e] >= 2:
-                reused.add(e)
+            k = _cse_tag_key(e)
+            seen[k] = seen.get(k, 0) + 1
+            key_variants.setdefault(k, set()).add(e)
+            if seen[k] >= 2:
+                reused |= key_variants[k]   # 이 키의 모든 origin 변형을 hoist 대상으로
         mut = _cse_tags_mutated(em)
         if mut is None:
-            seen.clear()
+            seen.clear(); key_variants.clear()
+        elif mut is POS_REBIND:
+            # _pos 재대입: origin-의존 스캔만 무효화, origin-무관(firstEntity·거리무제한)은 유지
+            for k in list(seen):
+                el = _cse_tag_eligible(k)
+                if el and not el[2]:
+                    seen.pop(k, None); key_variants.pop(k, None)
         elif mut:
-            for e in list(seen):
-                el = _cse_tag_eligible(e)
+            for k in list(seen):
+                el = _cse_tag_eligible(k)
                 if el and ((el[0] & mut) or (el[1] & mut)):
-                    seen.pop(e, None)
+                    seen.pop(k, None); key_variants.pop(k, None)
     return reused
 
 
@@ -829,13 +878,14 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 el = _cse_tag_eligible(e)
                 if el is None:
                     return e
-                v = cse_tag_cache.get(e)
+                k = _cse_tag_key(e)          # origin-무관 스캔은 origin 을 _pos 로 정규화한 키
+                v = cse_tag_cache.get(k)
                 if v is None:
                     v = f"_tsel{cse_tag_seq[0]}"
                     cse_tag_seq[0] += 1
-                    cse_tag_cache[e] = v
-                    cse_tag_tags[e] = el
-                    decls.append(f"net.minecraft.entity.Entity {v} = {e};")
+                    cse_tag_cache[k] = v
+                    cse_tag_tags[k] = el
+                    decls.append(f"net.minecraft.entity.Entity {v} = {k};")  # 정규화 식으로 1회 평가
                 return v
             _nj2 = []
             for line in new_java:
@@ -853,13 +903,19 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             cse_cache.clear()         # 변형 후 base-source nearest 캐시 무효화
             cse_set_cache.clear()
         # 태그 캐시 정밀 무효화: 이 명령이 변형한 태그(tag_mut)에 의존하는 바인딩만 제거.
-        # None = 함수호출/미지헬퍼/멤버변동/origin 재대입 → 전량 무효화.
+        # None = 함수호출/미지헬퍼/멤버변동 → 전량 무효화. POS_REBIND = origin-의존만 무효화.
         if ENTITY_TAG_CSE and cse_tag_cache:
             if tag_mut is None:
                 cse_tag_cache.clear(); cse_tag_tags.clear()
+            elif tag_mut is POS_REBIND:
+                for e in list(cse_tag_cache):
+                    el = cse_tag_tags.get(e)
+                    if el and not el[2]:      # origin-의존 스캔만 제거(무관 스캔은 유지)
+                        cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
             elif tag_mut:
                 for e in list(cse_tag_cache):
-                    pos, neg = cse_tag_tags.get(e, (frozenset(), frozenset()))
+                    el = cse_tag_tags.get(e, (frozenset(), frozenset(), False))
+                    pos, neg = el[0], el[1]
                     if (pos & tag_mut) or (neg & tag_mut):
                         cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
 

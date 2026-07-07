@@ -3055,7 +3055,10 @@ public final class KfcGen {
             all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
         }
         if (limit >= 0 && all.size() > limit) {
-            return new java.util.ArrayList<>(all.subList(0, limit));
+            // [할당 감소] subList 뷰 그대로 반환(복사 ArrayList 제거). all 은 이 메서드가 만든
+            // 임시 리스트이고 호출부(emit 생성 코드)는 for 순회만 하며 add/remove 하지 않으므로
+            // 뷰 반환이 안전하다. nearestN(타입 지정) 경로가 이미 동일하게 뷰를 반환 중.
+            return all.subList(0, limit);
         }
         return all;
     }
@@ -3072,7 +3075,7 @@ public final class KfcGen {
             all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
         }
         if (limit >= 0 && all.size() > limit) {
-            return new java.util.ArrayList<>(all.subList(0, limit));
+            return all.subList(0, limit);   // [할당 감소] 위와 동일 — 뷰 반환
         }
         return all;
     }
@@ -3258,18 +3261,20 @@ public final class KfcGen {
         if (od == null || os == null) return;
         net.minecraft.scoreboard.ScoreAccess da = sb.getOrCreateScore(holderOf(dh), od);
         net.minecraft.scoreboard.ScoreAccess sa = sb.getOrCreateScore(holderOf(sh), os);
-        int a = da.getScore(), b = sa.getScore();
+        int b = sa.getScore();
         int r;
+        // '=' 는 전체 operation 의 최다(≈45%)이고 대상 현재값(a)을 쓰지 않는다.
+        // a 를 각 연산에서 필요할 때만 읽어(da.getScore()) '=' 경로의 불필요한 읽기를 없앤다.
         switch (op) {
             case "=":  r = b; break;
-            case "+=": r = a + b; break;
-            case "-=": r = a - b; break;
-            case "*=": r = a * b; break;
-            case "/=": if (b == 0) return; r = Math.floorDiv(a, b); break;   // 0나눗셈: 실패(생성은 유지)
-            case "%=": if (b == 0) return; r = Math.floorMod(a, b); break;
-            case "<":  r = Math.min(a, b); break;
-            case ">":  r = Math.max(a, b); break;
-            case "><": da.setScore(b); sa.setScore(a); return;
+            case "+=": r = da.getScore() + b; break;
+            case "-=": r = da.getScore() - b; break;
+            case "*=": r = da.getScore() * b; break;
+            case "/=": if (b == 0) return; r = Math.floorDiv(da.getScore(), b); break;   // 0나눗셈: 실패(생성은 유지)
+            case "%=": if (b == 0) return; r = Math.floorMod(da.getScore(), b); break;
+            case "<":  { int a = da.getScore(); r = Math.min(a, b); break; }
+            case ">":  { int a = da.getScore(); r = Math.max(a, b); break; }
+            case "><": { int a = da.getScore(); da.setScore(b); sa.setScore(a); return; }
             default: return;
         }
         da.setScore(r);

@@ -6228,6 +6228,22 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     return True
 
 
+def _es_used(varname: str, *code_blocks) -> bool:
+    """as/단일 셀렉터 루프에서 `ServerCommandSource <varname> = ...withEntity(e)` 가
+       실제로 후속 코드(mod_rebinds + body)에서 참조되는지 검사.
+       [구조 최적화] 본문이 소스 컨텍스트(위치/회전/실행자)를 안 쓰고 엔티티 e 만
+       직접 조작하는 경우(e.stopRiding()/e.addCommandTag()/KfcGen.xxx(e,...) 등),
+       withEntity(e) 는 SCS 객체 1개 + name/displayName 문자열을 만들어 통째로 버리는
+       dead 할당이다(실측: 생성물에 다수 존재). 참조되지 않으면 선언 자체를 생략한다.
+       단어 경계로 검사해 kfcSrc2/kfcSrc20 같은 접두 오탐을 막는다."""
+    pat = re.compile(r'\b' + re.escape(varname) + r'\b')
+    for block in code_blocks:
+        for line in block:
+            if pat.search(line):
+                return True
+    return False
+
+
 def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bool:
     """
     execute as <selector> [at @s] [if ...] run <target>  ->  네이티브 엔티티/플레이어 루프.
@@ -6431,7 +6447,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         guard = " && ".join(["e != null"] + sconds)
         out.append(f'{{ net.minecraft.entity.Entity e = {pre_src}.getEntity();')
         out.append(f'  if ({guard}) {{')
-        out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+        if _es_used("es", mod_rebinds, mod_conds, body):
+            out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:
@@ -6456,7 +6473,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         ent = re.sub(r'\bsource\b', pre_src, ent)  # 셀렉터 평가 origin = as 앞 수정자 적용 소스
         out.append(f'{{ net.minecraft.entity.Entity e = {ent};')
         out.append('  if (e != null) {')
-        out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+        if _es_used("es", mod_rebinds, mod_conds, body):
+            out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:
@@ -6474,13 +6492,18 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     mod_guard = f'    if (!({" && ".join(mod_conds)})) continue;' if mod_conds else None
     mr1 = ["    " + s for s in mod_rebinds]    # 1단 들여쓰기(es 정의 뒤)
     mr2 = ["        " + s for s in mod_rebinds] # 2단(다중타입 루프)
+    # [구조 최적화] es(withEntity(e)) 가 mod_rebinds/body 어디서도 참조되지 않으면
+    # dead 할당(SCS 객체+name 문자열 낭비)이므로 선언 자체를 생략한다. 삽입부는
+    # 빈 src_line 을 걸러 빈 줄이 남지 않게 한다.
+    if not _es_used("es", mod_rebinds, mod_conds, body):
+        src_line = ""
     lim = sel.limit
     if sel.base in ("a", "p", "r"):
         out.append("for (ServerPlayerEntity e : ctx.allPlayers) {")
         pconds = [re.sub(r'\ben\b', 'e', c) for c in conds]
         if pconds:
             out.append(f'    if (!({" && ".join(pconds)})) continue;')
-        out.append("    " + src_line)
+        if src_line: out.append("    " + src_line)
         out.extend(mr1)
         if mod_guard:
             out.append(mod_guard)
@@ -6497,7 +6520,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
                        f"{jarr_tags(sel.tags_pos)}, {jarr_tags(sel.tags_neg)}, "
                        f"{_dmn}, {_dmx}, {lim}, true)) {{")
             out.append(f"    Entity en = e; if (!({filt})) continue;")
-            out.append("    " + src_line)
+            if src_line: out.append("    " + src_line)
             out.extend(mr1)
             if mod_guard:
                 out.append(mod_guard)
@@ -6516,7 +6539,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             out.append("for (Entity e : KfcGen.passengerFirst(KfcGen.entitiesSnapshot(ctx))) {")
             # 바닐라 @e/@n 기본 술어 Entity::isAlive (kill 직후 시체 20틱 제외 — 바이트코드 확인)
             out.append(f"    Entity en = e; if (!(en.isAlive() && ({filt}))) continue;")
-            out.append("    " + src_line)
+            if src_line: out.append("    " + src_line)
             out.extend(mr1)
             if mod_guard:
                 out.append(mod_guard)
@@ -6543,7 +6566,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         else:
             out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]},")
             out.append(f"        en -> {filt})) {{")
-        out.append("    " + src_line)
+        if src_line: out.append("    " + src_line)
         out.extend(mr1)
         if mod_guard:
             out.append(mod_guard)
@@ -6564,7 +6587,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         out.append(f"for (EntityType<?> kfcType : new net.minecraft.entity.EntityType<?>[]{{{typeset}}}) {{")
         out.append(f"    for (Entity e : ctx.world.getEntitiesByType(kfcType,")
         out.append(f"            en -> {filt})) {{")
-        out.append("        " + src_line)
+        if src_line: out.append("        " + src_line)
         out.extend(mr2)
         if mod_guard:
             out.append("    " + mod_guard)

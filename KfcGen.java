@@ -712,6 +712,19 @@ public final class KfcGen {
         return tmp.isEmpty() ? null : tmp.get(0);
     }
 
+    /** 특정 타입 box 존재검사 — 첫 매치에서 수집을 멈춘다(limit=1). anyEntity 의 box 경로가
+     *  entitiesByTypeBox(...).isEmpty() 로 '모든 매치를 리스트에 담은 뒤' 비었는지 보던 것을,
+     *  존재 의미 동일하게 유지하며 리스트 성장/전량 순회 없이 조기종료로 대체한다.
+     *  (getOtherEntities 를 쓰는 entitiesByTypeBox 와 동일한 술어 기반 — Sepals 캐스팅 안전.) */
+    private static boolean anyInBoxTyped(
+            GameContext ctx, net.minecraft.entity.EntityType<?> type, net.minecraft.util.math.Box box,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        java.util.ArrayList<net.minecraft.entity.Entity> tmp = new java.util.ArrayList<>(1);
+        ctx.world.collectEntitiesByType(ENTITY_ANY, box,
+                e -> e.isAlive() && e.getType() == type && pred.test(e), tmp, 1);
+        return !tmp.isEmpty();
+    }
+
     /** 두 좌표 거리의 [lo,hi] 범위 검사 (음수=무시). */
     public static boolean posInRange(net.minecraft.util.math.Vec3d a, net.minecraft.util.math.Vec3d b,
                                      double lo, double hi) {
@@ -725,8 +738,8 @@ public final class KfcGen {
     public static boolean anyEntityAnyType(GameContext ctx, net.minecraft.entity.Entity origin,
                                            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
-            return !ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
-                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+            return firstInBox(ctx, origin.getPos(), maxDist,
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)) != null;
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
@@ -1264,17 +1277,38 @@ public final class KfcGen {
     }
 
     /** on passengers — source 엔티티의 승객 목록(엔티티만 교체, 위치/회전 유지). */
+    // ── on passengers 순회 결과 캐시(단일 슬롯) ──
+    // 데이터팩의 `execute on passengers run ...` 은 줄마다 독립이라, move 처럼 한 함수가 같은
+    // source 로 on-passengers 를 6회 반복하면 매번 승객 리스트 + withEntity 래퍼를 새로 할당한다
+    // (onPassengers 는 생성 코드 전체에서 612회 호출되는 초-hot 헬퍼).
+    // 캐시 키 = (src 객체 신원, ENTITY_GEN). src 자체를 키로 삼는 이유: withEntity(p) 가 반환하는
+    // 자식 소스는 부모 src 의 위치/회전/컨텍스트를 상속하므로, getEntity() 가 같아도 positioned/as
+    // 로 재바인딩된 다른 src 면 결과가 달라야 한다(그 경우 캐시 미스 → 기존과 동일 재계산).
+    // 탑승 관계 변경(startRiding/stopRiding/스폰·킬)은 전부 ENTITY_GEN++ 를 거쳐 자동 무효화.
+    // 슬롯 1개라 다른 src 가 끼어들면 미스(정확성 무손실, 이득만 없음). 단일 틱 스레드 전제는
+    // 이 클래스의 다른 per-tick 캐시(SNAP/TYPE_INDEX)와 동일.
+    private static net.minecraft.server.command.ServerCommandSource ONP_SRC;
+    private static long ONP_GEN = -1;
+    private static java.util.List<net.minecraft.server.command.ServerCommandSource> ONP_CACHE;
+
     public static java.util.List<net.minecraft.server.command.ServerCommandSource> onPassengers(
             net.minecraft.server.command.ServerCommandSource src) {
         net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
         if (e == null) return java.util.List.of();
-        java.util.List<net.minecraft.entity.Entity> ps = e.getPassengerList();
-        if (ps.isEmpty()) return java.util.List.of();   // 승객 없는 엔티티(마커 등) — 할당 0
-        java.util.List<net.minecraft.server.command.ServerCommandSource> out =
-                new java.util.ArrayList<>(ps.size());
-        for (net.minecraft.entity.Entity p : ps) {
-            out.add(src.withEntity(p));
+        if (src == ONP_SRC && ONP_GEN == ENTITY_GEN && ONP_CACHE != null) {
+            return ONP_CACHE;   // 같은 소스 객체·같은 세대 — 직전 순회 결과 재사용(할당 0)
         }
+        java.util.List<net.minecraft.entity.Entity> ps = e.getPassengerList();
+        java.util.List<net.minecraft.server.command.ServerCommandSource> out;
+        if (ps.isEmpty()) {
+            out = java.util.List.of();   // 승객 없는 엔티티(마커 등) — 할당 0
+        } else {
+            java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
+                    new java.util.ArrayList<>(ps.size());
+            for (net.minecraft.entity.Entity p : ps) tmp.add(src.withEntity(p));
+            out = tmp;
+        }
+        ONP_SRC = src; ONP_GEN = ENTITY_GEN; ONP_CACHE = out;
         return out;
     }
 
@@ -2821,8 +2855,8 @@ public final class KfcGen {
                                     double minDist, double maxDist) {
         // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
         if (QUERY_BOX && origin != null && maxDist >= 0) {
-            return !entitiesByTypeBox(ctx, type, rangeBox(origin, maxDist),
-                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+            return anyInBoxTyped(ctx, type, rangeBox(origin, maxDist),
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
         for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
@@ -2835,8 +2869,8 @@ public final class KfcGen {
                                            String[] tagsPos, String[] tagsNeg,
                                            double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
-            return !ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
-                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+            return firstInBox(ctx, origin, maxDist,
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)) != null;
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
@@ -2851,9 +2885,9 @@ public final class KfcGen {
                                              String tagId, String[] tagsPos, String[] tagsNeg,
                                              double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
-            return !ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
+            return firstInBox(ctx, origin, maxDist,
                     en -> entityInTypeTag(en, tagId) && matchTagsAlive(en, tagsPos, tagsNeg)
-                          && inRange(origin, en, minDist, maxDist)).isEmpty();
+                          && inRange(origin, en, minDist, maxDist)) != null;
         }
         for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
             if (!entityInTypeTag(e, tagId)) continue;
@@ -3086,8 +3120,8 @@ public final class KfcGen {
                                     String[] tagsPos, String[] tagsNeg,
                                     double minDist, double maxDist) {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
-            return !entitiesByTypeBox(ctx, type, rangeBox(origin.getPos(), maxDist),
-                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)).isEmpty();
+            return anyInBoxTyped(ctx, type, rangeBox(origin.getPos(), maxDist),
+                    en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
         for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {

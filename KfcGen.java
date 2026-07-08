@@ -15,31 +15,35 @@ import net.minecraft.scoreboard.ServerScoreboard;
 public final class KfcGen {
 
     // ── 핫패스 캐시 ──────────────────────────────────────────────
+    // [스레드 노트] 커맨드 실행은 서버 메인 스레드 전용이라 이 캐시들은 단일 스레드에서만
+    // 접근된다 → ConcurrentHashMap 의 CAS/volatile 비용 없이 일반 HashMap 을 쓴다.
+    // (비동기 접근 경로가 생기면 되돌릴 것 — 캐시 미스 재계산은 멱등이라 최악도 중복 계산뿐이나,
+    //  HashMap 은 동시 변형 시 구조 손상 가능.)
     // 변환 출력은 상수 문자열(홀더명/사운드id/태그id/SNBT/텍스트 컴포넌트)을 매 틱 반복
     // 호출하므로, 문자열 → 파싱결과를 캐시해 매 호출 파싱/레지스트리 조회/객체 생성을 없앤다.
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.scoreboard.ScoreHolder>
-            HOLDER_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>>
-            SOUND_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.sound.SoundCategory>
-            SOUND_CAT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.block.Block>>
-            BLOCK_TAG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.nbt.NbtElement>
-            SNBT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.scoreboard.ScoreHolder>
+            HOLDER_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>>
+            SOUND_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.sound.SoundCategory>
+            SOUND_CAT_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.block.Block>>
+            BLOCK_TAG_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.nbt.NbtElement>
+            SNBT_CACHE = new java.util.HashMap<>();
     // NbtPath 는 파싱 후 완전 불변(string/nodeEndIndices/nodes 전부 final, 적용 시 root 만 다룸)이라
     // 재사용 안전. data 경로는 전부 상수 리터럴(storagePutSnbt 895 등 매 틱 호출)이므로 문자열→
     // NbtPath 캐시로 NbtPathArgumentType 재파싱을 제거한다.
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.command.argument.NbtPathArgumentType.NbtPath>
-            NBTPATH_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.command.argument.NbtPathArgumentType.NbtPath>
+            NBTPATH_CACHE = new java.util.HashMap<>();
     // display transformation 행렬형 리터럴의 파싱+TRS 분해(matrix→translation/rotation/scale)는
     // setTransformation 이 매 호출 수행하는 핫 비용이다. AffineTransformation 은 불변이고 분해를
     // 인스턴스 내부에 1회 memoize(initialized 플래그)하므로, NbtElement 값 기준으로 캐시해 동일
     // 행렬의 재파싱·재분해를 제거한다(distinct 행렬당 1회). 캐시 인스턴스 공유는 불변이라 안전.
-    private static final java.util.concurrent.ConcurrentHashMap<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
-            TRANSFORM_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.text.Text>
-            TEXT_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
+            TRANSFORM_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.text.Text>
+            TEXT_CACHE = new java.util.HashMap<>();
     private static final net.minecraft.nbt.NbtElement SNBT_INVALID = new net.minecraft.nbt.NbtCompound();
 
     /** 셀렉터 음수태그/빈 태그 인자용 공유 빈 배열 — 호출마다 new String[0] 할당을 없앤다.
@@ -66,8 +70,8 @@ public final class KfcGen {
 
     // Identifier.of 는 호출당 문자열 검증(namespace:path)+할당. Identifier 는 불변이고
     // reload 과 무관(레지스트리 '키'일 뿐 내용 아님) → 캐시 안전. null 입력은 그대로 null 반환.
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.util.Identifier>
-            ID_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.util.Identifier>
+            ID_CACHE = new java.util.HashMap<>();
 
     private static net.minecraft.util.Identifier idOf(String s) {
         if (s == null) return null;
@@ -455,8 +459,8 @@ public final class KfcGen {
 
     /** @e[predicate=ns:id] / if predicate — 런타임 술어 평가(컴파일타임 JSON 부재 시).
      *  바닐라 SELECTOR 컨텍스트(THIS_ENTITY+ORIGIN)로 LootCondition.test 호출. */
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.loot.condition.LootCondition>
-            PREDICATE_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.loot.condition.LootCondition>
+            PREDICATE_CACHE = new java.util.HashMap<>();
 
     public static boolean testPredicate(net.minecraft.server.command.ServerCommandSource src,
                                         net.minecraft.entity.Entity e, String predId) {
@@ -491,8 +495,8 @@ public final class KfcGen {
      *  바닐라 SetBlockCommand 흐름 그대로: BlockArgumentParser 로 상태+블록엔티티 NBT 를 파싱한 뒤
      *  BlockStateArgument.setBlockState(world, pos, flags) 로 적용한다(블록엔티티 NBT 포함).
      *  blockStr 은 'minecraft:gold_block' / 'oak_sign{...}' / 'stone[custom_data={...}]' 등 원문. */
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.command.argument.BlockStateArgument>
-            BLOCK_ARG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.command.argument.BlockStateArgument>
+            BLOCK_ARG_CACHE = new java.util.HashMap<>();
 
     private static net.minecraft.command.argument.BlockStateArgument parseBlockArg(String blockStr) {
         net.minecraft.command.argument.BlockStateArgument a = BLOCK_ARG_CACHE.get(blockStr);
@@ -523,8 +527,8 @@ public final class KfcGen {
     }
 
     // ── 엔티티 타입 태그(#ns:path) 런타임 멤버십 — 컴파일타임 태그 JSON 부재 시 사용 ──
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.entity.EntityType<?>>>
-            ENTITY_TYPE_TAG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.entity.EntityType<?>>>
+            ENTITY_TYPE_TAG_CACHE = new java.util.HashMap<>();
 
     public static boolean entityInTypeTag(net.minecraft.entity.Entity e, String tagId) {
         if (e == null) return false;
@@ -1215,7 +1219,7 @@ public final class KfcGen {
     // 기대 NBT(리터럴 문자열)는 매 호출 동일하므로 파싱 결과를 캐시 — StringNbtReader 반복 파싱 제거.
     // 비교 입력으로만 읽기 전용 사용(NbtHelper.matches 는 expected 를 변형하지 않음)하므로 안전.
     private static final java.util.Map<String, net.minecraft.nbt.NbtCompound> NBT_EXPECT_CACHE =
-            new java.util.concurrent.ConcurrentHashMap<>();
+            new java.util.HashMap<>();
     public static boolean nbtMatches(net.minecraft.entity.Entity e, String expectedNbt, boolean inverted) {
         boolean match;
         try {
@@ -1410,6 +1414,50 @@ public final class KfcGen {
             }
             return net.minecraft.sound.SoundCategory.MASTER;
         });
+        p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
+                ev, cat,
+                x, y, z, vol, pitch, p.getWorld().getRandom().nextLong()));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  [static-final 승격용] playSound 의 사운드/카테고리 리터럴 사전 파싱 + pre-parsed 오버로드.
+    //  merge_pass pass-4 가 변환 시점 상수 soundId/category 를 클래스 static final 필드로 승격하고
+    //  호출부를 아래 오버로드로 재작성 → 호출당 SOUND_CACHE/SOUND_CAT_CACHE 조회 + RegistryEntry.of
+    //  재할당 제거(이 팩 ~34만 호출). RegistryEntry/SoundEvent/SoundCategory 모두 불변 → 공유 안전.
+    //  파싱 시점: 버킷 클래스는 커맨드 실행(서버 시작 후)에 최초 로드 → SOUND_EVENT 레지스트리
+    //  frozen 상태라 안전. 로직은 SOUND_CACHE/SOUND_CAT_CACHE 람다와 완전 동일.
+    // ════════════════════════════════════════════════════════════════
+    public static net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> soundEvent(String soundId) {
+        net.minecraft.util.Identifier id = idOf(soundId.contains(":") ? soundId : "minecraft:" + soundId);
+        net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
+        // 미등록 id 도 그대로 재생(바닐라 허용) — RegistryEntry 래핑까지 1회.
+        return net.minecraft.registry.entry.RegistryEntry.of(
+                e != null ? e : net.minecraft.sound.SoundEvent.of(id));
+    }
+
+    public static net.minecraft.sound.SoundCategory soundCat(String category) {
+        // /playsound source 인자명(record/block/player)을 getName 으로 매칭(바닐라 동일), 미매칭=MASTER.
+        for (net.minecraft.sound.SoundCategory sc : net.minecraft.sound.SoundCategory.values()) {
+            if (sc.getName().equalsIgnoreCase(category)) return sc;
+        }
+        return net.minecraft.sound.SoundCategory.MASTER;
+    }
+
+    /** pre-parsed 오버로드(Vec3d) — 승격된 사운드/카테고리 필드를 받아 String 판과 동일 동작. */
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch) {
+        if (p == null || pos == null) return;
+        playSound(p, ev, cat, pos.x, pos.y, pos.z, vol, pitch);
+    }
+
+    /** pre-parsed 오버로드(x,y,z) — 파싱/조회만 생략, 패킷 전송은 String 판과 완전 동일. */
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 double x, double y, double z, float vol, float pitch) {
+        if (p == null) return;
         p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
                 ev, cat,
                 x, y, z, vol, pitch, p.getWorld().getRandom().nextLong()));
@@ -2211,8 +2259,8 @@ public final class KfcGen {
         return null;
     }
 
-    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<net.minecraft.command.argument.ItemStackArgument>>
-            ITEM_ARG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, java.util.Optional<net.minecraft.command.argument.ItemStackArgument>>
+            ITEM_ARG_CACHE = new java.util.HashMap<>();
 
     private static net.minecraft.item.ItemStack parseItemStack(net.minecraft.server.MinecraftServer server,
                                                                String itemStr, int count) {
@@ -3737,8 +3785,8 @@ public final class KfcGen {
     }
 
     /** ItemStack 이 item id(+custom_data) 술어에 일치하는지. clear/itemsMatch 공용. */
-    private static final java.util.concurrent.ConcurrentHashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.item.Item>>
-            ITEM_TAG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.item.Item>>
+            ITEM_TAG_CACHE = new java.util.HashMap<>();
 
     private static boolean stackMatches(net.minecraft.item.ItemStack stack, String itemId, String customDataSnbt) {
         if (stack == null || stack.isEmpty()) return false;
@@ -4182,7 +4230,7 @@ public final class KfcGen {
     //    절대 droppable 로 분류되지 않고 기존과 동일하게 round-trip 한다.)
     //  보편성: 특정 데이터팩/경로 하드코딩 없음 — 어떤 엔티티·경로든 런타임 관측으로 판정한다.
     private static final java.util.Map<String, Boolean> NBT_DROP =
-            new java.util.concurrent.ConcurrentHashMap<>();
+            new java.util.HashMap<>();
 
     private static String topSeg(String path) {
         int end = path.length();
@@ -4980,6 +5028,66 @@ public final class KfcGen {
         } catch (Exception ignored) {}
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  [static-final 승격용] SNBT 리터럴 사전 파싱 + pre-parsed 오버로드
+    //  merge_pass pass-4 가 변환 시점 상수 SNBT 를 클래스 static final 필드로 승격하고
+    //  호출부를 아래 오버로드로 재작성한다 → 호출당 SNBT_CACHE 조회/문자열 해시/파싱 제거.
+    //  (파싱은 StringNbtReader — 레지스트리 불요 → 클래스 로드 시 안전. 실패 시 null = 무동작.)
+    // ════════════════════════════════════════════════════════════════
+    /** SNBT 리터럴 → 불변 NbtCompound 템플릿(entityMergeSnbt 용). 파싱 실패/비compound 면 null. */
+    public static net.minecraft.nbt.NbtCompound snbtCompound(String snbt) {
+        try {
+            net.minecraft.nbt.NbtElement t = net.minecraft.nbt.StringNbtReader.readCompound(snbt);
+            return (t instanceof net.minecraft.nbt.NbtCompound c) ? c : null;
+        } catch (Exception ex) { return null; }
+    }
+
+    /** SNBT 값 리터럴 → 불변 NbtElement(storagePutSnbt 용, {v:...} 래핑 파싱). 실패 시 null. */
+    public static net.minecraft.nbt.NbtElement snbtValue(String snbt) {
+        try {
+            net.minecraft.nbt.NbtCompound w =
+                    net.minecraft.nbt.StringNbtReader.readCompound("{v:" + snbt + "}");
+            return w.get("v");
+        } catch (Exception ex) { return null; }
+    }
+
+    /** pre-parsed 오버로드: 승격된 static final 템플릿을 받아 실행(String 판 파싱 경로만 생략,
+     *  invalidateSnapshot/fast·slow 경로는 String 판과 완전 동일). tc==null(원본 SNBT_INVALID
+     *  대응)이면 invalidateSnapshot 후 무동작 — String 판과 동일 순서. */
+    public static void entityMergeSnbt(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound tc) {
+        if (e == null) return;
+        invalidateSnapshot(e);
+        if (tc == null) return;
+        try {
+            if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) return;
+            net.minecraft.nbt.NbtCompound patch = tc.copy();
+            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(nbt);
+            nbt.copyFrom(patch);
+            readNbtTagAware(e, nbt);
+        } catch (Exception ignored) {}
+    }
+
+    /** pre-parsed 오버로드: 승격된 static final 값 템플릿을 받아 실행(String 판과 동일,
+     *  파싱/조회만 생략). tmpl==null(원본 SNBT_INVALID 대응)이면 무동작 — String 판과 동일. */
+    public static void storagePutSnbt(net.minecraft.server.MinecraftServer server, String id,
+                                      String path, net.minecraft.nbt.NbtElement tmpl, String mode) {
+        if (tmpl == null) return;
+        try {
+            net.minecraft.nbt.NbtElement val = tmpl.copy();
+            net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+            if (root == null) root = new net.minecraft.nbt.NbtCompound();
+            boolean changed;
+            switch (mode) {
+                case "append"  -> changed = appendAtPath(root, path, val, false);
+                case "prepend" -> changed = appendAtPath(root, path, val, true);
+                case "merge"   -> changed = mergeAtPath(root, path, val);
+                default        -> changed = putAtPath(root, path, val);   // set
+            }
+            if (changed) storageSave(server, id, root);
+        } catch (Exception ignored) {}
+    }
+
     public static void entityRemovePath(net.minecraft.entity.Entity e, String path) {
         invalidateSnapshot(e);
         // DisplayEntity 의 brightness 는 DataTracker 필드 — writeNbt/readNbt 폴백으로는
@@ -5048,8 +5156,8 @@ public final class KfcGen {
      *  파싱 실패(잘못된 SNBT — 바닐라는 그 라인 인스턴스화 실패로 함수 미실행) → null 반환,
      *  호출부는 null 이면 함수를 호출하지 않는다(관측상 함수 미실행으로 동일).
      *  값은 변환 시점 상수+유한한 매크로 체인이므로 캐시(distinct 값당 1회 파싱). */
-    private static final java.util.concurrent.ConcurrentHashMap<String, String> MACRO_NORM_CACHE =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.HashMap<String, String> MACRO_NORM_CACHE =
+            new java.util.HashMap<>();
     private static final String MACRO_NORM_INVALID = new String("\u0000invalid");
     public static String macroNormalize(String raw) {
         if (raw == null) return null;

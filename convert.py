@@ -286,6 +286,67 @@ _SUM_TAG_HEAD_RE = re.compile(r'\btag\s+\S')
 _SUM_CALL_RE = re.compile(r'\bfunction\s+(\S+)')
 _SUM_LINE_VAL_RE = re.compile(r'((?:[^"\\]|\\.)*)"')
 
+# ── 점수판 쓰기 요약(인터프로시저) ──
+# 함수별 '이 함수(전이 포함)가 쓸 수 있는 점수' 지시 집합을 계산해 assemble 의 score read CSE 가
+# 함수 호출을 관통하게 한다. 지시: ('"h"','"o"') 리터럴쌍 | ("OBJ",'"o"') 동적홀더 | ("HLD",'"h"')
+# reset 전체. "SALL" = 미지(전량 무효화). ⊤ 트리거는 head-앵커(run/줄머리)로 한정해
+# objective 명에 흔한 kill/xp 같은 단어의 오탐을 막는다(선택자/텍스트 속 단어는 무해한
+# 과보수화만 유발하나, head-앵커로 그마저 줄인다). advancement 는 보상 함수 실행 가능,
+# kill/damage/xp 류는 통계·criteria 로 점수를 동기 변경할 수 있어 ⊤.
+_SSUM_TOP_RE  = re.compile(r'(?:^|\brun\s+)(?:kill|damage|advancement|xp|experience|reload|tick)\b'
+                           r'|instant_damage|instant_health')
+_SSUM_OPER_RE = re.compile(r'\bscoreboard\s+players\s+operation\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)')
+_SSUM_PLY_RE  = re.compile(r'\bscoreboard\s+players\s+(set|add|remove|reset|enable)\s+(\S+)(?:\s+(\S+))?')
+_SSUM_STORE_RE= re.compile(r'\bstore\s+(?:result|success)\s+score\s+(\S+)\s+(\S+)')
+_SSUM_TRG_RE  = re.compile(r'\btrigger\s+(\S+)')
+_SSUM_OBJRM_RE= re.compile(r'\bscoreboard\s+objectives\s+remove\b')
+
+def _sum_score_token(tok):
+    """홀더/obj 토큰 분류: ('lit', 자바문자열리터럴) | ('dyn',) | None(파싱불가=⊤)."""
+    if not tok or '$(' in tok or '"' in tok or '\\' in tok:
+        return None
+    if tok.startswith('@'):
+        if '[' in tok and not tok.endswith(']'):
+            return None                 # 공백 낀 셀렉터 — 토큰 분해 실패 = fail-closed
+        return ('dyn',)
+    return ('lit', '"' + tok + '"')
+
+def _sum_line_score(line):
+    """한 명령의 점수 쓰기 요약: "SALL" | set(지시)."""
+    if '$(' in line or _SSUM_TOP_RE.search(line) or _SSUM_OBJRM_RE.search(line):
+        return "SALL"
+    out = set()
+    def _emit(th, to):
+        if th is None or to is None or to[0] != 'lit':
+            return False
+        out.add((th[1], to[1]) if th[0] == 'lit' else ("OBJ", to[1]))
+        return True
+    for h, o, op, h2, o2 in _SSUM_OPER_RE.findall(line):
+        pairs = [(h, o), (h2, o2)] if op == '><' else [(h, o)]
+        for hh, oo in pairs:
+            if not _emit(_sum_score_token(hh), _sum_score_token(oo)):
+                return "SALL"
+    for verb, h, o in _SSUM_PLY_RE.findall(line):
+        th = _sum_score_token(h)
+        if th is None:
+            return "SALL"
+        if verb == 'reset' and not o:
+            if th[0] != 'lit':
+                return "SALL"           # 동적 홀더 전체 리셋 = 미지
+            out.add(("HLD", th[1]))
+            continue
+        if not _emit(th, _sum_score_token(o)):
+            return "SALL"
+    for h, o in _SSUM_STORE_RE.findall(line):
+        if not _emit(_sum_score_token(h), _sum_score_token(o)):
+            return "SALL"
+    for o in _SSUM_TRG_RE.findall(line):
+        to = _sum_score_token(o)
+        if to is None or to[0] != 'lit':
+            return "SALL"
+        out.add(("OBJ", to[1]))         # trigger = @s(동적) 홀더 쓰기
+    return out
+
 def _sum_line_effect(line: str):
     """한 명령의 지역 효과: ("ALL" | tags:set, move:bool | None, calls:list).
        토큰은 줄 전체에서 찾는다(execute 체인·if function 등 중첩 위치 불문).
@@ -320,12 +381,15 @@ def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
     """함수별 요약 → (effects_by_fqcn, known_fqcns).
        effects 는 효과 있는 함수만 수록: "ALL" | (frozenset[tags], move:bool).
        known 은 trees 의 전 함수 fqcn(미포함 fqcn 호출 = assemble 이 미지로 fail-closed)."""
-    local: dict = {}                              # fid -> "ALL" | (set, bool)
+    local: dict = {}                              # fid -> "ALL" | (set, bool)   [태그·이동]
+    slocal: dict = {}                             # fid -> "SALL" | set(지시)     [점수 쓰기]
     edges = collections.defaultdict(set)          # fid -> callee fid 들
     def _feed(fid, line):
         local.setdefault(fid, (set(), False))
+        slocal.setdefault(fid, set())
         if line is None:
             local[fid] = "ALL"
+            slocal[fid] = "SALL"
             return
         eff, move, calls = _sum_line_effect(line)
         for c in calls:
@@ -333,11 +397,20 @@ def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
                 edges[fid].add(c)
             else:
                 local[fid] = "ALL"       # #함수태그/$()/미존재 callee = 미지
+                slocal[fid] = "SALL"
         if eff == "ALL":
             local[fid] = "ALL"
         elif local[fid] != "ALL":
             cur = local[fid]
             local[fid] = (cur[0] | eff, cur[1] or move)
+        if slocal[fid] != "SALL":
+            se = _sum_line_score(line)
+            if se == "SALL":
+                slocal[fid] = "SALL"
+            else:
+                slocal[fid] |= se
+                if len(slocal[fid]) > 48:
+                    slocal[fid] = "SALL"   # 폭주 방지 상한(사실상 전역 초기화 함수)
     if _trees_is_jsonl(trees_path):
         with open(trees_path, encoding="utf-8") as f:
             for rec in f:
@@ -359,26 +432,41 @@ def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
         for c in cs:
             rev[c].add(f)
     summary = local
+    ssum = slocal
     work = collections.deque(summary.keys())
     inwork = set(work)
     while work:
         f = work.popleft(); inwork.discard(f)
         s = summary[f]
+        sc = ssum[f]
         for caller in rev.get(f, ()):
+            changed = False
             cs = summary.get(caller)
-            if cs is None or cs == "ALL":
-                continue
-            if s == "ALL":
-                summary[caller] = "ALL"
-            else:
-                nt = cs[0] | s[0]; nm = cs[1] or s[1]
-                if nt == cs[0] and nm == cs[1]:
-                    continue
-                summary[caller] = (nt, nm)
-            if caller not in inwork:
+            if cs is not None and cs != "ALL":
+                if s == "ALL":
+                    summary[caller] = "ALL"; changed = True
+                else:
+                    nt = cs[0] | s[0]; nm = cs[1] or s[1]
+                    if nt != cs[0] or nm != cs[1]:
+                        summary[caller] = (nt, nm); changed = True
+            ss = ssum.get(caller)
+            if ss != "SALL":
+                if sc == "SALL":
+                    ssum[caller] = "SALL"; changed = True
+                elif sc - ss:
+                    ns = ss | sc
+                    ssum[caller] = "SALL" if len(ns) > 48 else ns
+                    changed = True
+            if changed and caller not in inwork:
                 work.append(caller); inwork.add(caller)
-    effects = {fid_to_fqcn(f, group): ("ALL" if v == "ALL" else (frozenset(v[0]), v[1]))
-               for f, v in summary.items() if v == "ALL" or v[0] or v[1]}
+    # 인코딩: fqcn -> (태그효과, 점수효과). 둘 다 무효과인 함수는 미수록(사전 크기 절약).
+    effects = {}
+    for f, v in summary.items():
+        te = "ALL" if v == "ALL" else (frozenset(v[0]), v[1])
+        se = ssum[f]
+        se = "SALL" if se == "SALL" else frozenset(se)
+        if te == "ALL" or v[0] or v[1] or se == "SALL" or se:
+            effects[fid_to_fqcn(f, group)] = (te, se)
     known = frozenset(fid_to_fqcn(f, group) for f in summary)
     return effects, known
 

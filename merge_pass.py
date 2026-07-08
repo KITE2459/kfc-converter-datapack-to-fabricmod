@@ -741,6 +741,107 @@ def _code_pos_ok(text: str, pos: int) -> bool:
         i += 1
     return not in_str
 
+# ── SNBT 리터럴 → static final 파싱 필드 승격 (pre-parsed 오버로드 호출로 재작성) ──
+#   entityMergeSnbt(<e>, "SNBT")            → entityMergeSnbt(<e>, KFC_NBTC_k)   (NbtCompound)
+#   storagePutSnbt(server,"id","p","SNBT","mode") → ...(...,KFC_NBTV_k,...)      (NbtElement)
+#   변환 시점 상수 SNBT 를 클래스 로드 때 1회 파싱 → 호출당 SNBT_CACHE 조회/문자열 해시/copy용
+#   조회 제거 + 메서드 바이트코드 축소. 리터럴 인자만 승격(매크로·동적 문자열은 그대로 String 판).
+_SNBT_STR_FULL = re.compile(r'\s*"(?:[^"\\]|\\.)*"\s*\Z')
+
+def _scan_call_args(body: str, needle: str):
+    """body 안 모든 `needle`(= 'KfcGen.foo(') 호출의 (needle_start, close_idx, [(argstart,argend),...]).
+       문자열/괄호/대괄호/중괄호 상태를 추적해 SNBT 안의 쉼표·괄호·따옴표에 속지 않는다."""
+    out = []; i = 0; L = len(body)
+    while True:
+        j = body.find(needle, i)
+        if j < 0: break
+        i = j + len(needle)
+        if not _code_pos_ok(body, j):        # 문자열/주석 내부 = 코드 아님
+            continue
+        k = j + len(needle)                  # '(' 다음 문자
+        depth_p = 1; depth_b = 0; depth_c = 0
+        in_str = False; esc = False
+        seg_start = k; args = []; close_idx = -1
+        while k < L:
+            c = body[k]
+            if in_str:
+                if esc: esc = False
+                elif c == '\\': esc = True
+                elif c == '"': in_str = False
+            else:
+                if c == '"': in_str = True
+                elif c == '(': depth_p += 1
+                elif c == ')':
+                    depth_p -= 1
+                    if depth_p == 0:
+                        args.append((seg_start, k)); close_idx = k; break
+                elif c == '[': depth_b += 1
+                elif c == ']': depth_b -= 1
+                elif c == '{': depth_c += 1
+                elif c == '}': depth_c -= 1
+                elif c == ',' and depth_p == 1 and depth_b == 0 and depth_c == 0:
+                    args.append((seg_start, k)); seg_start = k + 1
+            k += 1
+        if close_idx >= 0:
+            out.append((j, close_idx, args))
+    return out
+
+def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
+    """리터럴 인자를 파싱된 static final 필드로 승격하고 pre-parsed 오버로드 호출로 재작성.
+       (새 body, 치환수, 다음 seq). 다인자 스펙(playSound)은 원자적 — 대상 인자가 '전부'
+       리터럴일 때만 승격(부분 승격 시 매칭 오버로드 없음). 리터럴 아닌 인자(매크로/동적)는 원판 유지."""
+    seq = start_seq; n = 0
+    # (needle, 허용 인자수 집합|None, [(arg_idx, ftype, parse_fn, prefix), ...])
+    specs = [
+        ("KfcGen.entityMergeSnbt(", {2}, [
+            (1, "net.minecraft.nbt.NbtCompound", "KfcGen.snbtCompound", "KFC_NBTC_")]),
+        ("KfcGen.storagePutSnbt(", {5}, [
+            (3, "net.minecraft.nbt.NbtElement", "KfcGen.snbtValue", "KFC_NBTV_")]),
+        ("KfcGen.playSound(", {6, 8}, [   # (p, sound, cat, [Vec3d|x,y,z], vol, pitch)
+            (1, "net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>",
+             "KfcGen.soundEvent", "KFC_SND_"),
+            (2, "net.minecraft.sound.SoundCategory", "KfcGen.soundCat", "KFC_SCAT_")]),
+    ]
+
+    def _field_for(ftype, pfn, prefix, lit_s):
+        nonlocal seq
+        key = (prefix, lit_s)
+        name = fields.get(key)
+        if name is None:
+            name = f"{prefix}{seq}"; seq += 1
+            fields[key] = name
+            decls.append(f"    private static final {ftype} {name} = {pfn}({lit_s});")
+        return name
+
+    repls = []   # (arg_start, arg_end, field_name)
+    for needle, argcs, targets in specs:
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if argcs is not None and len(args) not in argcs:
+                continue
+            if any(ti >= len(args) for (ti, *_ ) in targets):
+                continue
+            # 원자성: 대상 인자가 전부 순수 리터럴일 때만 승격
+            lits = []
+            ok = True
+            for (ti, ftype, pfn, prefix) in targets:
+                a0, a1 = args[ti]
+                lit = body[a0:a1]
+                if not _SNBT_STR_FULL.match(lit):
+                    ok = False; break
+                lits.append((a0, a1, lit.strip(), ftype, pfn, prefix))
+            if not ok:
+                continue
+            for (a0, a1, lit_s, ftype, pfn, prefix) in lits:
+                name = _field_for(ftype, pfn, prefix, lit_s)
+                repls.append((a0, a1, name)); n += 1
+    # 오른쪽부터 적용(인덱스 안정)
+    for a0, a1, name in sorted(repls, key=lambda r: r[0], reverse=True):
+        lead = body[a0:a1]
+        pad = lead[:len(lead)-len(lead.lstrip())]
+        body = body[:a0] + pad + name + body[a1:]
+    return body, n, seq
+
+
 def hoist_constants_text(text: str) -> tuple[str, int]:
     """단일 클래스 소스에서 상수 배열 리터럴을 static final 필드로 호이스팅.
        (변경된 텍스트, 치환 건수) 반환. 클래스 선언을 못 찾으면 무변경."""
@@ -781,6 +882,9 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     body = _sub(_V3_RE, "KFC_V3_", "net.minecraft.util.math.Vec3d", body)
     body = _sub(_V2_RE, "KFC_V2_", "net.minecraft.util.math.Vec2f", body)
     body = _sub(_CAT_RE, "KFC_CS_", "String", body)
+    # SNBT 리터럴 → 파싱된 static final 필드 승격(pre-parsed 오버로드 호출로 재작성)
+    body, _snbt_n, _ = _promote_snbt_text(body, decls, fields, len(decls))
+    n += _snbt_n
     if n == 0:
         return text, 0
     return text[:insert_at] + "\n" + "\n".join(decls) + body, n

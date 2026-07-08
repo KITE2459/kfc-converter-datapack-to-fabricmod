@@ -227,8 +227,14 @@ def _score_effects(em):
     if em.kind != "native":
         return None
     code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
-    if ".execute(" in code or ".executeReturn(" in code or "instantExecute" in code:
-        return None                    # 함수 호출 = 점수 요약 없음 → 배리어
+    inv0 = set()
+    if "instantExecute" in code:
+        return None                    # 브릿지 = 바닐라 임의 실행
+    if ".execute(" in code or ".executeReturn(" in code:
+        cs = _call_score(code)         # 인터프로시저 점수 요약(callee 가 쓰는 것만 무효화)
+        if cs is None:
+            return None
+        inv0 |= cs
     if re.search(r'\bsb\.[A-Za-z]', code):
         return None                    # KfcGen 래퍼 밖 직접 스코어보드 접근
     for hm in _CSE_HELPER_RE.finditer(code):
@@ -242,7 +248,7 @@ def _score_effects(em):
     # 인자 파싱 실패(복합식) fail-closed: 이름 기준 개수와 파싱 개수가 다르면 전량 무효화
     if len(w) != len(_SCR_WRITE_CNT_RE.findall(code)) or len(ops) != len(_SCR_OP_CNT_RE.findall(code)):
         return None
-    inv = set()
+    inv = set(inv0)
     for m in w + ops:
         h, o = m.group(1), m.group(2)
         if not o.startswith('"'):
@@ -258,7 +264,7 @@ def _scr_apply_inv(cache: dict, inv) -> None:
     """무효화 지시(inv)를 캐시에 적용. cache 키는 (h,o)."""
     if inv:
         for k in list(cache):
-            if k in inv or ("OBJ", k[1]) in inv:
+            if k in inv or ("OBJ", k[1]) in inv or ("HLD", k[0]) in inv:
                 cache.pop(k, None)
 
 
@@ -279,7 +285,7 @@ def _find_reused_score_reads(emitted) -> set:
             seen.clear()
         elif eff:
             for k in list(seen):
-                if k in eff or ("OBJ", k[1]) in eff:
+                if k in eff or ("OBJ", k[1]) in eff or ("HLD", k[0]) in eff:
                     seen.pop(k, None)
     return reused
 
@@ -321,14 +327,38 @@ def _call_effect(code: str):
             if m.group(1) not in _KNOWN_FQCNS:
                 return None          # 미지 callee(스텁/비함수 수신자) = 전량 무효화
             continue                 # 알려진 함수 + 효과 미수록 = 무효과(NONE)
-        if eff == "ALL":
+        te = eff[0] if isinstance(eff, tuple) and len(eff) == 2 and (eff[0] == "ALL" or isinstance(eff[0], tuple)) else eff
+        if te == "ALL":
             return None
-        tags |= eff[0]
-        move = move or eff[1]
+        tags |= te[0]
+        move = move or te[1]
     # 정규식이 못 잡은 호출이 남아 있으면(비정형 수신자) fail-closed
     if n != code.count(".execute(") + code.count(".executeReturn("):
         return None
     return (tags, move)
+
+
+def _call_score(code: str):
+    """code 내 모든 함수 호출의 점수 쓰기 합성: 지시 set | None(미지).
+       fail-closed 규칙은 _call_effect 와 동일(미지 callee/미주입/비정형 잔존)."""
+    if not _KNOWN_FQCNS:
+        return None
+    inv = set()
+    n = 0
+    for m in _CALL_TARGET_RE.finditer(code):
+        n += 1
+        eff = _CALL_EFFECTS.get(m.group(1))
+        if eff is None:
+            if m.group(1) not in _KNOWN_FQCNS:
+                return None
+            continue                 # 효과 미수록 = 점수 무효과
+        se = eff[1] if isinstance(eff, tuple) and len(eff) == 2 and (eff[0] == "ALL" or isinstance(eff[0], tuple)) else "SALL"
+        if se == "SALL":
+            return None
+        inv |= se
+    if n != code.count(".execute(") + code.count(".executeReturn("):
+        return None
+    return inv
 
 
 def _cse_is_barrier(em) -> bool:
@@ -971,9 +1001,6 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     _will_fallback = (rejected or (is_self_recursive and not tco) or _is_force_bridged(fid)
                       or any(_em.kind in ("bridge", "dispatch") for _em in emitted))
     _total_code = sum(_code_chars(_em.java) for _em in emitted)
-    do_split = (not _will_fallback) and (not tco) and (not _is_traced(fid)) \
-               and _total_code > _SEG_TRIGGER
-    seg_bounds = _seg_bounds_for(emitted) if do_split else set()
     cse_cache: dict[str, str] = {}   # scan_expr -> _selN  (현재 유효한 바인딩)
     cse_set_cache: dict[str, str] = {}  # full-set expr -> _esetN (재사용 구간 내 1회 수집)
     cse_tag_cache: dict[str, str] = {}  # 태그스캔 expr -> _tselN (태그/멤버 변동 전까지 배리어 관통)
@@ -982,18 +1009,30 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
     reused_tags = _find_reused_tag_exprs(emitted) if ENTITY_TAG_CSE else set()
     reused_scores = _find_reused_score_reads(emitted) if SCORE_READ_CSE else set()
+    # [수정] 세그먼트 분할이 CSE 주입 선언(_svN/_selN/_esetN/_tselN)을 예산에 넣지 않던 결함 교정.
+    # 종전엔 do_split 을 CSE '이전' 크기(_total_code)로만 판정하고, 경계도 _seg_bounds_for(
+    # emitted)(역시 CSE 이전)로 잡았다. 그 뒤 루프가 decls 를 본문에 주입하므로 그 바이트가
+    # 예산 밖이 되어 조각이 _SEG_TARGET 을 넘고, 분할이 지키려던 JIT HugeMethodLimit(8KB) 근처로
+    # 메서드가 부풀었다. 이제 (a) 트리거는 고유 hoist 대상 수만큼 크기를 보정하고, (b) 경계는
+    # 아래 루프에서 decls 를 포함한 실제 누적 코드량(seg_acc)이 목표를 넘을 때 동적으로 넣는다.
+    _cse_infl = (len(reused_scores) + len(reused_sets) + len(reused_tags)) * 48
+    do_split = (not _will_fallback) and (not tco) and (not _is_traced(fid)) \
+               and (_total_code + _cse_infl) > _SEG_TRIGGER
+    seg_acc = 0   # 현재 조각의 실제 렌더 코드량(주석 제외, decls 포함) 누적
     scr_seq = [0]   # _sv 전용 카운터
     cse_seq = [0]
     cse_set_seq = [0]   # _eset 전용 카운터(기존 _sel 번호 불변 → 순수 가산적)
     cse_tag_seq = [0]   # _tsel 전용 카운터
     hit_terminal = False
     for _gi, (obj, em) in enumerate(zip(parse_trees, emitted)):
-        if _gi in seg_bounds and not hit_terminal:
+        if (do_split and not hit_terminal and seg_acc > 0
+                and seg_acc + _code_chars(em.java) > _SEG_TARGET):
             body_lines.append(_SEG_MARK)        # 조각 경계 마커(렌더에서 분할 후 제거)
             cse_cache.clear()                   # CSE 를 조각-로컬로 격리
             cse_set_cache.clear()
             cse_tag_cache.clear(); cse_tag_tags.clear()  # _tsel 은 세그먼트 지역변수 → 경계 못 넘음
             scr_cache.clear()                            # _sv 도 세그먼트 지역변수
+            seg_acc = 0
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
         if hit_terminal:
@@ -1078,6 +1117,18 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         # 무효화는 아래 _score_effects 결과로 정밀 처리(그 키/objective 를 쓰는 지점에서만).
         scr_eff = _score_effects(em) if SCORE_READ_CSE else None
         if SCORE_READ_CSE and reused_scores:
+            # [정확성] 같은 명령(em)이 그 키를 '쓰는' 경우 그 키의 읽기는 호이스트하지 않는다.
+            # 이유: `execute store result ... run scoreboard players add/set/remove/operation`
+            # 은 쓰기 '이후'(결과) 값을 저장한다 — 이때 읽기는 addScore/opScore/setScore 뒤에
+            # 방출된다. 그런데 _svN 선언(decls)은 em 본문보다 '먼저' 놓이므로, 호이스트하면
+            # 쓰기 이전 값으로 collapse 되어 결과가 (더한 양만큼) 틀어진다(실측: store-result-add).
+            # → 이 em 이 건드리는 키(또는 미지 쓰기·objective 단위 쓰기)의 읽기는 원본 인라인
+            #   (getScore/scoreMatches, 라이브 읽기)으로 남겨 방출 순서상 올바른 값을 읽게 한다.
+            #   em 이 안 쓰는 키는 값이 em 전 구간 불변이므로 기존대로 안전하게 병합한다.
+            def _scr_key_written(k):
+                if scr_eff is None:
+                    return True                          # 미지 쓰기 = 이 em 전부 라이브
+                return (k in scr_eff) or (("OBJ", k[1]) in scr_eff) or (("HLD", k[0]) in scr_eff)
             def _scr_var(k):
                 v = scr_cache.get(k)
                 if v is None:
@@ -1088,14 +1139,14 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 return v
             def _repl_sm(m):
                 k = (m.group(1), m.group(2))
-                if k not in reused_scores:
+                if k not in reused_scores or _scr_key_written(k):
                     return m.group(0)
                 v = _scr_var(k)
                 # scoreMatches 시맨틱 복제: 미설정(null)=false, 이후 [min,max] 검사(센티널 동일)
                 return f"({v} != null && {v} >= {m.group(3)} && {v} <= {m.group(4)})"
             def _repl_sg(m):
                 k = (m.group(1), m.group(2))
-                if k not in reused_scores:
+                if k not in reused_scores or _scr_key_written(k):
                     return m.group(0)
                 v = _scr_var(k)
                 return f"({v} == null ? 0 : {v})"   # getScore(readOrZero) 시맨틱 복제
@@ -1112,6 +1163,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         body_lines.extend(decls)      # 스캔 1회 평가(메서드 본문 레벨, 사용 직전)
         body_lines.extend(new_java)
         body_lines.append("")
+        seg_acc += _code_chars(decls) + _code_chars(new_java)   # decls 포함 실제 누적
 
         if barrier:
             cse_cache.clear()         # 변형 후 base-source nearest 캐시 무효화

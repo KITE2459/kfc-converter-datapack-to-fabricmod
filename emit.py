@@ -1106,7 +1106,7 @@ def _dynamic_dispatch(fid: str, em: "Emitted") -> "list[str] | None":
     # 건너뛰므로(no-op), 키를 지역변수로 받아 null 가드 후에만 switch 한다(블록으로 스코프 격리).
     lines = [f"{{ String _dk = {sel_token};", "  if (_dk != null) switch (_dk) {"]
     for val, cf in cands:
-        lines.append(f"    case {jstr(val)}: {fqcn(cf)}.execute(source); break;")
+        lines.append(f"    case {jstr(val)}: {fqcn(cf)}.executeReturn(source); break;")
     lines.append("    default: break;")   # 알 수 없는 값 = 원본도 무효 함수(no-op)
     lines.append("  } }")
     em.kind = "native"
@@ -1199,7 +1199,7 @@ def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list
     call_cls = fqcn(fid)
     if fid not in MACRO_FNS:
         # 일반 함수: 인자가 붙어 있어도 mcfunction 은 무시 -> 무인자 호출.
-        return [f'{call_cls}.execute(source);']
+        return [f'{call_cls}.executeReturn(source);']
 
     # 매크로 함수 -> 인자 소스 결정
     if "with" in nn:
@@ -1209,20 +1209,20 @@ def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list
             sid = first_arg(args, "source")
             path = first_arg(args, "path")
             if path:
-                return [f'{call_cls}.execute(source, '
+                return [f'{call_cls}.executeReturn(source, '
                         f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(path)}));']
-            return [f'{call_cls}.execute(source, KfcGen.storageMacroArgs(server, {jstr(sid)}));']
+            return [f'{call_cls}.executeReturn(source, KfcGen.storageMacroArgs(server, {jstr(sid)}));']
         if kind == "entity":
             sel_raw = first_arg(args, "source")
             path = first_arg(args, "path") or ""
             if sel_raw == "@s":
-                return [f'{call_cls}.execute(source, '
+                return [f'{call_cls}.executeReturn(source, '
                         f'KfcGen.entityMacroArgs(executor, {jstr(path)}));']
             ent = nearest_entity_java(parse_selector(sel_raw))
             if ent is None:
                 em.reason = f"function with entity 셀렉터({sel_raw}) - 미지원"
                 return None
-            return [f'{call_cls}.execute(source, '
+            return [f'{call_cls}.executeReturn(source, '
                     f'KfcGen.entityMacroArgs({ent}, {jstr(path)}));']
         if kind == "block":
             pos = (first_arg(args, "pos") or first_arg(args, "position")
@@ -1232,7 +1232,7 @@ def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list
             if bp is None:
                 em.reason = f"function with block 좌표({pos}) - 로컬(^)/형식 미지원"
                 return None
-            return [f'{call_cls}.execute(source, '
+            return [f'{call_cls}.executeReturn(source, '
                     f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(path)}));']
         em.reason = f"function with {kind} 소스 - 1차 미지원"
         return None
@@ -1252,7 +1252,7 @@ def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list
             # 변환도 동일하게: 해당 인자가 비어있으면 호출하지 않도록 가드.
             if re.fullmatch(r'MACROVAR_\d+', v.strip()):
                 guard_vars.append(mv)
-        call = f'{call_cls}.execute(source, KfcGen.macroArgs({", ".join(kv)}));'
+        call = f'{call_cls}.executeReturn(source, KfcGen.macroArgs({", ".join(kv)}));'
         if guard_vars:
             # null(인자 부재) 또는 빈 문자열이면 NBT 파싱 실패와 동일 → 호출 스킵.
             cond = " && ".join(f'!KfcGen.macroEmpty({g})' for g in guard_vars)
@@ -1260,7 +1260,7 @@ def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list
         return [call]
 
     # 매크로 함수인데 인자 없음 -> 빈 맵 (mcfunction 에선 매크로 줄 도달 시 에러지만, 안전하게 빈 맵)
-    return [f'{call_cls}.execute(source, KfcGen.macroArgs());']
+    return [f'{call_cls}.executeReturn(source, KfcGen.macroArgs());']
 
 
 def parse_compound_args(raw: str) -> list[tuple[str, str]]:
@@ -1676,16 +1676,16 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         name = args.get("name", [{}])[0].get("raw")
         if verb and name is not None:
             if sel == "@s":
-                fn = "addCommandTag" if verb == "add" else "removeCommandTag"
-                em.java.append(f'if (executor != null) executor.{fn}({jstr(name)});')
+                fn = "addTag" if verb == "add" else "removeTag"
+                em.java.append(f'if (executor != null) KfcGen.{fn}(executor, {jstr(name)});')
                 return True
             if sel and (sel.startswith("@s[") or sel.startswith("@s ")):
                 psel = parse_selector(sel)
                 cond = selector_cond(psel) if psel else None
                 if cond is None:
                     return False
-                fn = "addCommandTag" if verb == "add" else "removeCommandTag"
-                stmt = f'executor.{fn}({jstr(name)});'
+                fn = "addTag" if verb == "add" else "removeTag"
+                stmt = f'KfcGen.{fn}(executor, {jstr(name)});'
                 em.java.append(f'if ({cond}) {stmt}' if cond != "true" else stmt)
                 return True
             return emit_tag_selector(verb, sel, name, em)  # @e/@n/@p 셀렉터 -> 루프/단일
@@ -2911,7 +2911,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         return False
     # nbt 필터 → 런타임 NbtHelper.matches 가드(부분일치). 단일/루프 모두 적용.
     _nbt_conds = [(jstr(ns), str(inv).lower()) for ns, inv in sel.nbt]
-    fn = "addCommandTag" if verb == "add" else "removeCommandTag"
+    fn = "addTag" if verb == "add" else "removeTag"
     single = (sel.base in ("n", "p", "r")) or (sel.limit == 1)
     if single:
         if sel.nbt:
@@ -2938,7 +2938,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
                 ent = (f'KfcGen.{_fnw4}(ctx, source.getPosition(), {tp}, {tn}, '
                        f'{dmin}, {dmax}, _ee -> ({pred}))')
             em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
-                           f' if (_t != null) _t.{fn}({jstr(name)}); }}')
+                           f' if (_t != null) KfcGen.{fn}(_t, {jstr(name)}); }}')
             em.kind = "native"
             return True
         ent = single_entity_expr(holder)
@@ -2948,7 +2948,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
         pg = predicate_guards(sel.predicates, "_t", player=False) if sel.predicates else []
         cond = "_t != null" + "".join(f" && {g}" for g in pg)
         em.java.append(f'{{ net.minecraft.entity.Entity _t = {ent};'
-                       f' if ({cond}) _t.{fn}({jstr(name)}); }}')
+                       f' if ({cond}) KfcGen.{fn}(_t, {jstr(name)}); }}')
         em.kind = "native"
         return True
     if sel.base == "a":
@@ -2974,7 +2974,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
             conds.append(f'KfcGen.nbtMatches(_t, {ns}, {inv})')
         if conds:
             em.java.append(f'    if (!({" && ".join(conds)})) continue;')
-        em.java.append(f'    _t.{fn}({jstr(name)});')
+        em.java.append(f'    KfcGen.{fn}(_t, {jstr(name)});')
         em.java.append("}")
         em.kind = "native"
         return True
@@ -3050,7 +3050,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
                 em.java.append(f'    if (!({g})) continue;')
         for ns, inv in _nbt_conds:
             em.java.append(f'    if (!KfcGen.nbtMatches(_t, {ns}, {inv})) continue;')
-    em.java.append(f'    _t.{fn}({jstr(name)});')
+    em.java.append(f'    KfcGen.{fn}(_t, {jstr(name)});')
     em.java.append("}")
     em.kind = "native"
     return True

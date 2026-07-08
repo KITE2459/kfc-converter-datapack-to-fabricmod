@@ -170,6 +170,52 @@ _CSE_TAG_RE = re.compile(
     r'KfcGen\.(?:firstEntity|nearestEntity)\((?:[^()]|\([^()]*\))*\)')
 ENTITY_TAG_CSE = True   # 회귀 시 즉시 차단용 단일 토글
 
+# ── 인터프로시저 태그 요약 (convert.py pass-1.5 가 주입) ────────────────────
+# 종전엔 함수 호출(.execute/.executeReturn)을 '무슨 태그든 바꿀 수 있다'고 보고 캐시를
+# 전량 무효화했다(실측: onkartcollision 의 carB 스캔 17회가 이 때문에 CSE 불가).
+# convert.py 가 원본 mcfunction 소스에서 함수별 '변형 태그 + 위치변경' 요약을 호출 그래프
+# 전이 폐포로 계산해 주입하면, 호출 시 그 함수가 실제로 건드리는 태그에 의존하는 캐시만
+# 무효화한다. 요약은 소스 레벨이라 native/bridge 경로 모두에 유효하다(emit 은 tag/kill/
+# summon 명령 외에 태그·엔티티집합을 바꾸는 코드를 합성하지 않음 — 실측 확인).
+#   _CALL_EFFECTS: fqcn -> "ALL"(미지=전량) | (frozenset[변형태그], move:bool)
+#                  (무효과(NONE) 함수는 미수록 — 사전 크기 절약)
+#   _KNOWN_FQCNS:  요약이 계산된 전체 함수의 fqcn. 미포함 fqcn 호출 = fail-closed(미지).
+# 둘 다 미주입이면 모든 함수 호출 = 미지 → 종전 동작과 동일(순수 가산적).
+_CALL_EFFECTS: dict = {}
+_KNOWN_FQCNS: frozenset = frozenset()
+
+def set_call_summaries(effects: dict, known_fqcns):
+    global _CALL_EFFECTS, _KNOWN_FQCNS
+    _CALL_EFFECTS = dict(effects or {})
+    _KNOWN_FQCNS = frozenset(known_fqcns or ())
+
+_CALL_TARGET_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_$.]*)\.(execute|executeReturn)\(')
+
+def _call_effect(code: str):
+    """code 내 모든 함수 호출의 합성 효과: (tags:set, move:bool) | None(미지).
+       fail-closed: 요약 미주입, 미지 callee(스텁 등), 수신자를 식별 못 한
+       `.execute(`/`.executeReturn(` 잔존 시 모두 None."""
+    if not _KNOWN_FQCNS:
+        return None
+    tags: set = set()
+    move = False
+    n = 0
+    for m in _CALL_TARGET_RE.finditer(code):
+        n += 1
+        eff = _CALL_EFFECTS.get(m.group(1))
+        if eff is None:
+            if m.group(1) not in _KNOWN_FQCNS:
+                return None          # 미지 callee(스텁/비함수 수신자) = 전량 무효화
+            continue                 # 알려진 함수 + 효과 미수록 = 무효과(NONE)
+        if eff == "ALL":
+            return None
+        tags |= eff[0]
+        move = move or eff[1]
+    # 정규식이 못 잡은 호출이 남아 있으면(비정형 수신자) fail-closed
+    if n != code.count(".execute(") + code.count(".executeReturn("):
+        return None
+    return (tags, move)
+
 
 def _cse_is_barrier(em) -> bool:
     """이 명령이 (단순형 nearest 캐시 관점에서) 엔티티 집합/위치/커맨드태그를 바꿀 수 있으면 True.
@@ -178,7 +224,12 @@ def _cse_is_barrier(em) -> bool:
         return True  # 폴백/브릿지/디스패치 = 미지 → 배리어
     code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
     if ".execute(" in code or ".executeReturn(" in code:
-        return True  # 다른 함수 호출(execute / executeReturn) = 미지의 부작용
+        # 인터프로시저 요약: '전이적으로 태그·위치·엔티티집합을 전혀 안 바꾸는' callee 만
+        # 배리어 아님(나머지 검사는 계속). 태그 변형 callee 도 배리어 — nearest/집합 스캔은
+        # 태그 필터를 포함할 수 있고 여기선 스캔별 태그 의존을 추적하지 않기 때문.
+        ce = _call_effect(code)
+        if ce is None or ce[0] or ce[1]:
+            return True
     for p in _CSE_INLINE_BARRIER:
         if p in code:
             return True
@@ -244,43 +295,56 @@ def _cse_tag_eligible(expr: str):
 
 
 _TAG_MUTATE_RE = re.compile(r'\.(?:addCommandTag|removeCommandTag)\("([^"]*)"\)')
-
-# _pos(origin 로컬) 재대입 전용 무효화 신호: origin-의존 태그 스캔만 캐시에서 제거하라는 의미.
-# (origin-무관 스캔 — firstEntity 이고 min/max dist 둘 다 <0 — 은 _pos 변화와 결과가 무관해 유지.)
-POS_REBIND = "__POS_REBIND__"
+# KfcGen.addTag/removeTag(<대상>, "이름") — 태그 버킷(런타임) 유지를 위해 emit 이 엔티티 메서드
+# 직접 호출 대신 이 헬퍼를 경유한다. 태그 변형 분석은 두 형태 모두 인식(구형 생성물 호환).
+_TAG_MUTATE2_RE = re.compile(r'KfcGen\.(?:addTag|removeTag)\(\s*[^,()]+,\s*"([^"]*)"\)')
 
 def _cse_tags_mutated(em):
-    """이 명령이 건드리는 커맨드태그 집합. 태그 변형 없으면 빈 set.
-       집합이 미지로 변할 수 있으면(함수호출/미지헬퍼/멤버 스폰·킬/위치외 변형·origin 재대입) None."""
+    """이 명령의 태그 캐시 영향. 반환:
+         None             = 미지(전량 무효화: 미지 callee/미지 헬퍼/멤버 스폰·킬)
+         (tags:set, move) = 변형 커맨드태그 집합 + 위치변경 여부.
+       move=True 는 origin-'의존' 스캔만 무효화(origin-무관 스캔은 위치 변화와 결과 무관).
+       tags 와 move 는 동시 표현 가능(종전 POS_REBIND 센티넬 대체) — 예: 태그 X 추가 +
+       teleportTo 인 명령은 X-의존 스캔과 origin-의존 스캔을 함께 무효화하며, 그 외
+       (X 미참조·origin-무관) 스캔은 유지해도 안전하다.
+       함수 호출은 인터프로시저 요약(_call_effect)으로 그 함수가 실제 건드리는
+       태그/위치만 반영한다(요약 미주입·미지 callee 는 종전대로 None)."""
     if em.kind != "native":
         return None
     code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+    tags: set = set()
+    move = False
     if ".execute(" in code or ".executeReturn(" in code:
-        return None
-    # origin 로컬(_pos) 재대입은 origin-'의존' 스캔만 캐시를 깨야 한다(origin-무관 스캔은 유효).
-    # 전량 무효화(None) 대신 전용 센티넬을 반환해 호출부가 선별 제거하게 한다.
+        ce = _call_effect(code)
+        if ce is None:
+            return None                   # 미지 callee = 전량 무효화(종전 동작)
+        tags |= ce[0]
+        move = move or ce[1]
+    # origin 로컬(_pos) 재대입: origin-의존 스캔만 무효화. (종전엔 여기서 조기 반환해
+    # 같은 명령의 태그/스폰·킬 검사를 건너뛰었다 — 아래로 계속 진행해 그 구멍을 막는다.)
     if re.search(r'\b_pos\s*=', code) or re.search(r'\bVec3d\s+_pos\b', code):
-        return POS_REBIND
-    mutated = set(_TAG_MUTATE_RE.findall(code))
+        move = True
+    tags |= set(_TAG_MUTATE_RE.findall(code))
+    tags |= set(_TAG_MUTATE2_RE.findall(code))
     for p in (".remove(", ".discard(", ".kill(", "KfcGen.summon", "KfcGen.killEntity"):
         if p in code:
             return None                   # 멤버 스폰/킬 = 집합 크기 변동
     # 위치 변경 헬퍼(teleportTo/movePosition): 커맨드태그는 불변이나 엔티티 위치가 바뀌므로
     # origin-의존 스캔(거리 필터/최근접) 결과가 달라질 수 있다. origin-무관 스캔은 영향 없음.
-    # → 태그 변형이 없으면 POS_REBIND(origin-의존만 무효화)로 처리해 origin-무관 캐시를 살린다.
-    #   (태그 변형이 함께 있으면 아래 미지 헬퍼 경로로 안 빠지고 mutated 를 반환하되, 위치도
-    #    바뀌므로 보수적으로 None 을 반환한다.)
     if "KfcGen.teleportTo(" in code or "KfcGen.movePosition(" in code:
-        if mutated:
-            return None                   # 태그+위치 동시 변경 = 보수적 전량 무효화
-        return POS_REBIND
+        move = True
     for hm in _CSE_HELPER_RE.finditer(code):
-        if hm.group(1) not in _CSE_SAFE_HELPERS:
+        h = hm.group(1)
+        if h in ("teleportTo", "movePosition"):
+            continue                      # 위에서 move 로 정밀 처리됨
+        if h in ("addTag", "removeTag"):
+            continue                      # _TAG_MUTATE2_RE 로 태그 단위 정밀 처리됨
+        if h not in _CSE_SAFE_HELPERS:
             return None                   # 미지 헬퍼 = 보수적 전량 무효화
     for p in _CSE_INLINE_BARRIER:
         if p in code and "CommandTag(" not in p:
             return None
-    return mutated
+    return (tags, move)
 
 
 def _cse_tag_key(expr: str) -> str:
@@ -316,17 +380,15 @@ def _find_reused_tag_exprs(emitted) -> set:
         mut = _cse_tags_mutated(em)
         if mut is None:
             seen.clear(); key_variants.clear()
-        elif mut is POS_REBIND:
-            # _pos 재대입: origin-의존 스캔만 무효화, origin-무관(firstEntity·거리무제한)은 유지
-            for k in list(seen):
-                el = _cse_tag_eligible(k)
-                if el and not el[2]:
-                    seen.pop(k, None); key_variants.pop(k, None)
-        elif mut:
-            for k in list(seen):
-                el = _cse_tag_eligible(k)
-                if el and ((el[0] & mut) or (el[1] & mut)):
-                    seen.pop(k, None); key_variants.pop(k, None)
+        else:
+            mtags, mmove = mut
+            if mtags or mmove:
+                # 변형 태그에 의존하거나, 위치가 바뀌었는데 origin-의존인 스캔만 제거
+                for k in list(seen):
+                    el = _cse_tag_eligible(k)
+                    if el and ((el[0] & mtags) or (el[1] & mtags)
+                               or (mmove and not el[2])):
+                        seen.pop(k, None); key_variants.pop(k, None)
     return reused
 
 
@@ -902,22 +964,20 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         if barrier:
             cse_cache.clear()         # 변형 후 base-source nearest 캐시 무효화
             cse_set_cache.clear()
-        # 태그 캐시 정밀 무효화: 이 명령이 변형한 태그(tag_mut)에 의존하는 바인딩만 제거.
-        # None = 함수호출/미지헬퍼/멤버변동 → 전량 무효화. POS_REBIND = origin-의존만 무효화.
+        # 태그 캐시 정밀 무효화: 이 명령이 변형한 태그/위치(tag_mut)에 의존하는 바인딩만 제거.
+        # None = 미지 callee/미지헬퍼/멤버변동 → 전량 무효화.
+        # (tags, move): 변형 태그 의존 + (move 시) origin-의존 스캔 제거.
+        # (_find_reused_tag_exprs 와 동일 판정 — 두 곳은 반드시 같은 규칙이어야 한다.)
         if ENTITY_TAG_CSE and cse_tag_cache:
             if tag_mut is None:
                 cse_tag_cache.clear(); cse_tag_tags.clear()
-            elif tag_mut is POS_REBIND:
-                for e in list(cse_tag_cache):
-                    el = cse_tag_tags.get(e)
-                    if el and not el[2]:      # origin-의존 스캔만 제거(무관 스캔은 유지)
-                        cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
-            elif tag_mut:
-                for e in list(cse_tag_cache):
-                    el = cse_tag_tags.get(e, (frozenset(), frozenset(), False))
-                    pos, neg = el[0], el[1]
-                    if (pos & tag_mut) or (neg & tag_mut):
-                        cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
+            else:
+                mtags, mmove = tag_mut
+                if mtags or mmove:
+                    for e in list(cse_tag_cache):
+                        el = cse_tag_tags.get(e, (frozenset(), frozenset(), False))
+                        if (el[0] & mtags) or (el[1] & mtags) or (mmove and not el[2]):
+                            cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
 
         if em.terminal:
             hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리
@@ -987,6 +1047,11 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     cache_pos = body.count("source.getPosition()") >= 2
     if cache_pos:
         body = body.replace("source.getPosition()", "_pos")
+    # 루프-로컬 엔티티 등 잔여 getNameForScoreboard(): 비-플레이어는 호출마다 UUID 문자열을
+    # 새로 만든다(핫패스 할당 — 핫코어 실측 3,574 호출부). 이름은 엔티티 수명 동안 불변이므로
+    # KfcGen.nameOf(identity 캐시) 경유로 바꾼다. 수신자가 단순 변수인 경우만 치환(체인식은
+    # 그대로), _exName 치환 뒤 잔여가 대상이라 executor 캐시 로직과 충돌하지 않는다.
+    body = re.sub(r'\b([A-Za-z_]\w*)\.getNameForScoreboard\(\)', r'KfcGen.nameOf(\1)', body)
 
     # 필요한 prelude/import 결정 (본문 토큰 스캔; 주석 줄은 제외)
     scan_src = "\n".join(l for l in body.split("\n") if not l.lstrip().startswith("//"))

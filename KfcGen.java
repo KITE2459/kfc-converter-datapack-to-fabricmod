@@ -46,6 +46,20 @@ public final class KfcGen {
      *  내용이 비어 있고 읽기 전용으로만 쓰이므로 공유해도 안전하다. */
     public static final String[] NO_TAGS = new String[0];
 
+    // ── 스코어보드 이름 캐시 ──
+    // 비-플레이어 Entity.getNameForScoreboard() 는 호출마다 UUID 문자열을 새로 만든다(핫패스
+    // 할당 폭증 — 핫코어 실측 3,574 호출부). 이름은 엔티티 수명 동안 불변(UUID 고정, 플레이어명
+    // 세션 고정) → identity 기반 캐시. WeakHashMap(Entity 는 기본 identity equals) 이라 엔티티
+    // 소멸 시 엔트리도 자연 회수된다(틱 청소 불필요, 누수 없음). 서버 스레드 전용.
+    private static final java.util.WeakHashMap<net.minecraft.entity.Entity, String> NAME_CACHE =
+            new java.util.WeakHashMap<>();
+    public static String nameOf(net.minecraft.entity.Entity e) {
+        if (e == null) return null;
+        String n = NAME_CACHE.get(e);
+        if (n == null) { n = e.getNameForScoreboard(); NAME_CACHE.put(e, n); }
+        return n;
+    }
+
     private static net.minecraft.scoreboard.ScoreHolder holderOf(String name) {
         return HOLDER_CACHE.computeIfAbsent(name, net.minecraft.scoreboard.ScoreHolder::fromName);
     }
@@ -116,8 +130,29 @@ public final class KfcGen {
     // 스냅샷을 통째로 버리지 말고 증분 갱신한다. (바닐라/브릿지 스폰은 틱 경계에서 재수집되어
     // 정확성 유지 — 기존 per-tick 스냅샷 시맨틱 그대로.)
     static void snapAdd(net.minecraft.entity.Entity e) {
+        long _prevGen = ENTITY_GEN;
         ENTITY_GEN++;                        // gen 은 단조 증가 유지(다른 캐시/판정과 일관)
+        // [정합 가드] 직전까지 유효(TB_GEN==prev)했던 태그 버킷만 증분 갱신·재유효화한다.
+        // 이미 무효(예: 직전 브릿지의 ENTITY_GEN++)면 '유효' 표시가 브릿지 변화를 놓친 버킷을
+        // 부활시키므로 그대로 무효 상태로 둔다(다음 접근 때 재수집).
+        if (TB_GEN == _prevGen && e != null) {
+            tagBucketsOnAdd(e);
+            for (net.minecraft.entity.Entity p : e.getPassengersDeep()) tagBucketsOnAdd(p);
+            TB_GEN = ENTITY_GEN;
+        }
+        // 타입 인덱스도 동일 원칙의 증분 유지 — 종전엔 스폰/킬마다 gen 불일치로 다음 typeBucket
+        // 접근 때 전체 재빌드(IdentityHashMap 재구축 + 전 엔티티 재분류)가 일어났다. 스폰이 잦은
+        // 틱에서 이 재빌드가 스캔 사이마다 반복(핫코어 실측: 스폰/킬 1,145곳 × 스캔 9,279곳).
+        if (TYPEIDX_GEN == _prevGen && e != null) {
+            typeIndexAdd(e);
+            for (net.minecraft.entity.Entity p : e.getPassengersDeep()) typeIndexAdd(p);
+            TYPEIDX_GEN = ENTITY_GEN;
+        }
         if (e == null || SNAP_ENTITIES == null) return;
+        // [정합 가드] 스냅샷도 동일 원칙 — 직전까지 유효했던 경우에만 증분 갱신·재유효화.
+        // (종전엔 무조건 SNAP_GEN=ENTITY_GEN 으로 표시해, '브릿지 무효화 → 접근 없이 → summon'
+        //  순서에서 브릿지가 만든 변화가 빠진 스냅샷이 부활할 수 있었다.)
+        if (SNAP_GEN != _prevGen) return;
         // 엔티티 + 모든 탑승자(재귀) 를 스냅샷에 반영한다.
         // spawnNewEntityAndPassengers 는 차량과 탑승자를 같은 틱에 함께 월드에 추가하므로,
         // parent 만 넣으면 탑승자(예: player_head item_display = loop-player-head)가 같은 틱
@@ -161,8 +196,18 @@ public final class KfcGen {
     }
 
     static void snapRemove(net.minecraft.entity.Entity e) {
+        long _prevGen = ENTITY_GEN;
         ENTITY_GEN++;
+        if (TB_GEN == _prevGen && e != null) {   // 태그 버킷 증분 제거(snapAdd 와 동일 정합 가드)
+            tagBucketsOnRemove(e);
+            TB_GEN = ENTITY_GEN;
+        }
+        if (TYPEIDX_GEN == _prevGen && e != null) {   // 타입 인덱스 증분 제거(동일 가드)
+            typeIndexRemove(e);
+            TYPEIDX_GEN = ENTITY_GEN;
+        }
         if (e == null || SNAP_ENTITIES == null) return;
+        if (SNAP_GEN != _prevGen) return;        // 이미 무효였던 스냅샷은 부활시키지 않는다
         // 단일 제거. discard 된 차량의 탑승자는 분리(dismount)되어 월드에 남으므로 스냅샷에서 빼지 않는다.
         // 탑승자도 함께 kill 되는 경우엔 각 엔티티가 자기 snapRemove 호출을 받는다.
         // (과거 'if (e.hasPassengers()) return;' 은 SNAP_GEN 을 stale 로 남겨 snapAdd 와 동일한 버그를 유발.)
@@ -193,6 +238,120 @@ public final class KfcGen {
         }
         java.util.List<net.minecraft.entity.Entity> b = TYPE_INDEX.get(t);
         return b == null ? java.util.Collections.emptyList() : b;
+    }
+
+    /** 스폰/킬의 타입 인덱스 증분 반영(전체 재빌드 방지 — snapAdd/snapRemove 전용). */
+    private static void typeIndexAdd(net.minecraft.entity.Entity e) {
+        if (TYPE_INDEX == null || e == null) return;
+        TYPE_INDEX.computeIfAbsent(e.getType(), k -> new java.util.ArrayList<>()).add(e);
+    }
+    private static void typeIndexRemove(net.minecraft.entity.Entity e) {
+        if (TYPE_INDEX == null || e == null) return;
+        java.util.List<net.minecraft.entity.Entity> b = TYPE_INDEX.get(e.getType());
+        if (b != null) b.remove(e);
+    }
+
+    // ── 틱 단위 태그→엔티티 버킷 (@e[tag=..] 무제한 스캔 핫패스용) ──
+    // 무제한(박스 미적용) 태그 스캔이 매번 typeBucket/스냅샷 '전체'를 순회하던 것을 태그별
+    // 소수 목록만 보게 한다. 타입버킷과 달리 멤버십(태그) 자체가 버킷 키라서 '사용 시 라이브
+    // 재필터'만으론 누락(스캔 사이에 태그가 붙은 엔티티)을 못 잡는다 → 변형 훅으로 유지:
+    //   · KfcGen.addTag/removeTag — 생성 코드의 tag add/remove 전부 이 경유(증분 갱신)
+    //   · summon/kill(snapAdd/snapRemove) — 증분 갱신(스폰 NBT 태그 반영/제거)
+    //   · 브릿지(instantExecute*: 바닐라 /tag 가능) — ENTITY_GEN++ → epoch 불일치로 전체 무효화
+    //   · 엔티티 NBT 쓰기(readNbt 는 Tags 를 재로드할 수 있음) — readNbtTagAware 가 전후 비교로 무효화
+    // 사용측이 양성/음성 태그·생존·타입·거리를 항상 라이브로 재검사하므로 버킷의 '초과' 원소는
+    // 무해하고(걸러짐), 위 훅들이 '누락'을 막는다. 결과 집합/순서는 종전 경로와 동일하다
+    // (버킷 = 스냅샷 순서의 부분수열; 타입 지정 헬퍼는 타입-우선 순회를 그대로 유지).
+    private static final java.util.HashMap<String, java.util.ArrayList<net.minecraft.entity.Entity>> TAG_BUCKETS =
+            new java.util.HashMap<>();
+    private static net.minecraft.server.MinecraftServer TB_SERVER;
+    private static int  TB_TICK = Integer.MIN_VALUE;
+    private static long TB_GEN  = -1;
+
+    static java.util.List<net.minecraft.entity.Entity> tagBucket(GameContext ctx, String tag) {
+        int tk = ctx.server.getTicks();
+        if (TB_SERVER != ctx.server || TB_TICK != tk || TB_GEN != ENTITY_GEN) {
+            TAG_BUCKETS.clear(); TB_SERVER = ctx.server; TB_TICK = tk; TB_GEN = ENTITY_GEN;
+        }
+        java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
+        if (b == null) {
+            b = new java.util.ArrayList<>();
+            for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx))
+                if (e.getCommandTags().contains(tag)) b.add(e);
+            TAG_BUCKETS.put(tag, b);
+        }
+        return b;
+    }
+
+    /** 거리상한(박스) 스캔용 후보: 양성 태그 버킷이 충분히 작을 때만 반환(그 외 null → 섹션 스캔 유지).
+     *  거리·태그·생존·타입 필터는 호출측이 동일하게 재적용하므로 결과 '집합'은 박스 경로와 동일하다.
+     *  관측 차이는 limit=1 다중매치 시 임의 픽 순서뿐(스냅샷 순서 — 섹션 순서보다 틱 간 안정적).
+     *  버킷이 크면(수백+ 모델 태그 등) 박스 섹션 스캔이 더 적게 보므로 기존 경로를 유지한다.
+     *  핫패스 근거: 충돌 계열 nearest/any 가 같은 소수-태그(@e[tag=carB..,distance=..N])를 틱당
+     *  수십 회 박스 질의 — 버킷(카트 수) 순회 + 거리필터가 섹션 스캔 반복보다 훨씬 싸다. */
+    /** 버킷 경로의 타입 배열 매치(1~2개 원소 — 선형이 가장 싸다). */
+    private static boolean typeMatch(net.minecraft.entity.Entity e, net.minecraft.entity.EntityType<?>[] types) {
+        for (net.minecraft.entity.EntityType<?> t : types) if (e.getType() == t) return true;
+        return false;
+    }
+
+    private static final int TAG_BOUNDED_MAX = 128;
+    static java.util.List<net.minecraft.entity.Entity> tagCandidatesBounded(GameContext ctx, String[] tagsPos) {
+        if (tagsPos == null || tagsPos.length == 0) return null;
+        java.util.List<net.minecraft.entity.Entity> b = tagBucket(ctx, tagsPos[0]);
+        return b.size() <= TAG_BOUNDED_MAX ? b : null;
+    }
+
+    /** 무제한 스캔의 후보 축소: 양성 태그가 있으면 그 태그 버킷(대개 소수), 없으면 null(기존 소스 사용).
+     *  호출측은 반드시 기존 필터(matchTagsAlive/타입/거리)를 그대로 재적용해야 한다 — 버킷은 1차 후보일 뿐. */
+    static java.util.List<net.minecraft.entity.Entity> tagCandidates(GameContext ctx, String[] tagsPos) {
+        return (tagsPos != null && tagsPos.length > 0) ? tagBucket(ctx, tagsPos[0]) : null;
+    }
+
+    /** 타입 미지정 무제한 스캔용: 양성 태그가 있으면 태그 버킷, 없으면 스냅샷(종전 소스). */
+    static java.util.List<net.minecraft.entity.Entity> tagOrSnap(GameContext ctx, String[] tagsPos) {
+        java.util.List<net.minecraft.entity.Entity> b = tagCandidates(ctx, tagsPos);
+        return b != null ? b : entitiesSnapshot(ctx);
+    }
+
+    /** 생성 코드의 `tag <sel> add` 는 전부 이 헬퍼를 경유한다(엔티티 직접 호출 금지 — 버킷 증분 유지). */
+    public static void addTag(net.minecraft.entity.Entity e, String tag) {
+        if (e == null) return;
+        if (e.addCommandTag(tag)) {   // false(이미 있음/1024 초과) = 변화 없음 → 버킷 불변
+            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
+            if (b != null && !b.contains(e)) b.add(e);
+        }
+    }
+
+    /** 생성 코드의 `tag <sel> remove` 전용 (addTag 와 동일 원칙). */
+    public static void removeTag(net.minecraft.entity.Entity e, String tag) {
+        if (e == null) return;
+        if (e.removeCommandTag(tag)) {
+            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
+            if (b != null) b.remove(e);
+        }
+    }
+
+    private static void tagBucketsOnAdd(net.minecraft.entity.Entity e) {
+        if (TAG_BUCKETS.isEmpty() || e == null) return;
+        for (String tg : e.getCommandTags()) {
+            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tg);
+            if (b != null && !b.contains(e)) b.add(e);
+        }
+    }
+
+    private static void tagBucketsOnRemove(net.minecraft.entity.Entity e) {
+        if (TAG_BUCKETS.isEmpty() || e == null) return;
+        for (java.util.ArrayList<net.minecraft.entity.Entity> b : TAG_BUCKETS.values()) b.remove(e);
+    }
+
+    /** e.readNbt(n) 대체 — readNbt 는 n.Tags 로 커맨드태그를 통째로 재로드할 수 있다(data merge/
+     *  modify entity, store ... entity 등). 전후 태그가 실제로 달라졌을 때만 버킷을 무효화한다. */
+    private static void readNbtTagAware(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound n) {
+        if (TAG_BUCKETS.isEmpty()) { e.readNbt(n); return; }
+        java.util.HashSet<String> before = new java.util.HashSet<>(e.getCommandTags());
+        e.readNbt(n);
+        if (!before.equals(e.getCommandTags())) TAG_BUCKETS.clear();
     }
 
     // ── Sepals(Catheter) 호환 타입-박스 질의 ──
@@ -654,7 +813,7 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!posInRange(origin, e.getPos(), minDist, maxDist)) continue;
             out.add(e);
@@ -738,10 +897,17 @@ public final class KfcGen {
     public static boolean anyEntityAnyType(GameContext ctx, net.minecraft.entity.Entity origin,
                                            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
             return firstInBox(ctx, origin.getPos(), maxDist,
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)) != null;
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             return true;
@@ -757,6 +923,16 @@ public final class KfcGen {
         double bestD = Double.MAX_VALUE;
         net.minecraft.util.math.Vec3d o = origin != null ? origin.getPos() : null;
         if (o != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(o);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
             for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(o, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                 double d = e.getPos().squaredDistanceTo(o);
@@ -764,7 +940,7 @@ public final class KfcGen {
             }
             return best;
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             double d = (o == null) ? 0 : e.getPos().squaredDistanceTo(o);
@@ -2611,7 +2787,7 @@ public final class KfcGen {
     /** 엔티티의 스코어보드 이름으로 점수 조회 (null/미설정이면 0). */
     public static int getScoreOfEntity(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
         if (e == null) return 0;
-        return readOrZero(sb, e.getNameForScoreboard(), o);
+        return readOrZero(sb, nameOf(e), o);
     }
 
     public static void setScore(ServerScoreboard sb, String holder, String o, int v) {
@@ -2855,11 +3031,20 @@ public final class KfcGen {
                                     double minDist, double maxDist) {
         // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
         if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (e.getType() == type && matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
             return anyInBoxTyped(ctx, type, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
-        for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, type))) {
+            if (_tb != null && e.getType() != type) continue;   // 태그버킷 경로: 타입 필터
             if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
         }
         return false;
@@ -2869,10 +3054,17 @@ public final class KfcGen {
                                            String[] tagsPos, String[] tagsNeg,
                                            double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
             return firstInBox(ctx, origin, maxDist,
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist)) != null;
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             return true;
@@ -2885,11 +3077,18 @@ public final class KfcGen {
                                              String tagId, String[] tagsPos, String[] tagsNeg,
                                              double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (entityInTypeTag(e, tagId) && matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
             return firstInBox(ctx, origin, maxDist,
                     en -> entityInTypeTag(en, tagId) && matchTagsAlive(en, tagsPos, tagsNeg)
                           && inRange(origin, en, minDist, maxDist)) != null;
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!entityInTypeTag(e, tagId)) continue;
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
@@ -2907,6 +3106,17 @@ public final class KfcGen {
         // typeBucket 전체(월드의 해당 타입 전부) 순회를 피한다 — onkartcollision 등 핫패스에서
         // maxDist 가 작아(예: 4) box 스캔이 훨씬 적게 본다. 결과 집합/최근접 동일.
         if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!typeMatch(e, types)) continue;
+                    if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
             net.minecraft.util.math.Box _bx = rangeBox(origin, maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
                 for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
@@ -2917,8 +3127,10 @@ public final class KfcGen {
             }
             return best;
         }
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {   // 거리 무제한
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입 필터
                 if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
                 if (!inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
@@ -2934,6 +3146,16 @@ public final class KfcGen {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
             for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
                 double d = e.getPos().squaredDistanceTo(origin);
@@ -2941,7 +3163,7 @@ public final class KfcGen {
             }
             return best;
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
@@ -3016,6 +3238,19 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        // 무제한 + 양성 태그: 태그 버킷 경로(결과 집합·타입-우선 순서 동일, 후보만 소수).
+        java.util.List<net.minecraft.entity.Entity> _tb =
+                (origin != null && maxDist >= 0) ? tagCandidatesBounded(ctx, tagsPos) : tagCandidates(ctx, tagsPos);
+        if (_tb != null) {
+            java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : _tb) {
+                    if (e.getType() != t) continue;
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) out.add(e);
+                }
+            }
+            return out;
+        }
         // 단일 타입(생성물의 226개 중 209개)은 조회 결과를 그대로 반환 — new ArrayList+addAll 로
         // 한 번 더 복사하던 중간 리스트 할당을 제거한다(내용·순서 동일, 복사만 생략).
         if (types.length == 1) {
@@ -3085,11 +3320,19 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                java.util.List<net.minecraft.entity.Entity> _out = new java.util.ArrayList<>();
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) _out.add(e);
+                }
+                return _out;
+            }
             return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
@@ -3145,11 +3388,20 @@ public final class KfcGen {
                                     String[] tagsPos, String[] tagsNeg,
                                     double minDist, double maxDist) {
         if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (e.getType() == type && matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
             return anyInBoxTyped(ctx, type, rangeBox(origin.getPos(), maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
-        for (net.minecraft.entity.Entity e : typeBucket(ctx, type)) {
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, type))) {
+            if (_tb != null && e.getType() != type) continue;   // 태그버킷 경로: 타입 필터
             if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
         }
         return false;
@@ -3206,8 +3458,10 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입-우선 순회 순서 보존
                 if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
             }
         }
@@ -3218,10 +3472,17 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {   // 범위 한정: 박스 조기종료(리스트 미생성)
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
+                }
+                return null;
+            }
             return firstInBox(ctx, origin, maxDist,
                     e -> matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist));
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {   // 무한범위: 스냅샷 조기종료
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {   // 무한범위: 스냅샷 조기종료
             if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
         }
         return null;
@@ -3232,8 +3493,10 @@ public final class KfcGen {
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입-우선 순회 순서 보존
                 if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)
                         && pred.test(e)) return e;
             }
@@ -3246,10 +3509,17 @@ public final class KfcGen {
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
         if (origin != null && maxDist >= 0) {   // 범위 한정: 박스 조기종료(리스트 미생성)
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) { if (pred.test(e)) return e; }
+                }
+                return null;
+            }
             return firstInBox(ctx, origin, maxDist,
                     e -> matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e));
         }
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {   // 무한범위: 스냅샷 조기종료
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {   // 무한범위: 스냅샷 조기종료
             if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e)) return e;
         }
         return null;
@@ -3351,6 +3621,17 @@ public final class KfcGen {
         net.minecraft.entity.Entity best = null;
         double bestD = Double.MAX_VALUE;
         if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!typeMatch(e, types)) continue;
+                    if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = origin.squaredDistanceTo(e);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
             net.minecraft.util.math.Box _bx = rangeBox(origin.getPos(), maxDist);
             for (net.minecraft.entity.EntityType<?> t : types) {
                 for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
@@ -3361,8 +3642,10 @@ public final class KfcGen {
             }
             return best;
         }
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
         for (net.minecraft.entity.EntityType<?> t : types) {
-            for (net.minecraft.entity.Entity e : typeBucket(ctx, t)) {   // 거리 무제한: 타입 버킷 순회
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {   // 거리 무제한
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입 필터
                 if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
                 if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
                 double d = origin == null ? 0 : origin.squaredDistanceTo(e);
@@ -3615,7 +3898,7 @@ public final class KfcGen {
     public static boolean anyEntityItemsCond(GameContext ctx, String[] tagsPos, String[] tagsNeg,
                                              String slot, String itemId, String customNbt, boolean negate) {
         boolean anyEntity = false, found = false;
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!e.isAlive()) continue;                      // @e/@n: 바닐라 기본 isAlive 술어
             boolean ok = true;
             for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
@@ -3645,7 +3928,7 @@ public final class KfcGen {
     /** if items entity @e/@n <slot> <pred> : 어떤 엔티티든 슬롯에 일치 아이템 보유(태그 필터 반영). */
     public static boolean anyEntityItemsMatch(GameContext ctx, String[] tagsPos, String[] tagsNeg,
                                               String slot, String itemId, String customNbt) {
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!e.isAlive()) continue;                      // @e/@n: 바닐라 기본 isAlive 술어
             boolean ok = true;
             for (String t : tagsPos) if (!e.getCommandTags().contains(t)) { ok = false; break; }
@@ -3683,6 +3966,20 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.entity.Entity origin,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        // 무제한 + 양성 태그: 태그 버킷 경로(결과 집합·타입-우선 순서 동일, 후보만 소수).
+        java.util.List<net.minecraft.entity.Entity> _tb =
+                (origin != null && maxDist >= 0) ? tagCandidatesBounded(ctx, tagsPos) : tagCandidates(ctx, tagsPos);
+        if (_tb != null) {
+            java.util.List<net.minecraft.entity.Entity> out2 = new java.util.ArrayList<>();
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : _tb) {
+                    if (e.getType() != t) continue;
+                    if (matchTagsAlive(e, tagsPos, tagsNeg)
+                            && (origin == null || inRange(origin, e, minDist, maxDist))) out2.add(e);
+                }
+            }
+            return out2;
+        }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
         for (net.minecraft.entity.EntityType<?> t : types) {
             if (origin != null && maxDist >= 0) {
@@ -3702,11 +3999,19 @@ public final class KfcGen {
             GameContext ctx, net.minecraft.entity.Entity origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                java.util.List<net.minecraft.entity.Entity> _out = new java.util.ArrayList<>();
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) _out.add(e);
+                }
+                return _out;
+            }
             return ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
-        for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
@@ -3881,7 +4186,7 @@ public final class KfcGen {
             invalidateSnapshot(e);                   // effective — 기존과 동일 round-trip
             net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(n);
-            if (putAtPath(n, path, v)) e.readNbt(n);
+            if (putAtPath(n, path, v)) readNbtTagAware(e, n);
             return;
         }
         // 첫 관측: 자가검증(추가 writeNbt 1회 — (클래스,키)당 1회만, 이후 캐시 hit)
@@ -3891,7 +4196,7 @@ public final class KfcGen {
         net.minecraft.nbt.NbtCompound mod = before.copy();
         if (!putAtPath(mod, path, v)) return;        // 경로 적용 실패 → 변화 없음(분류 보류)
         if (mod.equals(before)) return;              // put 이 NBT 를 안 바꿈(이미 동일값) → no-op(분류 보류)
-        e.readNbt(mod);
+        readNbtTagAware(e, mod);
         boolean beforeHas = before.contains(top);
         net.minecraft.nbt.NbtCompound after = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(after);
@@ -4243,7 +4548,7 @@ public final class KfcGen {
         invalidateSnapshot(e);
         net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
         e.writeNbt(root);
-        if (appendAtPath(root, path, elem, prepend)) e.readNbt(root);
+        if (appendAtPath(root, path, elem, prepend)) readNbtTagAware(e, root);
     }
 
     private static net.minecraft.nbt.NbtElement numberNbt(String type, double v) {
@@ -4499,7 +4804,7 @@ public final class KfcGen {
             net.minecraft.nbt.NbtElement val = tmpl.copy();
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
-            if (putAtPath(nbt, path, val)) e.readNbt(nbt);   // NbtPath: 인덱스/필터 경로 정확
+            if (putAtPath(nbt, path, val)) readNbtTagAware(e, nbt);   // NbtPath: 인덱스/필터 경로 정확
         } catch (Exception ignored) {}
     }
 
@@ -4523,7 +4828,7 @@ public final class KfcGen {
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
             int cnt = putAtPathCount(nbt, path, val);
-            if (cnt > 0) { invalidateSnapshot(e); e.readNbt(nbt); }
+            if (cnt > 0) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
             return cnt > 0;
         } catch (Exception ignored) { return false; }
     }
@@ -4646,7 +4951,7 @@ public final class KfcGen {
             net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
             e.writeNbt(nbt);
             nbt.copyFrom(patch);
-            e.readNbt(nbt);
+            readNbtTagAware(e, nbt);
         } catch (Exception ignored) {}
     }
 
@@ -4663,7 +4968,7 @@ public final class KfcGen {
         e.writeNbt(nbt);
         net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);   // NbtPath
         if (p == null) return;
-        try { if (p.remove(nbt) > 0) e.readNbt(nbt); } catch (Exception ignored) {}
+        try { if (p.remove(nbt) > 0) readNbtTagAware(e, nbt); } catch (Exception ignored) {}
     }
 
     // ──────────────── 매크로 인자 (function X with .../{...}) ────────────────

@@ -140,7 +140,8 @@ def extract_tick_load(src) -> dict:
 _W_GROUP = None
 
 def _mp_init(datapack_root, macro_fns, group, all_fids=(),
-             force_bridge_prefixes=(), trace_prefixes=()):
+             force_bridge_prefixes=(), trace_prefixes=(),
+             call_effects=None, known_fqcns=()):
     """각 워커 프로세스 1회 초기화: emit + assemble 전역 상태 복원.
        (spawn 워커는 메인의 set_force_bridge/set_trace 결과를 못 물려받으므로 여기서 재주입.)"""
     global _W_GROUP
@@ -153,6 +154,7 @@ def _mp_init(datapack_root, macro_fns, group, all_fids=(),
     import assemble as _asm
     _asm.set_force_bridge(list(force_bridge_prefixes))      # --bridge <prefix> 강제 브릿지
     _asm.set_trace(list(trace_prefixes))                    # --trace <prefix>
+    _asm.set_call_summaries(call_effects or {}, known_fqcns)  # 인터프로시저 태그 요약
     _W_GROUP = group
 
 def _mp_convert(item):
@@ -257,6 +259,128 @@ def _collect_called(objs):
             if isinstance(v, dict) and v.get("kind") == "" and ":" in str(v.get("raw", "")):
                 called.add(v["raw"])
     return called
+
+
+# ── [pass-1.5] 인터프로시저 태그 요약 ──────────────────────────────────────
+# 각 함수가 (전이적으로) add/remove 할 수 있는 커맨드태그 집합과 엔티티 위치 변경 여부를
+# '원본 mcfunction 소스'에서 계산한다. assemble 의 태그 스캔 CSE 가 함수 호출을 만났을 때
+# 전량 무효화 대신 이 요약에 있는 태그만 무효화하게 한다(assemble.set_call_summaries).
+# 소스 레벨이므로 native/bridge 어느 실행 경로에도 유효하다(emit 은 tag/kill/summon 명령
+# 외에 태그·엔티티집합을 바꾸는 코드를 합성하지 않음). 판정은 fail-closed: 확신할 수 없는
+# 줄은 그 함수를 ⊤(ALL=미지)로 만든다 — 매크로 $()(호출 시 텍스트 재조립이라 무엇이든 될
+# 수 있음), 미지 callee(#함수태그/미존재), tag 명령 형태 인식 실패, 그리고 엔티티 생성·
+# 제거·NBT 변형이 가능한 명령(summon/kill/damage/data ... entity/store ... entity 등.
+# 즉발 피해 효과 instant_damage/instant_health 는 같은 틱에 죽음을 유발할 수 있어 포함.
+# 시간 경과형 효과·물리는 함수 실행 중 틱이 진행되지 않으므로 제외).
+_SUM_TOP_RE = re.compile(
+    r'\b(?:summon|kill|damage|kick|ban(?:-ip)?|whitelist|transfer|place|reload|tick'
+    r'|instant_damage|instant_health)\b'
+    r'|\bdata\s+(?:merge|modify|remove)\s+entity\b'
+    r'|\bstore\s+(?:result|success)\s+entity\b')
+# 위치 변경 명령(엔티티 이동): origin-의존 스캔만 무효화하면 되는 효과
+_SUM_MOVE_RE = re.compile(r'\b(?:tp|teleport|spreadplayers|ride|spectate)\b')
+# tag <대상(셀렉터 내 공백/1단 중첩 [] 허용)> add|remove|list [<이름>]
+_SUM_TAG_RE = re.compile(
+    r'\btag\s+(@[a-z]\[(?:[^\[\]]|\[[^\]]*\])*\]|\S+)\s+(add|remove|list)\b(?:\s+(\S+))?')
+_SUM_TAG_HEAD_RE = re.compile(r'\btag\s+\S')
+_SUM_CALL_RE = re.compile(r'\bfunction\s+(\S+)')
+_SUM_LINE_VAL_RE = re.compile(r'((?:[^"\\]|\\.)*)"')
+
+def _sum_line_effect(line: str):
+    """한 명령의 지역 효과: ("ALL" | tags:set, move:bool | None, calls:list).
+       토큰은 줄 전체에서 찾는다(execute 체인·if function 등 중첩 위치 불문).
+       과잉 매치(문자열 속 단어 등)는 과보수화만 유발할 뿐 불건전하지 않다."""
+    calls = [m.group(1) for m in _SUM_CALL_RE.finditer(line)]
+    if '$(' in line:
+        return ("ALL", None, calls)
+    if _SUM_TOP_RE.search(line):
+        return ("ALL", None, calls)
+    full = _SUM_TAG_RE.findall(line)
+    if len(full) != len(_SUM_TAG_HEAD_RE.findall(line)):
+        return ("ALL", None, calls)      # tag 명령 형태 인식 실패 = fail-closed
+    tags = set()
+    for _t, verb, name in full:
+        if verb == 'list':
+            continue
+        if not name or '"' in name or '\\' in name:
+            return ("ALL", None, calls)
+        tags.add(name)
+    return (tags, bool(_SUM_MOVE_RE.search(line)), calls)
+
+def _sum_scan_line_field(rec: str):
+    """JSONL 레코드에서 "line" 값을 이스케이프 원문 그대로 추출(json.loads 회피).
+       토큰 검색엔 \\" 등 이스케이프가 남아 있어도 지장 없다. None = 추출 실패(⊤ 처리)."""
+    i = rec.find('"line":"')
+    if i < 0:
+        return ''
+    m = _SUM_LINE_VAL_RE.match(rec, i + 8)
+    return m.group(1) if m else None
+
+def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
+    """함수별 요약 → (effects_by_fqcn, known_fqcns).
+       effects 는 효과 있는 함수만 수록: "ALL" | (frozenset[tags], move:bool).
+       known 은 trees 의 전 함수 fqcn(미포함 fqcn 호출 = assemble 이 미지로 fail-closed)."""
+    local: dict = {}                              # fid -> "ALL" | (set, bool)
+    edges = collections.defaultdict(set)          # fid -> callee fid 들
+    def _feed(fid, line):
+        local.setdefault(fid, (set(), False))
+        if line is None:
+            local[fid] = "ALL"
+            return
+        eff, move, calls = _sum_line_effect(line)
+        for c in calls:
+            if c in all_fids:
+                edges[fid].add(c)
+            else:
+                local[fid] = "ALL"       # #함수태그/$()/미존재 callee = 미지
+        if eff == "ALL":
+            local[fid] = "ALL"
+        elif local[fid] != "ALL":
+            cur = local[fid]
+            local[fid] = (cur[0] | eff, cur[1] or move)
+    if _trees_is_jsonl(trees_path):
+        with open(trees_path, encoding="utf-8") as f:
+            for rec in f:
+                rec = rec.strip()
+                if not rec:
+                    continue
+                fid = _scan_fid(rec)
+                if fid is None:
+                    continue
+                _feed(fid, _sum_scan_line_field(rec))
+    else:
+        for obj in _iter_trees(trees_path):
+            fid = obj.get("function")
+            if fid is not None:
+                _feed(fid, obj.get("line", ""))
+    # 호출 그래프 전이 폐포(worklist, 역방향 전파; 재귀/상호재귀는 단조 수렴)
+    rev = collections.defaultdict(set)
+    for f, cs in edges.items():
+        for c in cs:
+            rev[c].add(f)
+    summary = local
+    work = collections.deque(summary.keys())
+    inwork = set(work)
+    while work:
+        f = work.popleft(); inwork.discard(f)
+        s = summary[f]
+        for caller in rev.get(f, ()):
+            cs = summary.get(caller)
+            if cs is None or cs == "ALL":
+                continue
+            if s == "ALL":
+                summary[caller] = "ALL"
+            else:
+                nt = cs[0] | s[0]; nm = cs[1] or s[1]
+                if nt == cs[0] and nm == cs[1]:
+                    continue
+                summary[caller] = (nt, nm)
+            if caller not in inwork:
+                work.append(caller); inwork.add(caller)
+    effects = {fid_to_fqcn(f, group): ("ALL" if v == "ALL" else (frozenset(v[0]), v[1]))
+               for f, v in summary.items() if v == "ALL" or v[0] or v[1]}
+    known = frozenset(fid_to_fqcn(f, group) for f in summary)
+    return effects, known
 
 
 def _mp_convert_raw(item):
@@ -391,6 +515,23 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     emit.set_all_fids(all_fids)
     print(f"[generate] pass-1: identified {len(macro_fns)} macro functions")
 
+    # ── [pass-1.5] 인터프로시저 태그 요약 계산 → assemble 주입 ──
+    # (단일/병렬 공통. 병렬은 initargs 로 워커에도 전달. 실패해도 변환은 계속 —
+    #  요약 미주입 시 assemble 은 함수 호출을 종전대로 전량 무효화로 처리한다.)
+    import time as _sum_time
+    import assemble as _asm_mod
+    _sum_effects, _sum_known = {}, frozenset()
+    try:
+        _sum_t0 = _sum_time.time()
+        _sum_effects, _sum_known = _scan_call_summaries(trees_path, all_fids, group)
+        _asm_mod.set_call_summaries(_sum_effects, _sum_known)
+        print(f"[generate] pass-1.5: interprocedural tag summaries — "
+              f"{len(_sum_effects)} effectful / {len(_sum_known)} fns "
+              f"({_sum_time.time() - _sum_t0:.1f}s)")
+    except Exception as _sum_e:
+        print(f"[generate][warn] pass-1.5 tag summary failed ({_sum_e}) — "
+              f"falling back to conservative call invalidation")
+
     # ── [pass-2] 함수별 변환 -> 파일 쓰기 (멀티프로세싱) ──
     # JSONL(신규 ParseDumper): 같은 함수가 연속 → 스트리밍으로 (fid,objs) 청크를 만들어
     # 워커 풀에 분배. 워커는 자바 코드 문자열만 반환, 파일 쓰기는 메인(디스크 경합 방지).
@@ -515,7 +656,8 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         with ctx.Pool(processes=jobs,
                       initializer=_mp_init,
                       initargs=(datapack_root, macro_fns, group, all_fids,
-                                _force_prefixes, _trace_prefixes)) as pool:
+                                _force_prefixes, _trace_prefixes,
+                                _sum_effects, _sum_known)) as pool:
             # chunksize 로 IPC 오버헤드 감소. 함수가 많을수록 크게.
             for res in pool.imap_unordered(_conv_worker, _items, chunksize=64):
                 _write_result(res)
@@ -884,6 +1026,11 @@ public final class {cls} {{
     public static void execute(ServerCommandSource source, java.util.Map<String, String> macroArgs) {{
         KfcGen.instantExecuteFunction(source, Identifier.of("{ns}", "{path}"), macroArgs);
     }}
+
+    /** 매크로 호출의 return 값 전파(bare 호출도 executeReturn 직접 호출로 통일 — 래퍼 프레임 제거). */
+    public static int executeReturn(ServerCommandSource source, java.util.Map<String, String> macroArgs) {{
+        return KfcGen.instantExecuteFunctionReturn(source, Identifier.of("{ns}", "{path}"), macroArgs);
+    }}
 }}
 """
     return JavaClass(fid, package, cls, code, 0, 0, 1)
@@ -922,7 +1069,7 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
        진입점에서는 다루지 않는다(SERVER_STARTED 핸들러 불필요)."""
     tick_calls = []
     for fid in tags.get("tick", []):
-        tick_calls.append(f"            {fid_to_fqcn(fid, group)}.execute(src);")
+        tick_calls.append(f"            {fid_to_fqcn(fid, group)}.executeReturn(src);")
     tick_body = "\n".join(tick_calls) if tick_calls else "            // (tick 함수 없음)"
 
     n_load = len(tags.get("load", []))

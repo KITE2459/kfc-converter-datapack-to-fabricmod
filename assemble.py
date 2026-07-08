@@ -190,6 +190,48 @@ _SCR_OP_RE    = re.compile(rf'KfcGen\.opScore\(sb, ({_SCR_ARG}), ({_SCR_ARG}),')
 _SCR_WRITE_CNT_RE = re.compile(r'KfcGen\.(?:setScore|addScore|resetScore|enableTrigger)\(')
 _SCR_OP_CNT_RE    = re.compile(r'KfcGen\.opScore\(')
 _SCR_CLEARALL_RE  = re.compile(r'KfcGen\.(?:resetScoreWildcard|removeObjective|ensureObjective)\(')
+# ── 엔티티-홀더(실행자) 점수 read CSE ──────────────────────────────────────
+# 디스패치 트리 등에서 `{ Entity e = source.getEntity(); if (e!=null &&
+#   scoreMatches(sb, nameOf(e), "obj", lo, hi)) {...} }` 블록이 같은 실행자·같은 objective 를
+# 여러 번 읽는다(실측 ~26만 곳). 이 홀더는 source.getEntity()(메서드 param source 는 재대입
+# 없음 → 메서드 내 안정)라, 그 objective 를 '쓰지 않는 구간'에선 값이 불변 → readScoreEnt 1회로 병합.
+#   · 안전 게이트: 읽기 nameOf(X) 의 X 가 '이 em 에서 source.getEntity() 로만 바인딩된 별칭'일 때만
+#     실행자 읽기로 인정(루프변수 e 등 오탐 방지). 키는 ("@EXEC", obj).
+#   · 무효화: 실행자 점수 쓰기 setScore(sb, nameOf(e), obj,..)=동적홀더 → _score_effects 가
+#     ("OBJ",obj) 반환 → ("@EXEC",obj) 도 함께 무효화(기존 규칙 재사용). 호출/배리어=전량.
+#   · sb.getScore(e, ob) 는 e.getNameForScoreboard() 키 = nameOf(e)+holderOf 경로와 동일 조회 → 값 동치.
+# 실행자 홀더 표기는 어셈블 시점 em 에서 `X.getNameForScoreboard()` 이고(이후 별도 패스가
+# KfcGen.nameOf(X) 로 감쌈), 두 형태 모두 인정한다. var = group(1) 또는 group(2).
+_ENT_H = r'(?:(\w+)\.getNameForScoreboard\(\)|KfcGen\.nameOf\((\w+)\))'
+_SCR_MATCH_ENT_RE = re.compile(rf'KfcGen\.scoreMatches\(sb, {_ENT_H}, ({_SCR_LIT}), ({_SCR_INT}), ({_SCR_INT})\)')
+_SCR_GET_ENT_RE   = re.compile(rf'KfcGen\.getScore\(sb, {_ENT_H}, ({_SCR_LIT})\)')
+_EXEC_BIND_RE = re.compile(r'\b(\w+)\s*=\s*source\.getEntity\(\)')
+_FOR_VAR_RE   = re.compile(r'for\s*\([^;:{}]*?\b(\w+)\s*:')
+_ANY_ASSIGN_RE= re.compile(r'\b(\w+)\s*=\s*([^;]+);')
+
+# source(메서드 param) 재대입 = 실행자 컨텍스트 변경(execute as/on/at). 이 지점 이후
+# source.getEntity() 는 다른 엔티티가 될 수 있어 @EXEC 캐시의 배리어로 취급한다.
+_SOURCE_REASSIGN_RE = re.compile(r'(?<![.\w])source\s*=\s*(?!source\s*;)')
+
+def _reassigns_source(code: str) -> bool:
+    return _SOURCE_REASSIGN_RE.search(code) is not None
+
+def _exec_alias_vars(code: str) -> frozenset:
+    """이 코드(em)에서 'source.getEntity() 로만' 바인딩된 실행자 별칭 변수 집합.
+       루프변수이거나 다른 값으로도 대입되면 제외(오탐 방지 — fail-closed).
+       source 를 재대입하는 em 은 실행자가 바뀌므로 전부 제외(fail-closed)."""
+    if _reassigns_source(code):
+        return frozenset()
+    aliases = set(m.group(1) for m in _EXEC_BIND_RE.finditer(code))
+    if not aliases:
+        return frozenset()
+    loopvars = set(m.group(1) for m in _FOR_VAR_RE.finditer(code))
+    other = set()
+    for m in _ANY_ASSIGN_RE.finditer(code):
+        v, rhs = m.group(1), m.group(2)
+        if v in aliases and 'source.getEntity()' not in rhs:
+            other.add(v)                 # 같은 이름이 다른 값으로도 대입됨 → 불안정, 제외
+    return frozenset(aliases - loopvars - other)
 # 점수에 영향 없는 헬퍼(읽기/스캔/표시/월드/태그/이동 등). advancement 는 보상으로 함수를
 # 실행할 수 있어 제외(배리어). summon/killEntity/lootSpawn/damage 는 미포함 = 배리어.
 _SCORE_SAFE_HELPERS = frozenset({
@@ -280,12 +322,27 @@ def _find_reused_score_reads(emitted) -> set:
                 seen[k] = seen.get(k, 0) + 1
                 if seen[k] >= 2:
                     reused.add(k)
+        _exec_al = _exec_alias_vars(code)         # 실행자-홀더 읽기(("@EXEC",obj)) 도 집계
+        if _exec_al:
+            for rx in (_SCR_MATCH_ENT_RE, _SCR_GET_ENT_RE):
+                for m in rx.finditer(code):
+                    var = m.group(1) or m.group(2)
+                    if var not in _exec_al:
+                        continue
+                    k = ("@EXEC", m.group(3))
+                    seen[k] = seen.get(k, 0) + 1
+                    if seen[k] >= 2:
+                        reused.add(k)
         eff = _score_effects(em)
         if eff is None:
             seen.clear()
         elif eff:
             for k in list(seen):
                 if k in eff or ("OBJ", k[1]) in eff or ("HLD", k[0]) in eff:
+                    seen.pop(k, None)
+        if _reassigns_source(code):           # 실행자 변경 → @EXEC 바인딩 무효화(배리어)
+            for k in list(seen):
+                if k[0] == "@EXEC":
                     seen.pop(k, None)
     return reused
 
@@ -1135,7 +1192,11 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                     v = f"_sv{scr_seq[0]}"
                     scr_seq[0] += 1
                     scr_cache[k] = v
-                    decls.append(f"Integer {v} = KfcGen.readScore(sb, {k[0]}, {k[1]});")
+                    if k[0] == "@EXEC":
+                        # 실행자 홀더: source.getEntity()(메서드 내 안정) 로 1회 nullable 읽기.
+                        decls.append(f"Integer {v} = KfcGen.readScoreEnt(sb, source.getEntity(), {k[1]});")
+                    else:
+                        decls.append(f"Integer {v} = KfcGen.readScore(sb, {k[0]}, {k[1]});")
                 return v
             def _repl_sm(m):
                 k = (m.group(1), m.group(2))
@@ -1150,12 +1211,34 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                     return m.group(0)
                 v = _scr_var(k)
                 return f"({v} == null ? 0 : {v})"   # getScore(readOrZero) 시맨틱 복제
+            # 실행자-홀더 읽기 병합: nameOf(X) 의 X 가 이 em 의 source.getEntity() 별칭일 때만.
+            _exec_aliases = _exec_alias_vars("\n".join(new_java))
+            def _repl_sm_ent(m):
+                var = m.group(1) or m.group(2)
+                if var not in _exec_aliases:
+                    return m.group(0)
+                k = ("@EXEC", m.group(3))
+                if k not in reused_scores or _scr_key_written(k):
+                    return m.group(0)
+                v = _scr_var(k)
+                return f"({v} != null && {v} >= {m.group(4)} && {v} <= {m.group(5)})"
+            def _repl_sg_ent(m):
+                var = m.group(1) or m.group(2)
+                if var not in _exec_aliases:
+                    return m.group(0)
+                k = ("@EXEC", m.group(3))
+                if k not in reused_scores or _scr_key_written(k):
+                    return m.group(0)
+                v = _scr_var(k)
+                return f"({v} == null ? 0 : {v})"
             _nj3 = []
             for line in new_java:
                 if line.lstrip().startswith("//"):
                     _nj3.append(line); continue
                 line = _SCR_MATCH_RE.sub(_repl_sm, line)
                 line = _SCR_GET_RE.sub(_repl_sg, line)
+                line = _SCR_MATCH_ENT_RE.sub(_repl_sm_ent, line)
+                line = _SCR_GET_ENT_RE.sub(_repl_sg_ent, line)
                 _nj3.append(line)
             new_java = _nj3
 
@@ -1188,6 +1271,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 scr_cache.clear()
             else:
                 _scr_apply_inv(scr_cache, scr_eff)
+                if _reassigns_source("\n".join(em.java)):   # 실행자 변경 → @EXEC 무효화(배리어)
+                    for _k in [k for k in scr_cache if k[0] == "@EXEC"]:
+                        scr_cache.pop(_k, None)
 
         if em.terminal:
             hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리

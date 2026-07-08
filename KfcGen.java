@@ -2999,6 +2999,20 @@ public final class KfcGen {
         return v >= min && v <= max;
     }
 
+    /** [엔티티-홀더 점수 read CSE 용] 엔티티 홀더의 점수 nullable 읽기. 미설정/​null=null.
+     *  sb.getScore(e, ob) 는 e.getNameForScoreboard() 를 키로 쓰므로
+     *  scoreMatches(sb, nameOf(e), o, ..)/getScore(sb, nameOf(e), o) 의 홀더 경로
+     *  (ScoreHolder.fromName(nameOf(e)))와 조회 키가 동일 → 값 동치. 조건용(미설정=미일치)이라
+     *  readOrZero 가 아닌 nullable 을 돌려준다(scoreMatches/​_sv 시맨틱과 일치). */
+    public static Integer readScoreEnt(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
+        if (e == null) return null;
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return null;
+        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        if (sc == null) return null;
+        return sc.getScore();
+    }
+
     /** if score <a> OP <b> (비교형). 둘 중 하나라도 값 없으면 false(=mcfunction 시맨틱). */
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, String hb, String ob) {

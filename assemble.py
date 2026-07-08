@@ -170,6 +170,120 @@ _CSE_TAG_RE = re.compile(
     r'KfcGen\.(?:firstEntity|nearestEntity)\((?:[^()]|\([^()]*\))*\)')
 ENTITY_TAG_CSE = True   # 회귀 시 즉시 차단용 단일 토글
 
+# ── 스코어 read CSE (mem2reg-lite) ──────────────────────────────────────────
+# 같은 리터럴 (holder, objective) 점수를 한 함수 안에서 반복해 읽는 것(예: 프레임 디스패치의
+# `if score #x obj matches N` 수백 줄)을, 그 점수를 쓰는 지점까지 Integer 지역변수 1회 읽기로
+# 병합한다. scoreMatches 의 미설정(null)=false 시맨틱은 nullable 캐시 + 명시 범위검사로 복제.
+# fail-closed 원칙: 확신 못 하는 것은 전부 전량 무효화 —
+#   · 함수 호출(.execute/.executeReturn/instantExecute*): 호출부 점수 요약이 없으므로 배리어
+#   · 미지 헬퍼(화이트리스트 외), 직접 sb.* 접근, 쓰기 인자 파싱 실패(복합식 홀더 등)
+#   · advancement(보상 함수 실행 가능), summon/kill/damage 류(통계·criteria 유발 가능성)
+# 쓰기의 표적 무효화: 리터럴 (h,o) 쓰기는 그 키만, 동적 홀더 쓰기는 그 objective 전체.
+SCORE_READ_CSE = True   # 회귀 시 즉시 차단용 토글
+_SCR_LIT = r'"(?:[^"\\]|\\.)*"'
+_SCR_INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
+_SCR_ARG = rf'(?:{_SCR_LIT}|KfcGen\.nameOf\([^()]*\)|\([^()]*(?:\([^()]*\))?[^()]*\)|[^,()]+)'
+_SCR_MATCH_RE = re.compile(rf'KfcGen\.scoreMatches\(sb, ({_SCR_LIT}), ({_SCR_LIT}), ({_SCR_INT}), ({_SCR_INT})\)')
+_SCR_GET_RE   = re.compile(rf'KfcGen\.getScore\(sb, ({_SCR_LIT}), ({_SCR_LIT})\)')
+_SCR_WRITE_RE = re.compile(rf'KfcGen\.(?:setScore|addScore|resetScore|enableTrigger)\(sb, ({_SCR_ARG}), ({_SCR_ARG})\s*[,)]')
+_SCR_OP_RE    = re.compile(rf'KfcGen\.opScore\(sb, ({_SCR_ARG}), ({_SCR_ARG}),')
+_SCR_WRITE_CNT_RE = re.compile(r'KfcGen\.(?:setScore|addScore|resetScore|enableTrigger)\(')
+_SCR_OP_CNT_RE    = re.compile(r'KfcGen\.opScore\(')
+_SCR_CLEARALL_RE  = re.compile(r'KfcGen\.(?:resetScoreWildcard|removeObjective|ensureObjective)\(')
+# 점수에 영향 없는 헬퍼(읽기/스캔/표시/월드/태그/이동 등). advancement 는 보상으로 함수를
+# 실행할 수 있어 제외(배리어). summon/killEntity/lootSpawn/damage 는 미포함 = 배리어.
+_SCORE_SAFE_HELPERS = frozenset({
+    "getOrCreateContext", "scoreMatches", "scoreCmp", "entityScoreMatches", "getScore",
+    "getScoreOfEntity", "readScore", "inRange", "itemsMatchSlots", "blockMatches", "nbtMatches",
+    "posInRange", "posInBox", "posLoaded", "blockInTag", "entityInTypeTag", "entityHasPath",
+    "storageHasPath", "hasEffect", "gamemodeIs", "testPredicate", "nbtGetStorage",
+    "storageGetDouble", "nbtGetEntity", "entityGetDouble", "nbtGetBlock",
+    "nearestEntityAnyType", "nearestEntity", "nearestPlayer", "nearestN", "nearestPlayerWhere",
+    "firstEntity", "firstEntityAnyType", "anyEntityInTypeTag", "entityByUuid",
+    "allEntitiesAnyType", "allEntities", "allEntitiesAny", "allEntitiesInBox",
+    "anyPlayer", "anyPlayerWhere", "anyEntity", "anyEntityAnyType", "anyEntityInBox",
+    "facingEntity", "localOffset", "anchorEyes",
+    "entitiesByTypeBox", "atEntity", "rangeBox", "anyEntityScored", "typeBucketCopy",
+    "storagePutNumber", "nbtSetStorage", "storageRemovePath", "storagePutSnbt",
+    "storageMacroArgs", "nbtAppendStorage", "macroArgs", "entityMacroArgs",
+    "titleText", "titleActionbar", "titleTimes", "tellraw", "playSound", "stopSound",
+    "bossbarSetPlayers", "bossbarSetName", "bossbarSetValue", "bossbarSetMaxValue",
+    "bossbarAdd", "bossbarSetColor",
+    "setBlock", "fill", "clone", "forceloadAdd", "setWeather", "setTime",
+    "itemReplaceWith", "itemReplaceFrom", "clearItems", "teamModify", "teamJoin", "teamLeave",
+    "teamAdd", "setGameMode", "effectClear", "attrModifierRemove", "attrModifierAdd",
+    "onVehicle", "onPassengers", "addTag", "removeTag", "teleportTo", "movePosition",
+    "rotateTo", "nameOf", "hasPlayerPassenger", "trace",
+})
+_SCR_WRITE_HELPERS = frozenset({
+    "setScore", "addScore", "resetScore", "enableTrigger", "opScore",
+    "resetScoreWildcard", "removeObjective", "ensureObjective", "setObjectiveDisplay",
+})
+
+
+def _score_effects(em):
+    """이 명령의 점수 캐시 영향. None=전량 무효화, 아니면 무효화 지시 집합:
+       ("H","O") 리터럴 키 / ("OBJ","O") = 그 objective 의 모든 캐시."""
+    if em.kind != "native":
+        return None
+    code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+    if ".execute(" in code or ".executeReturn(" in code or "instantExecute" in code:
+        return None                    # 함수 호출 = 점수 요약 없음 → 배리어
+    if re.search(r'\bsb\.[A-Za-z]', code):
+        return None                    # KfcGen 래퍼 밖 직접 스코어보드 접근
+    for hm in _CSE_HELPER_RE.finditer(code):
+        h = hm.group(1)
+        if h not in _SCORE_SAFE_HELPERS and h not in _SCR_WRITE_HELPERS:
+            return None                # 미지/criteria 유발 가능 헬퍼
+    if _SCR_CLEARALL_RE.search(code):
+        return None
+    w = list(_SCR_WRITE_RE.finditer(code))
+    ops = list(_SCR_OP_RE.finditer(code))
+    # 인자 파싱 실패(복합식) fail-closed: 이름 기준 개수와 파싱 개수가 다르면 전량 무효화
+    if len(w) != len(_SCR_WRITE_CNT_RE.findall(code)) or len(ops) != len(_SCR_OP_CNT_RE.findall(code)):
+        return None
+    inv = set()
+    for m in w + ops:
+        h, o = m.group(1), m.group(2)
+        if not o.startswith('"'):
+            return None                # objective 동적 = 전량
+        if h.startswith('"'):
+            inv.add((h, o))
+        else:
+            inv.add(("OBJ", o))        # 동적 홀더 = 그 objective 전체 무효화
+    return inv
+
+
+def _scr_apply_inv(cache: dict, inv) -> None:
+    """무효화 지시(inv)를 캐시에 적용. cache 키는 (h,o)."""
+    if inv:
+        for k in list(cache):
+            if k in inv or ("OBJ", k[1]) in inv:
+                cache.pop(k, None)
+
+
+def _find_reused_score_reads(emitted) -> set:
+    """리터럴 (h,o) 점수 읽기가 '그 키를 쓰는 지점/배리어 사이'에 2회+ 등장하면 병합 대상."""
+    reused: set = set()
+    seen: dict = {}
+    for em in emitted:
+        code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+        for rx in (_SCR_MATCH_RE, _SCR_GET_RE):
+            for m in rx.finditer(code):
+                k = (m.group(1), m.group(2))
+                seen[k] = seen.get(k, 0) + 1
+                if seen[k] >= 2:
+                    reused.add(k)
+        eff = _score_effects(em)
+        if eff is None:
+            seen.clear()
+        elif eff:
+            for k in list(seen):
+                if k in eff or ("OBJ", k[1]) in eff:
+                    seen.pop(k, None)
+    return reused
+
+
 # ── 인터프로시저 태그 요약 (convert.py pass-1.5 가 주입) ────────────────────
 # 종전엔 함수 호출(.execute/.executeReturn)을 '무슨 태그든 바꿀 수 있다'고 보고 캐시를
 # 전량 무효화했다(실측: onkartcollision 의 carB 스캔 17회가 이 때문에 CSE 불가).
@@ -863,9 +977,12 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     cse_cache: dict[str, str] = {}   # scan_expr -> _selN  (현재 유효한 바인딩)
     cse_set_cache: dict[str, str] = {}  # full-set expr -> _esetN (재사용 구간 내 1회 수집)
     cse_tag_cache: dict[str, str] = {}  # 태그스캔 expr -> _tselN (태그/멤버 변동 전까지 배리어 관통)
+    scr_cache: dict[tuple, str] = {}    # (holder,obj) -> _svN (그 키를 쓰기 전까지 재사용)
     cse_tag_tags: dict[str, tuple] = {}  # _tselN 이 의존하는 (pos, neg) 태그집합
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
     reused_tags = _find_reused_tag_exprs(emitted) if ENTITY_TAG_CSE else set()
+    reused_scores = _find_reused_score_reads(emitted) if SCORE_READ_CSE else set()
+    scr_seq = [0]   # _sv 전용 카운터
     cse_seq = [0]
     cse_set_seq = [0]   # _eset 전용 카운터(기존 _sel 번호 불변 → 순수 가산적)
     cse_tag_seq = [0]   # _tsel 전용 카운터
@@ -876,6 +993,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             cse_cache.clear()                   # CSE 를 조각-로컬로 격리
             cse_set_cache.clear()
             cse_tag_cache.clear(); cse_tag_tags.clear()  # _tsel 은 세그먼트 지역변수 → 경계 못 넘음
+            scr_cache.clear()                            # _sv 도 세그먼트 지역변수
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
         if hit_terminal:
@@ -956,6 +1074,40 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 _nj2.append(_CSE_TAG_RE.sub(_repl_tag, line))
             new_java = _nj2
 
+        # 스코어 read CSE: 리터럴 (holder,obj) 반복 읽기를 _svN(Integer·nullable) 1회 읽기로.
+        # 무효화는 아래 _score_effects 결과로 정밀 처리(그 키/objective 를 쓰는 지점에서만).
+        scr_eff = _score_effects(em) if SCORE_READ_CSE else None
+        if SCORE_READ_CSE and reused_scores:
+            def _scr_var(k):
+                v = scr_cache.get(k)
+                if v is None:
+                    v = f"_sv{scr_seq[0]}"
+                    scr_seq[0] += 1
+                    scr_cache[k] = v
+                    decls.append(f"Integer {v} = KfcGen.readScore(sb, {k[0]}, {k[1]});")
+                return v
+            def _repl_sm(m):
+                k = (m.group(1), m.group(2))
+                if k not in reused_scores:
+                    return m.group(0)
+                v = _scr_var(k)
+                # scoreMatches 시맨틱 복제: 미설정(null)=false, 이후 [min,max] 검사(센티널 동일)
+                return f"({v} != null && {v} >= {m.group(3)} && {v} <= {m.group(4)})"
+            def _repl_sg(m):
+                k = (m.group(1), m.group(2))
+                if k not in reused_scores:
+                    return m.group(0)
+                v = _scr_var(k)
+                return f"({v} == null ? 0 : {v})"   # getScore(readOrZero) 시맨틱 복제
+            _nj3 = []
+            for line in new_java:
+                if line.lstrip().startswith("//"):
+                    _nj3.append(line); continue
+                line = _SCR_MATCH_RE.sub(_repl_sm, line)
+                line = _SCR_GET_RE.sub(_repl_sg, line)
+                _nj3.append(line)
+            new_java = _nj3
+
         body_lines.append(f'// {obj["line"]}')
         body_lines.extend(decls)      # 스캔 1회 평가(메서드 본문 레벨, 사용 직전)
         body_lines.extend(new_java)
@@ -978,6 +1130,12 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                         el = cse_tag_tags.get(e, (frozenset(), frozenset(), False))
                         if (el[0] & mtags) or (el[1] & mtags) or (mmove and not el[2]):
                             cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
+        # 스코어 캐시 무효화(치환 뒤 적용 — 같은 줄의 읽기는 쓰기 '이전' 값이 맞다: 조건이 run 보다 먼저)
+        if SCORE_READ_CSE and scr_cache:
+            if scr_eff is None:
+                scr_cache.clear()
+            else:
+                _scr_apply_inv(scr_cache, scr_eff)
 
         if em.terminal:
             hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리

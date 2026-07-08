@@ -6564,8 +6564,11 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
                        f"KfcGen.rangeBox({pre_src}.getPosition(), {_dist_arg(sel.distance[1])}),")
             out.append(f"        en -> {filt})) {{")
         else:
-            out.append(f"for (Entity e : ctx.world.getEntitiesByType({jtypes[0]},")
-            out.append(f"        en -> {filt})) {{")
+            # 틱 스냅샷 타입버킷 복사 순회(월드 인덱스 재순회 + 결과 리스트 생성 제거).
+            # 집합·순서 동일: 버킷 = 스냅샷(EntityIndex 순) 부분수열 = getEntitiesByType 순회 순서.
+            # 바닐라 @e 기본 술어 isAlive 는 명시 가드로 재현(위 스냅샷(untyped) 경로와 동일).
+            out.append(f"for (Entity e : KfcGen.typeBucketCopy(ctx, {jtypes[0]})) {{")
+            out.append(f"    Entity en = e; if (!(en.isAlive() && ({filt}))) continue;")
         if src_line: out.append("    " + src_line)
         out.extend(mr1)
         if mod_guard:

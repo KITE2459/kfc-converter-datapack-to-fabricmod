@@ -240,6 +240,15 @@ public final class KfcGen {
         return b == null ? java.util.Collections.emptyList() : b;
     }
 
+    /** as @e[type=..](거리상한 없음) 루프용 — 타입버킷의 얕은 복사.
+     *  world.getEntitiesByType(월드 인덱스 재순회 + 필터 + 리스트 생성) 대체: 집합·순서 동일
+     *  (버킷 = 스냅샷(EntityIndex 순) 부분수열), isAlive 는 호출측 가드로 재현(untyped 경로와
+     *  동일 방식). 본문 스폰/킬이 버킷을 증분 변형할 수 있어 복사본을 순회한다(격리). */
+    public static java.util.List<net.minecraft.entity.Entity> typeBucketCopy(
+            GameContext ctx, net.minecraft.entity.EntityType<?> t) {
+        return new java.util.ArrayList<>(typeBucket(ctx, t));
+    }
+
     /** 스폰/킬의 타입 인덱스 증분 반영(전체 재빌드 방지 — snapAdd/snapRemove 전용). */
     private static void typeIndexAdd(net.minecraft.entity.Entity e) {
         if (TYPE_INDEX == null || e == null) return;
@@ -1463,17 +1472,27 @@ public final class KfcGen {
     // 탑승 관계 변경(startRiding/stopRiding/스폰·킬)은 전부 ENTITY_GEN++ 를 거쳐 자동 무효화.
     // 슬롯 1개라 다른 src 가 끼어들면 미스(정확성 무손실, 이득만 없음). 단일 틱 스레드 전제는
     // 이 클래스의 다른 per-tick 캐시(SNAP/TYPE_INDEX)와 동일.
-    private static net.minecraft.server.command.ServerCommandSource ONP_SRC;
-    private static long ONP_GEN = -1;
-    private static java.util.List<net.minecraft.server.command.ServerCommandSource> ONP_CACHE;
+    // src 는 틱마다 새로 만들어지는 임시 객체(identity 키 = 같은 틱 내에서만 유효).
+    // 종전 단일-엔트리 캐시는 카트 A→B→A 처럼 src 가 교차되면 매번 미스였다(스파크 ~0.6%).
+    // 틱/세대가 바뀌면 통째로 비운다(이전 틱 src 는 다시 안 오므로 누수 없음).
+    private static final java.util.IdentityHashMap<net.minecraft.server.command.ServerCommandSource,
+            java.util.List<net.minecraft.server.command.ServerCommandSource>> ONP_MAP =
+            new java.util.IdentityHashMap<>();
+    private static net.minecraft.server.MinecraftServer ONP_MAP_SERVER;
+    private static int  ONP_MAP_TICK = Integer.MIN_VALUE;
+    private static long ONP_MAP_GEN  = -1;
 
     public static java.util.List<net.minecraft.server.command.ServerCommandSource> onPassengers(
             net.minecraft.server.command.ServerCommandSource src) {
         net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
         if (e == null) return java.util.List.of();
-        if (src == ONP_SRC && ONP_GEN == ENTITY_GEN && ONP_CACHE != null) {
-            return ONP_CACHE;   // 같은 소스 객체·같은 세대 — 직전 순회 결과 재사용(할당 0)
+        net.minecraft.server.MinecraftServer sv = src.getServer();
+        int tk = sv.getTicks();
+        if (ONP_MAP_SERVER != sv || ONP_MAP_TICK != tk || ONP_MAP_GEN != ENTITY_GEN) {
+            ONP_MAP.clear(); ONP_MAP_SERVER = sv; ONP_MAP_TICK = tk; ONP_MAP_GEN = ENTITY_GEN;
         }
+        java.util.List<net.minecraft.server.command.ServerCommandSource> hit = ONP_MAP.get(src);
+        if (hit != null) return hit;   // 같은 src·같은 틱·같은 세대 — 재사용(할당 0)
         java.util.List<net.minecraft.entity.Entity> ps = e.getPassengerList();
         java.util.List<net.minecraft.server.command.ServerCommandSource> out;
         if (ps.isEmpty()) {
@@ -1484,7 +1503,7 @@ public final class KfcGen {
             for (net.minecraft.entity.Entity p : ps) tmp.add(src.withEntity(p));
             out = tmp;
         }
-        ONP_SRC = src; ONP_GEN = ENTITY_GEN; ONP_CACHE = out;
+        ONP_MAP.put(src, out);
         return out;
     }
 
@@ -2777,6 +2796,12 @@ public final class KfcGen {
         // dirty 마킹을 유발해 핫패스에서 매우 비쌌음). 미설정 = 0 시맨틱은 그대로.
         ReadableScoreboardScore s = sb.getScore(holderOf(holder), ob);
         return s == null ? 0 : s.getScore();
+    }
+
+    /** score read CSE(_svN) 용 nullable 읽기 — scoreMatches 의 '미설정=false' 시맨틱 원천.
+     *  엔트리를 생성하지 않는다(read 와 동일). */
+    public static Integer readScore(ServerScoreboard sb, String holder, String o) {
+        return read(sb, holder, o);
     }
 
     /** 공개 스코어 읽기 (store←scoreboard get 등에서 사용). 없으면 0. */

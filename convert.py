@@ -800,6 +800,23 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     write_entrypoint(src_root, group, tags, generated_fids)
     write_resources(out_root, group, tags, dp_src)
 
+    # ── [pass-2.7] 스코어 디스패치 트리 평탄화 ──
+    # 본문 전체가 `execute as @s[scores={obj=lo..hi}] run function child` 꼴인 순수
+    # 디스패치 함수 클러스터(NBS 음악/키프레임 트리 — kartall 실측 전체 함수의 58%)를
+    # 정적 구간 테이블 + 반복 워커로 컴파일한다. 플레이어·틱당 log2(N)단 메서드 프레임과
+    # 단마다의 objective 해시 조회/박싱이 int 비교 루프로 줄고, 외부 미참조 내부 노드
+    # 레코드는 제거되어 산출물/컴파일/클래스로딩 규모가 급감한다.
+    # (무결성 논증·안전 게이트는 tree_flatten.py 헤더 — 실패는 fail-closed 로 원형 유지.)
+    if merge and _records is not None and dp_src is not None:
+        try:
+            import tree_flatten as _tf_mod
+            tstats = _tf_mod.flatten_trees(_records, src_root, group, dp_src,
+                                           tags, fid_to_fqcn, verbose=True)
+            print(f"[generate] pass-2.7 tree-flatten: {tstats}")
+        except Exception as _te:
+            import traceback; traceback.print_exc()
+            print(f"[generate][warn] tree-flatten skipped due to error: {_te}")
+
     # ── [pass-3] 후처리: 오버사이즈 브릿지 + 버킷화(여러 함수를 한 클래스로 묶어 클래스 수 감축) ──
     # ModEntry(tick) 가 생성된 뒤라 외부 FQCN 참조가 자동 핀된다. tick/load 는 명시 핀으로도 전달.
     # 기본 상시 버킷화. 끄려면 --no-merge (또는 --none-merge).

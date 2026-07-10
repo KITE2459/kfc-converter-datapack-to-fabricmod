@@ -117,7 +117,7 @@ def _is_force_bridged(fid: str) -> bool:
 #        영향 없음 → SAFE. 단 회전(rotateTo)·관전(spectate)은 보수적으로 배리어로 둔다).
 _CSE_SAFE_HELPERS = frozenset({
     # 읽기/술어/컨텍스트
-    "getOrCreateContext", "scoreMatches", "scoreCmp", "entityScoreMatches", "getScore",
+    "getOrCreateContext", "scoreMatches", "scoreMatchesEntity", "scoreCmp", "entityScoreMatches", "getScore",
     "getScoreOfEntity", "inRange", "itemsMatchSlots", "blockMatches", "nbtMatches",
     "posInRange", "posInBox", "posLoaded", "blockInTag", "entityInTypeTag", "entityHasPath",
     "storageHasPath", "hasEffect", "gamemodeIs", "testPredicate", "nbtGetStorage",
@@ -235,7 +235,7 @@ def _exec_alias_vars(code: str) -> frozenset:
 # 점수에 영향 없는 헬퍼(읽기/스캔/표시/월드/태그/이동 등). advancement 는 보상으로 함수를
 # 실행할 수 있어 제외(배리어). summon/killEntity/lootSpawn/damage 는 미포함 = 배리어.
 _SCORE_SAFE_HELPERS = frozenset({
-    "getOrCreateContext", "scoreMatches", "scoreCmp", "entityScoreMatches", "getScore",
+    "getOrCreateContext", "scoreMatches", "scoreMatchesEntity", "scoreCmp", "entityScoreMatches", "getScore",
     "getScoreOfEntity", "readScore", "inRange", "itemsMatchSlots", "blockMatches", "nbtMatches",
     "posInRange", "posInBox", "posLoaded", "blockInTag", "entityInTypeTag", "entityHasPath",
     "storageHasPath", "hasEffect", "gamemodeIs", "testPredicate", "nbtGetStorage",
@@ -1348,6 +1348,19 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     # KfcGen.nameOf(identity 캐시) 경유로 바꾼다. 수신자가 단순 변수인 경우만 치환(체인식은
     # 그대로), _exName 치환 뒤 잔여가 대상이라 executor 캐시 로직과 충돌하지 않는다.
     body = re.sub(r'\b([A-Za-z_]\w*)\.getNameForScoreboard\(\)', r'KfcGen.nameOf(\1)', body)
+
+    # ── 엔티티 홀더 점수 매칭의 이름 경유 제거 ──
+    # scoreMatches(sb, nameOf(e), o, lo, hi) 는 nameOf(WeakHashMap 조회/최초 UUID 문자열화)
+    # + holderOf(HashMap 조회) 를 매 호출 태운다. sb.getScore(e, ob) 는 내부적으로
+    # e.getNameForScoreboard() 를 키로 쓰므로 scoreMatchesEntity(sb, e, o, lo, hi) 와 값 동치
+    # (KfcGen 두 구현 모두 미설정=false, null 엔티티=false). primitive(int,int) 인자 확정
+    # 호출만 치환(Integer/null 오버로드 오매치 방지 — 경계는 정수 리터럴/MIN/MAX 센티넬).
+    # 반드시 read-CSE 이후(여기)에 적용: CSE 의 _SCR_MATCH_ENT_RE 는 scoreMatches 형태를 본다.
+    body = re.sub(
+        r'KfcGen\.scoreMatches\(sb, KfcGen\.nameOf\((\w+)\), ("(?:[^"\\]|\\.)*"), '
+        r'(-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE), '
+        r'(-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE)\)',
+        r'KfcGen.scoreMatchesEntity(sb, \1, \2, \3, \4)', body)
 
     # 필요한 prelude/import 결정 (본문 토큰 스캔; 주석 줄은 제외)
     scan_src = "\n".join(l for l in body.split("\n") if not l.lstrip().startswith("//"))

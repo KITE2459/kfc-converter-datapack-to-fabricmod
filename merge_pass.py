@@ -472,15 +472,19 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
             remap[c.fqcn] = (bfqcn, mang)
         bucket_of[bi] = (cls_name, members, imports)
 
-    # 3) 전역 호출 재작성기: <oldFQCN>.execute( -> <bfqcn>.<mang>_execute(
-    #    효율을 위해 한 번에: 토큰 단위로 찾아 remap 적용.
+    # 3) 전역 호출 재작성기: <oldFQCN>.execute|executeReturn( -> <bfqcn>.<mang>_executeReturn(
+    #    [래퍼 제거] execute(void)는 executeReturn 위임 3줄 래퍼로 항상 순수(assemble 템플릿
+    #    3종 전수 확인)이고, emit 은 모든 호출을 executeReturn 으로 방출한다(실측: 버킷 내
+    #    _execute 호출부 0곳). 버킷에는 executeReturn 만 싣고, 혹시 남은 .execute( 호출은
+    #    executeReturn 으로 통일한다(void 반환이던 호출은 식으로 쓰일 수 없어 문장 위치 보장
+    #    → 반환 int 무시 = 래퍼와 동일 시맨틱). → 메서드 수 절반(클래스파일/메타스페이스).
     call_re = re.compile(r'([A-Za-z_][\w.]+)\.(execute|executeReturn)\s*\(')
     def rewrite_calls(text):
         def _r(m):
-            fq, meth = m.group(1), m.group(2)
+            fq = m.group(1)
             if fq in remap:
                 bfqcn, mang = remap[fq]
-                return f'{bfqcn}.{mang}_{meth}('
+                return f'{bfqcn}.{mang}_executeReturn('
             return m.group(0)
         return call_re.sub(_r, text)
 
@@ -492,7 +496,6 @@ def bucketize(src_root: Path, group: str, pins: set | None = None,
     for bi, (cls_name, members, imports) in bucket_of.items():
         body_methods = []
         for (c, mang, ex_t, rt_t, seg_ts) in members:
-            body_methods.append("    " + rewrite_calls(ex_t).strip())
             body_methods.append("    " + rewrite_calls(rt_t).strip())
             for st in seg_ts:   # JIT 분할 조각(있으면) — 개명본을 함께 이동
                 body_methods.append("    " + rewrite_calls(st).strip())
@@ -592,14 +595,16 @@ def bucketize_records(records, src_root: Path, group: str,
             remap[c.fqcn] = (bfqcn, mang)
         bucket_of[bi] = (cls_name, members, imports)
 
-    # 5) 전역 호출 재작성기 (<oldFQCN>.execute( -> <bfqcn>.<mang>_execute()
+    # 5) 전역 호출 재작성기 (<oldFQCN>.execute|executeReturn( -> <bfqcn>.<mang>_executeReturn()
+    #    [래퍼 제거] 파일 기반 bucketize 와 동일 근거 — execute 래퍼는 순수 위임이므로
+    #    버킷에 싣지 않고, 모든 호출을 executeReturn 으로 통일한다.
     call_re = re.compile(r'([A-Za-z_][\w.]+)\.(execute|executeReturn)\s*\(')
     def rewrite_calls(text):
         def _r(m):
-            fq, meth = m.group(1), m.group(2)
+            fq = m.group(1)
             if fq in remap:
                 bfqcn, mang = remap[fq]
-                return f'{bfqcn}.{mang}_{meth}('
+                return f'{bfqcn}.{mang}_executeReturn('
             return m.group(0)
         return call_re.sub(_r, text)
 
@@ -611,7 +616,6 @@ def bucketize_records(records, src_root: Path, group: str,
     for bi, (cls_name, members, imports) in bucket_of.items():
         body_methods = []
         for (c, mang, ex_t, rt_t, seg_ts) in members:
-            body_methods.append("    " + rewrite_calls(ex_t).strip())
             body_methods.append("    " + rewrite_calls(rt_t).strip())
             for st in seg_ts:   # JIT 분할 조각(있으면) — 개명본을 함께 이동
                 body_methods.append("    " + rewrite_calls(st).strip())

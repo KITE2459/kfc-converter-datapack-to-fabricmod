@@ -80,6 +80,26 @@ public final class KfcGen {
 
     private KfcGen() { throw new UnsupportedOperationException(); }
 
+    // ── [tree_flatten] 구간 테이블 디코더 ──
+    // 정적 int[] 초기화는 원소당 <clinit> 바이트코드를 만들어 수천 원소면 64KB 한계를
+    // 위협한다. 대신 상수풀 문자열(5자/int, base-90, '"'/'\\' 회피 프린터블)로 실어
+    // 클래스 로드 시 1회 디코드한다. 인코더는 tree_flatten._encode_ints (역함수 쌍).
+    public static int[] decodeInts(String s) {
+        int n = s.length() / 5;
+        int[] out = new int[n];
+        int p = 0;
+        for (int i = 0; i < n; i++) {
+            long v = 0;
+            for (int k = 0; k < 5; k++) {
+                int c = s.charAt(p++) - 35;
+                if (c > 57) c--;             // 92('\\') 자리 건너뜀 보정
+                v = v * 90 + c;
+            }
+            out[i] = (int) (v + Integer.MIN_VALUE);
+        }
+        return out;
+    }
+
     // ──────────────── 실행 컨텍스트 (구 kfcutil 통합) ────────────────
     // 생성 코드가 ctx.world / ctx.scoreboard / ctx.allPlayers / ctx.server 를 쓴다.
     public static final class GameContext {

@@ -377,6 +377,59 @@ def _sum_scan_line_field(rec: str):
     m = _SUM_LINE_VAL_RE.match(rec, i + 8)
     return m.group(1) if m else None
 
+# ── pass-1.5 병렬 워커 ──
+# 요약 수집은 '줄 단위 독립'(각 레코드에 fid 포함) → 라인 청크로 나눠 병렬 스캔 후
+# 부분 결과를 단조 병합(ALL/SALL 흡수원, 집합 합집합)한다. 순서 무관이므로 결과 동일.
+# (cap-48 은 '최종 합집합 크기' 기준으로 동치 — 부분합 어느 쪽에서 넘어도 SALL.)
+_SUM_ALL_FIDS = None
+
+def _sum_init(all_fids):
+    global _SUM_ALL_FIDS
+    _SUM_ALL_FIDS = all_fids
+
+def _sum_feed_into(fid, line, local, slocal, edges, all_fids):
+    """_scan_call_summaries._feed 와 동일 로직(전달 dict 에 기록)."""
+    local.setdefault(fid, (set(), False))
+    slocal.setdefault(fid, set())
+    if line is None:
+        local[fid] = "ALL"
+        slocal[fid] = "SALL"
+        return
+    eff, move, calls = _sum_line_effect(line)
+    for c in calls:
+        if c in all_fids:
+            edges.setdefault(fid, set()).add(c)
+        else:
+            local[fid] = "ALL"       # #함수태그/$()/미존재 callee = 미지
+            slocal[fid] = "SALL"
+    if eff == "ALL":
+        local[fid] = "ALL"
+    elif local[fid] != "ALL":
+        cur = local[fid]
+        local[fid] = (cur[0] | eff, cur[1] or move)
+    if slocal[fid] != "SALL":
+        se = _sum_line_score(line)
+        if se == "SALL":
+            slocal[fid] = "SALL"
+        else:
+            slocal[fid] |= se
+            if len(slocal[fid]) > 48:
+                slocal[fid] = "SALL"   # 폭주 방지 상한(사실상 전역 초기화 함수)
+
+def _sum_chunk(lines):
+    """워커: raw JSONL 라인 청크 → (local, slocal, edges) 부분 결과."""
+    local, slocal, edges = {}, {}, {}
+    for rec in lines:
+        rec = rec.strip()
+        if not rec:
+            continue
+        fid = _scan_fid(rec)
+        if fid is None:
+            continue
+        _sum_feed_into(fid, _sum_scan_line_field(rec), local, slocal, edges, _SUM_ALL_FIDS)
+    return local, slocal, edges
+
+
 def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
     """함수별 요약 → (effects_by_fqcn, known_fqcns).
        effects 는 효과 있는 함수만 수록: "ALL" | (frozenset[tags], move:bool).
@@ -412,15 +465,60 @@ def _scan_call_summaries(trees_path: str, all_fids: set, group: str):
                 if len(slocal[fid]) > 48:
                     slocal[fid] = "SALL"   # 폭주 방지 상한(사실상 전역 초기화 함수)
     if _trees_is_jsonl(trees_path):
-        with open(trees_path, encoding="utf-8") as f:
-            for rec in f:
-                rec = rec.strip()
-                if not rec:
-                    continue
-                fid = _scan_fid(rec)
-                if fid is None:
-                    continue
-                _feed(fid, _sum_scan_line_field(rec))
+        import os as _oss
+        try:
+            _sz = _oss.path.getsize(trees_path)
+        except OSError:
+            _sz = 0
+        try:
+            _jobs = int(_oss.environ.get("KFC_JOBS", "0")) or len(_oss.sched_getaffinity(0))
+        except (AttributeError, OSError, ValueError):
+            _jobs = _oss.cpu_count() or 1
+        if _sz >= 50_000_000 and _jobs > 1:
+            # 병렬: 라인 청크 → 부분 요약 → 단조 병합 (순서 무관 — 직렬과 동일 결과)
+            import multiprocessing as _mpc
+            def _chunks(f, n=8000):
+                buf = []
+                for rec in f:
+                    buf.append(rec)
+                    if len(buf) >= n:
+                        yield buf; buf = []
+                if buf:
+                    yield buf
+            with open(trees_path, encoding="utf-8") as f, \
+                 _mpc.get_context("spawn").Pool(processes=_jobs,
+                                                initializer=_sum_init,
+                                                initargs=(all_fids,)) as pool:
+                for plocal, pslocal, pedges in pool.imap_unordered(_sum_chunk, _chunks(f)):
+                    for fid, v in plocal.items():
+                        cur = local.get(fid)
+                        if cur is None:
+                            local[fid] = v
+                        elif cur == "ALL" or v == "ALL":
+                            local[fid] = "ALL"
+                        else:
+                            local[fid] = (cur[0] | v[0], cur[1] or v[1])
+                    for fid, v in pslocal.items():
+                        cur = slocal.get(fid)
+                        if cur is None:
+                            slocal[fid] = v
+                        elif cur == "SALL" or v == "SALL":
+                            slocal[fid] = "SALL"
+                        else:
+                            u = cur | v
+                            slocal[fid] = "SALL" if len(u) > 48 else u
+                    for fid, cs in pedges.items():
+                        edges[fid] |= cs
+        else:
+            with open(trees_path, encoding="utf-8") as f:
+                for rec in f:
+                    rec = rec.strip()
+                    if not rec:
+                        continue
+                    fid = _scan_fid(rec)
+                    if fid is None:
+                        continue
+                    _feed(fid, _sum_scan_line_field(rec))
     else:
         for obj in _iter_trees(trees_path):
             fid = obj.get("function")
@@ -533,12 +631,21 @@ def _iter_trees(trees_path: str):
 
 
 def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "kartriderpack", profile=None, clean: bool = True, merge: bool = True):
+    # ── 패스별 벽시계 타이밍(항상 출력) — 병목 추적의 단일 근거 ──
+    import time as _pt
+    _pt0 = _pt.time(); _ptl = [_pt0]
+    def _tlog(label):
+        _n = _pt.time()
+        print(f"[generate][t] {label}: +{_n - _ptl[0]:.1f}s (total {_n - _pt0:.1f}s)", flush=True)
+        _ptl[0] = _n
+
     # 데이터팩 입력을 한 번 열어(디렉터리/zip 투명) 모든 로더-리소스 복사에서 재사용.
     dp_src = open_datapack(datapack_root) if datapack_root else None
     if dp_src is not None:
         emit.load_entity_type_tags(dp_src)
         emit.load_block_tags(dp_src)
         emit.load_predicates(dp_src)
+    _tlog("setup (datapack tags/predicates)")
 
     out_root = Path(out_dir)
     # 이전 변환의 잔재 .java/리소스가 남아 빌드를 깨는 것을 막는다(예: 삭제/改名된 함수의 옛 클래스).
@@ -546,11 +653,14 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     # (.gradle/build)·개발월드(run)·사용자 수정은 보존한다. (--no-clean 으로 끌 수 있음)
     if clean:
         import shutil as _sh
-        _src = out_root / "src"
+        # [리소스 증분화] 종전엔 src/ 전체(=main/resources 포함)를 지워 write_resources 의
+        # '불변 스킵'이 무효였다(매 변환 790MB/19만 파일 전량 재기록). java 트리만 지우고,
+        # 리소스는 write_resources 가 기대 집합 대조로 스테일 파일을 삭제한다(최종 트리 동일).
+        _src = out_root / "src" / "main" / "java"
         if _src.exists():
             try:
                 _sh.rmtree(_src)
-                print(f"[generate] cleaned previous source tree: {_src} (build env/caches kept)")
+                print(f"[generate] cleaned previous java tree: {_src} (resources reconciled incrementally; build env/caches kept)")
             except OSError as _e:
                 print(f"[generate][warn] couldn't fully clean {_src}: {_e} "
                       f"(파일 잠금? gradle 데몬/에디터 종료 후 재시도)")
@@ -602,6 +712,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     emit.set_macro_fns(macro_fns)
     emit.set_all_fids(all_fids)
     print(f"[generate] pass-1: identified {len(macro_fns)} macro functions")
+    _tlog("pass-1 (macro/fid scan)")
 
     # ── [pass-1.5] 인터프로시저 태그 요약 계산 → assemble 주입 ──
     # (단일/병렬 공통. 병렬은 initargs 로 워커에도 전달. 실패해도 변환은 계속 —
@@ -619,6 +730,21 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     except Exception as _sum_e:
         print(f"[generate][warn] pass-1.5 tag summary failed ({_sum_e}) — "
               f"falling back to conservative call invalidation")
+    _tlog("pass-1.5 (call summaries)")
+
+    # ── 리소스 복사(순수 I/O)를 pass-2(CPU·워커풀)와 병행 ──
+    # write_resources 는 dp_src 읽기 + resources/ 쓰기뿐이라 pass-2 와 자원이 겹치지 않고,
+    # 파일 I/O 는 GIL 을 놓으므로 스레드 병행이 유효하다. 예외는 join 시점에 재전파.
+    tags = load_tags(trees_path)
+    import threading as _thr
+    _res_exc = []
+    def _res_bg():
+        try:
+            write_resources(out_root, group, tags, dp_src)
+        except BaseException as _e:
+            _res_exc.append(_e)
+    _res_thread = _thr.Thread(target=_res_bg, name="kfc-resources", daemon=True)
+    _res_thread.start()
 
     # ── [pass-2] 함수별 변환 -> 파일 쓰기 (멀티프로세싱) ──
     # JSONL(신규 ParseDumper): 같은 함수가 연속 → 스트리밍으로 (fid,objs) 청크를 만들어
@@ -751,6 +877,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
                 _write_result(res)
         _src = "explicit KFC_JOBS" if _jobs_env > 0 else "auto (max usable cores)"
         print(f"[generate] pass-2: parallel convert with {jobs} workers [{_src}]")
+    _tlog(f"pass-2 (convert {fn_count} fns, jobs={jobs})")
 
     # 호출되지만 클래스가 안 만들어진 함수(매크로 전용 등) -> 브릿지 stub 클래스 생성
     # called 는 pass-1 에서 스트리밍으로 수집됨.
@@ -783,6 +910,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
 
     write_report(out_root, fn_meta, stats, group)
+    _tlog("stubs+KfcGen+report")
 
     # ── 사전 흐름분석 감사(개선사항 E): unreachable/missing-return 0건 확인 ──
     if audit_violations:
@@ -796,9 +924,11 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         print(f"[generate][AUDIT] ✅ 흐름분석 위반 0건 (unreachable/missing-return 없음)")
 
     # ── 모드 진입점 + resources 생성 (tick/load 태그 기반) ──
-    tags = load_tags(trees_path)
     write_entrypoint(src_root, group, tags, generated_fids)
-    write_resources(out_root, group, tags, dp_src)
+    _res_thread.join()
+    if _res_exc:
+        raise _res_exc[0]
+    _tlog("entrypoint+resources join (copy ran concurrently with pass-2)")
 
     # ── [pass-2.7] 스코어 디스패치 트리 평탄화 ──
     # 본문 전체가 `execute as @s[scores={obj=lo..hi}] run function child` 꼴인 순수
@@ -811,7 +941,21 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         _lines_map = None
         try:
             import tree_flatten as _tf_mod
-            _lines_map = _tf_mod.collect_function_lines(dp_src)
+            # extract 가 만든 lines.json 이 trees 옆에 있으면 재사용(19만 파일 재스캔 생략).
+            # 규칙 동일(kartall 194,133 fid 전수 값 비교 일치). fid 커버리지가 어긋나면
+            # (다른 팩의 잔재 등) fail-closed 로 데이터팩 재스캔.
+            _lj = Path(trees_path).parent / "lines.json"
+            if _lj.exists():
+                try:
+                    _lm_try = json.loads(_lj.read_text(encoding="utf-8"))
+                    if (all_fids and len(set(_lm_try) & all_fids) >= len(all_fids) * 0.99
+                            and len(_lm_try) <= len(all_fids) * 1.05):   # 상위집합(다른 팩 잔재) 거부
+                        _lines_map = _lm_try
+                        print(f"[generate] pass-2.7: reusing extract lines.json ({len(_lines_map)} fns)")
+                except Exception:
+                    _lines_map = None
+            if _lines_map is None:
+                _lines_map = _tf_mod.collect_function_lines(dp_src)
             tstats = _tf_mod.flatten_trees(_records, src_root, group, dp_src,
                                            tags, fid_to_fqcn, verbose=True,
                                            lines_map=_lines_map)
@@ -819,6 +963,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         except Exception as _te:
             import traceback; traceback.print_exc()
             print(f"[generate][warn] tree-flatten skipped due to error: {_te}")
+        _tlog("pass-2.7 (tree-flatten)")
 
         # ── [pass-2.8] 상수 스코어 폴딩 — 전 팩 라인 분석으로 '항상 같은 리터럴'임이
         #    증명된 (#가짜플레이어, dummy objective) 읽기를 리터럴로 재작성.
@@ -830,6 +975,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         except Exception as _ce:
             import traceback; traceback.print_exc()
             print(f"[generate][warn] const-fold skipped due to error: {_ce}")
+        _tlog("pass-2.8 (const-fold)")
 
     # ── [pass-3] 후처리: 오버사이즈 브릿지 + 버킷화(여러 함수를 한 클래스로 묶어 클래스 수 감축) ──
     # ModEntry(tick) 가 생성된 뒤라 외부 FQCN 참조가 자동 핀된다. tick/load 는 명시 핀으로도 전달.
@@ -858,16 +1004,20 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
                     p = pkg_dir / f"{c.cls}.java"
                     if not p.exists():
                         write_if_changed(p, c.text)
+    _tlog("pass-3 (bucketize)")
 
     # ── [pass-4] 상수 배열 호이스팅: 방출된 `new String[]{...}` 등 상수 리터럴을
     #    클래스 static final 필드로 승격 — 실행당 할당 제거 + 메서드 바이트코드 축소.
     #    (merge 유무와 무관하게 최종 디스크 산출 전체에 적용. KfcGen.java 제외.)
     try:
         import merge_pass as _hp_mod
-        hstats = _hp_mod.hoist_constants_tree(src_root, verbose=False)
+        _skip_hoist = ((src_root / Path(*f"{group}.buckets".split(".")))
+                       if (merge and _records is not None) else None)
+        hstats = _hp_mod.hoist_constants_tree(src_root, verbose=False, skip_dir=_skip_hoist)
         print(f"[generate] pass-4 hoist-constants: {hstats}")
     except Exception as _he:
         print(f"[generate][warn] hoist pass skipped due to error: {_he}")
+    _tlog("pass-4 (hoist-constants)")
 
     print(f"[generate] {fn_count} classes -> {src_root}")
     tot = sum(stats.values())
@@ -885,6 +1035,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     if profile is None:
         from build_config import DEFAULT_PROFILE as profile
     scaffold_build_env(out_root, profile, group, _datapack_base_name(datapack_root))
+    _tlog("scaffold (build env)")
 
 
 
@@ -1257,30 +1408,129 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
               else (open_datapack(datapack_root) if datapack_root else None))
     if dp_src is not None and dp_src.exists():
         dst_data = res / "data"
-        copied = skipped_ticks = 0
+        copied = skipped_ticks = unchanged = 0
         _seen_dirs = set()   # 생성한 부모 디렉터리 캐시 — 188k 파일에서 mkdir 중복 syscall 제거
         # data/ 이하 전 파일을 메모리에서 읽어 그대로 기록 (zip 도 디스크 전개 없이).
-        for rel, blob in dp_src.iter_files(under="data"):
-            relposix = rel[len("data/"):]   # data/ 제거한 내부 상대경로
-            # tick 함수 태그만 제외 (자바 진입점이 매 틱 담당 -> 중복 구동 방지).
-            # load 태그는 데이터팩에 보존 - 바닐라 함수 매니저가 월드 로드/리로드 시점에
-            # 정확한 시맨틱(스폰청크 로드 후, /reload 포함)으로 실행한다.
-            if relposix in ("minecraft/tags/function/tick.json",
-                            "minecraft/tags/functions/tick.json"):
-                skipped_ticks += 1
-                continue
-            dst = dst_data / relposix
-            parent = dst.parent
-            if parent not in _seen_dirs:        # 같은 디렉터리는 한 번만 mkdir
-                parent.mkdir(parents=True, exist_ok=True)
-                _seen_dirs.add(parent)
-            dst.write_bytes(blob)
-            copied += 1
+        # [가속 2건 — 산출 바이트 불변]
+        #  (1) 불변 스킵: 기존 파일과 내용 동일하면 미기록(mtime 보존) — 반복 변환에서
+        #      gradle processResources/jar 의 최신성 검사가 통과해 증분 빌드에도 기여.
+        #  (2) 스레드 병렬 기록: 파일 I/O 는 GIL 을 놓으므로 스레드로 유효(대량 소파일 syscall
+        #      레이턴시 은닉). 배치 단위 처리로 메모리 상주는 배치 분량으로 제한.
+        from concurrent.futures import ThreadPoolExecutor
+        # ── 매니페스트 증분 (dir 소스 전용) ──
+        # {rel: [src_size, src_mtime_ns, dst_size, dst_mtime_ns]} — 원본과 산출 양쪽의
+        # stat 이 직전 기록과 일치하면 read 없이 skip (make/gradle 식 최신성 판정).
+        # 원본이 zip 이거나 KFC_RES_MANIFEST=0 이면 종전(바이트 비교) 경로.
+        import os as _osr
+        _use_manifest = (getattr(dp_src, "kind", "") == "dir"
+                         and _osr.environ.get("KFC_RES_MANIFEST") != "0")
+        _mf_path = res / ".kfc_res_manifest.json"
+        _manifest = {}
+        if _use_manifest and _mf_path.exists():
+            try:
+                _manifest = json.loads(_mf_path.read_text(encoding="utf-8"))
+            except Exception:
+                _manifest = {}
+        _new_manifest = {}
+        def _copy_one(job):
+            # job=(dst, blob | None, abs_src, relposix, src_size, src_mtime_ns)
+            dst, blob, absrc, relposix, ssz, smt = job
+            if blob is None:
+                blob = absrc.read_bytes()
+            w = 1
+            try:
+                if dst.stat().st_size == len(blob) and dst.read_bytes() == blob:
+                    w = 0                         # 불변 → 미기록(mtime 보존)
+            except OSError:
+                pass
+            if w:
+                dst.write_bytes(blob)
+            try:
+                st = dst.stat()
+                _new_manifest[relposix] = [ssz, smt, st.st_size, st.st_mtime_ns]
+            except OSError:
+                pass
+            return w
+        _BATCH = 4096
+        batch = []
+        _expected = set()   # 이번 변환의 유효 리소스 상대경로 — 스테일 파일 삭제 대조용
+        def _src_iter():
+            """(relposix, blob|None, abs|None, size, mtime_ns) 로 정규화."""
+            if _use_manifest:
+                for rel, ap, sz, mt in dp_src.iter_stat(under="data"):
+                    yield rel[len("data/"):], None, ap, sz, mt
+            else:
+                for rel, blob in dp_src.iter_files(under="data"):
+                    yield rel[len("data/"):], blob, None, len(blob), None
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            def _flush():
+                nonlocal copied, unchanged
+                for w in _ex.map(_copy_one, batch):
+                    copied += w
+                    unchanged += (1 - w)
+                batch.clear()
+            for relposix, blob, absrc, ssz, smt in _src_iter():
+                # tick 함수 태그만 제외 (자바 진입점이 매 틱 담당 -> 중복 구동 방지).
+                # load 태그는 데이터팩에 보존 - 바닐라 함수 매니저가 월드 로드/리로드 시점에
+                # 정확한 시맨틱(스폰청크 로드 후, /reload 포함)으로 실행한다.
+                if relposix in ("minecraft/tags/function/tick.json",
+                                "minecraft/tags/functions/tick.json"):
+                    skipped_ticks += 1
+                    continue
+                dst = dst_data / relposix
+                _expected.add(relposix)
+                # 빠른 경로: 원본 stat + 산출 stat 이 매니페스트와 일치 → read 없이 skip
+                if _use_manifest and smt is not None:
+                    ent = _manifest.get(relposix)
+                    if ent and ent[0] == ssz and ent[1] == smt:
+                        try:
+                            st = dst.stat()
+                            if st.st_size == ent[2] and st.st_mtime_ns == ent[3]:
+                                _new_manifest[relposix] = ent
+                                unchanged += 1
+                                continue
+                        except OSError:
+                            pass
+                parent = dst.parent
+                if parent not in _seen_dirs:        # 같은 디렉터리는 한 번만 mkdir
+                    parent.mkdir(parents=True, exist_ok=True)
+                    _seen_dirs.add(parent)
+                batch.append((dst, blob, absrc, relposix, ssz, smt))
+                if len(batch) >= _BATCH:
+                    _flush()
+            _flush()
+        if _use_manifest:
+            try:
+                _mf_path.write_text(json.dumps(_new_manifest, separators=(",", ":")),
+                                    encoding="utf-8")
+            except OSError as _me:
+                print(f"[generate][warn] resource manifest write failed: {_me}")
+        # ── 스테일 리소스 삭제(종전 'src/ 전체 clean' 과 최종 트리 동일 보장) ──
+        # 데이터팩에서 삭제/개명된 파일이 남지 않도록 기대 집합에 없는 파일을 지운다.
+        stale = 0
+        if dst_data.exists():
+            for p in dst_data.rglob("*"):
+                if p.is_file():
+                    relp = p.relative_to(dst_data).as_posix()
+                    if relp not in _expected:
+                        try:
+                            p.unlink(); stale += 1
+                        except OSError:
+                            pass
+            if stale:
+                # 비워진 디렉터리 정리(bottom-up)
+                import os as _osw
+                for dirpath, _dn, _fn in _osw.walk(dst_data, topdown=False):
+                    try:
+                        _osw.rmdir(dirpath)
+                    except OSError:
+                        pass
         # pack.mcmeta 도 복사 (있으면)
         pm = dp_src.pack_meta_bytes()
         if pm is not None:
             (res / "pack.mcmeta").write_bytes(pm)
-        print(f"[generate] copied datapack resources: {copied} files (excluded {skipped_ticks} tick/load tags - replaced by entrypoint)")
+        print(f"[generate] copied datapack resources: {copied} written, {unchanged} unchanged(skip), "
+              f"{stale} stale removed (excluded {skipped_ticks} tick tags - replaced by entrypoint)")
     else:
         print("[!]  no datapack_root - datapack resources (tags/predicate etc.) not copied. "
               "other datapacks may fail to find #kartmobil:ignoreblock etc.")

@@ -139,50 +139,70 @@ def analyze(lines_map: dict) -> dict:
 _INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
 
 
+def _compile_key(h: str, o: str, v: int) -> list:
+    """키 하나의 (패턴, 치환) 6종 사전 컴파일 — 레코드 루프 밖에서 1회."""
+    hq, oq = re.escape(f'"{h}"'), re.escape(f'"{o}"')
+    out = [
+        # scoreMatches → 순수 범위비교
+        (re.compile(rf'KfcGen\.scoreMatches\(sb, {hq}, {oq}, ({_INT}), ({_INT})\)'),
+         rf'({v} >= \1 && {v} <= \2)'),
+        # getScore → 리터럴
+        (re.compile(rf'KfcGen\.getScore\(sb, {hq}, {oq}\)'), f'{v}'),
+        # readScore(CSE 선언) → 박싱 리터럴
+        (re.compile(rf'KfcGen\.readScore\(sb, {hq}, {oq}\)'), f'Integer.valueOf({v})'),
+    ]
+    # opScore 소스 특수화: =, +=, -=  (대상 인자는 임의 식 — 중첩 괄호 없는 흔한 꼴만,
+    # 매칭 실패 시 원형 유지 = fail-closed)
+    for op, repl in (("=", f'KfcGen.setScore(sb, \\1, \\2, {v});'),
+                     ("+=", f'KfcGen.addScore(sb, \\1, \\2, {v});'),
+                     ("-=", f'KfcGen.addScore(sb, \\1, \\2, -({v}));')):
+        out.append((re.compile(
+            r'KfcGen\.opScore\(sb, ((?:[^,()]|\([^()]*\))+), ((?:[^,()]|\([^()]*\))+), '
+            + re.escape(f'"{op}"') + rf', {hq}, {oq}\);'), repl))
+    return out
+
+
 def _fold_text(text: str, consts: dict) -> tuple[str, int]:
-    """단일 클래스 소스에 폴딩 적용. (새 텍스트, 치환수)."""
+    """단일 클래스 소스에 폴딩 적용. (새 텍스트, 치환수). (하위호환 API — 느린 경로)"""
     n = 0
     for (h, o), v in consts.items():
-        hq, oq = re.escape(f'"{h}"'), re.escape(f'"{o}"')
-        # scoreMatches → 순수 범위비교
-        pat = re.compile(rf'KfcGen\.scoreMatches\(sb, {hq}, {oq}, ({_INT}), ({_INT})\)')
-        text, k = pat.subn(rf'({v} >= \1 && {v} <= \2)', text)
-        n += k
-        # getScore → 리터럴
-        pat = re.compile(rf'KfcGen\.getScore\(sb, {hq}, {oq}\)')
-        text, k = pat.subn(f'{v}', text)
-        n += k
-        # readScore(CSE 선언) → 박싱 리터럴
-        pat = re.compile(rf'KfcGen\.readScore\(sb, {hq}, {oq}\)')
-        text, k = pat.subn(f'Integer.valueOf({v})', text)
-        n += k
-        # opScore 소스 특수화: =, +=, -=  (대상 인자는 임의 식 — 중첩 괄호 없는 흔한 꼴만,
-        # 매칭 실패 시 원형 유지 = fail-closed)
-        for op, repl in (("=", f'KfcGen.setScore(sb, \\1, \\2, {v});'),
-                         ("+=", f'KfcGen.addScore(sb, \\1, \\2, {v});'),
-                         ("-=", f'KfcGen.addScore(sb, \\1, \\2, -({v}));')):
-            pat = re.compile(
-                r'KfcGen\.opScore\(sb, ((?:[^,()]|\([^()]*\))+), ((?:[^,()]|\([^()]*\))+), '
-                + re.escape(f'"{op}"') + rf', {hq}, {oq}\);')
+        for pat, repl in _compile_key(h, o, v):
             text, k = pat.subn(repl, text)
             n += k
     return text, n
 
 
 def fold_const_scores(records: list, lines_map: dict, verbose: bool = True) -> dict:
-    """records 텍스트 제자리 폴딩. 반환 {"keys": n, "folded": n}."""
+    """records 텍스트 제자리 폴딩. 반환 {"keys": n, "folded": n}.
+
+    [성능] 종전엔 레코드마다 '키 48개 × 패턴 6개' 정규식이 전체 텍스트를 스캔했다
+    (272MB 코드 × 288패스 ≈ 78GB 스캔 — kartall 실측 96.6s, 실제 폴딩은 39곳).
+    폴딩 대상 호출은 반드시 `"#홀더"` 자바 문자열 리터럴을 포함하므로:
+      1) `'"#'` 미포함 레코드는 즉시 스킵 (C 레벨 substring, 대부분 여기서 탈락)
+      2) 남은 레코드도 해당 키의 `"홀더"` 리터럴이 있을 때만 그 키의 패턴 6종 적용
+    적용 순서는 종전과 동일(consts 삽입 순서)이므로 산출물 바이트 동일."""
     if not FOLD_CONST_SCORES or not lines_map:
         return {"keys": 0, "folded": 0}
     consts = analyze(lines_map)
     if not consts:
         return {"keys": 0, "folded": 0}
+    compiled = [(f'"{h}"', _compile_key(h, o, v)) for (h, o), v in consts.items()]
     total = 0
     for c in records:
-        t, k = _fold_text(c.text, consts)
-        if k:
+        t = c.text
+        if '"#' not in t:               # 1) 홀더 리터럴 자체가 없음 → 폴딩 불가
+            continue
+        n = 0
+        for hlit, pats in compiled:     # 2) 키별: 홀더 리터럴 있을 때만 정규식
+            if hlit not in t:
+                continue
+            for pat, repl in pats:
+                t, k = pat.subn(repl, t)
+                n += k
+        if n:
             c.text = t
             c.size = len(t.encode("utf-8"))
-            total += k
+            total += n
     if verbose and total:
         top = sorted(consts.items())[:100]
         print(f"  [const-fold] {len(consts)} keys, {total} sites — "

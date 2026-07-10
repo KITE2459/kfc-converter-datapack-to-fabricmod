@@ -92,6 +92,16 @@ class DirSource:
             if p.is_file():
                 yield p.relative_to(self.root).as_posix(), p.read_bytes()
 
+    def iter_stat(self, under: str | None = None):
+        """(rel, abs_path, size, mtime_ns) — 내용 read 없이 stat 만. (증분 리소스 복사용)"""
+        base = self.root if under is None else (self.root / under)
+        if not base.exists():
+            return
+        for p in base.rglob("*"):
+            if p.is_file():
+                st = p.stat()
+                yield p.relative_to(self.root).as_posix(), p, st.st_size, st.st_mtime_ns
+
     def pack_meta_bytes(self) -> bytes | None:
         pm = self.root / "pack.mcmeta"
         return pm.read_bytes() if pm.exists() else None

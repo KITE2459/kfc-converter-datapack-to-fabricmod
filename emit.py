@@ -6640,6 +6640,42 @@ def store_success_value_expr(tail: list[dict], em: Emitted,
         return None
     nodes, args = split_chain(tail)
     nn = [n["node"] for n in nodes]
+    # ── scoreboard players set|add|remove 소스 ──
+    # 바닐라 ScoreboardCommand: set/add/remove 는 홀더 컬렉션에 쓰고 정수를 반환할 뿐,
+    # 실패(예외) 경로는 '홀더 셀렉터 해소 실패'(매치 0)뿐이다. 따라서
+    #   · 리터럴 홀더(#가짜플레이어/이름): 해소 실패 없음 → 항상 성공(1)
+    #   · @s / @s[...]: 실행자 부재·조건 불일치 = 해소 실패 → 커맨드 실패(0, 소스 미실행)
+    # 그 외 셀렉터(@e/@a 등)는 '매치 0 = 실패' 판정까지 얹어야 하므로 1차 미지원(fail-closed).
+    # (store 앞의 if/unless 는 emit_execute 가 바깥 가드로 감싼다 — 좌→우 시맨틱상
+    #  조건 실패 시 store 자체가 등록되지 않아 아무것도 저장되지 않는 것과 일치.)
+    if (nn[0] == "scoreboard" and len(nn) > 2 and nn[1] == "players"
+            and nn[2] in ("set", "add", "remove")):
+        holder = args["targets"][0]["raw"]
+        obj = args["objective"][0]["raw"]
+        n = args["score"][0]["raw"]
+        hg = self_holder_guard(holder)
+        if hg is None:
+            em.reason = f"store success scoreboard 셀렉터 홀더({holder[:25]}) 1차 미지원"
+            return None
+        h, guard = hg
+        if self_expr != "executor":
+            h = re.sub(r'\bexecutor\b', self_expr, h)
+            guard = re.sub(r'\bexecutor\b', self_expr, guard) if guard else guard
+        nj = jint(n)
+        verb = nn[2]
+        if verb == "set":
+            stmt = f'KfcGen.setScore(sb, {h}, {jstr(obj)}, {nj});'
+        elif verb == "add":
+            stmt = f'KfcGen.addScore(sb, {h}, {jstr(obj)}, {nj});'
+        else:
+            stmt = f'KfcGen.addScore(sb, {h}, {jstr(obj)}, -({nj}));'
+        if guard is None:
+            em.side_effects = [stmt]
+            return "1"
+        sres = _fresh_var("sres")
+        em.side_effects = [f'int {sres} = 0;',
+                           f'if ({guard}) {{ {stmt} {sres} = 1; }}']
+        return sres
     if nn[0] != "data" or "modify" not in nn:
         em.reason = "store success <non-data-modify> 소스 1차 미지원"
         return None

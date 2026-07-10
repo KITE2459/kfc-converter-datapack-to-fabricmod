@@ -295,7 +295,7 @@ def _score_effects(em):
         if cs is None:
             return None
         inv0 |= cs
-    if re.search(r'\bsb\.[A-Za-z]', code):
+    if _SB_USE_RE.search(code):
         return None                    # KfcGen 래퍼 밖 직접 스코어보드 접근
     for hm in _CSE_HELPER_RE.finditer(code):
         h = hm.group(1)
@@ -483,14 +483,14 @@ def _cse_tag_eligible(expr: str):
     if "->" in expr:
         return None
     # origin 인자(ctx 다음) 추출.
-    m = re.match(r'KfcGen\.\w+\(\s*ctx\s*,\s*([^,]+?)\s*,', expr)
+    m = _CSE_CTXARG_RE.match(expr)
     origin = m.group(1).strip() if m else None
     # origin 무관 여부(firstEntity + min/max dist 둘 다 <0): inRange 가 origin 을 안 쓰므로
     # 결과가 origin 값과 무관하다. 이 경우 블록-지역 origin(_asSrc_N.getPosition() 등)이어도
     # 적격이며, hoist 시 origin 을 메서드-스코프 _pos 로 정규화해 여러 origin 의 동일 스캔을
     # 하나로 합친다(결과 동일 보장).
     origin_free = False
-    mm2 = re.search(r',\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*$', expr)
+    mm2 = _CSE_TAIL2_RE.search(expr)
     if mm2 and expr.startswith("KfcGen.firstEntity(") \
             and int(mm2.group(1)) < 0 and int(mm2.group(2)) < 0:
         origin_free = True
@@ -541,7 +541,7 @@ def _cse_tags_mutated(em):
         move = move or ce[1]
     # origin 로컬(_pos) 재대입: origin-의존 스캔만 무효화. (종전엔 여기서 조기 반환해
     # 같은 명령의 태그/스폰·킬 검사를 건너뛰었다 — 아래로 계속 진행해 그 구멍을 막는다.)
-    if re.search(r'\b_pos\s*=', code) or re.search(r'\bVec3d\s+_pos\b', code):
+    if _POS_SET_RE.search(code) or _POS_DECL_RE.search(code):
         move = True
     tags |= set(_TAG_MUTATE_RE.findall(code))
     tags |= set(_TAG_MUTATE2_RE.findall(code))
@@ -574,7 +574,7 @@ def _cse_tag_key(expr: str) -> str:
        origin-의존 스캔은 origin 이 결과에 영향을 주므로 원식을 그대로 키로 쓴다."""
     el = _cse_tag_eligible(expr)
     if el and el[2]:   # origin_free
-        return re.sub(r'(KfcGen\.firstEntity\(\s*ctx\s*,\s*)[^,]+?(\s*,)',
+        return _FE_SRC_RE.sub(
                       r'\1source.getPosition()\2', expr, count=1)
     return expr
 
@@ -641,6 +641,19 @@ def _find_reused_set_exprs(emitted) -> set:
 # if/else, 블록, for/while/do/switch 를 처리한다(주석은 줄 단위 // 만 제거).
 
 _IDCHAR_RE = re.compile(r'\w')
+# 핫 경로 사전 컴파일(프로파일: re._compile 재조회 제거) — 시맨틱 동일
+_SB_USE_RE = re.compile(r'\bsb\.[A-Za-z]')
+_CSE_CTXARG_RE = re.compile(r'KfcGen\.\w+\(\s*ctx\s*,\s*([^,]+?)\s*,')
+_CSE_TAIL2_RE = re.compile(r',\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*$')
+_POS_SET_RE = re.compile(r'\b_pos\s*=')
+_POS_DECL_RE = re.compile(r'\bVec3d\s+_pos\b')
+_FE_SRC_RE = re.compile(r'(KfcGen\.firstEntity\(\s*ctx\s*,\s*)[^,]+?(\s*,)')
+_ST_JUMP_RE = re.compile(r'(return|continue|break|throw)\b')
+_ST_IF_RE = re.compile(r'if\b')
+_ST_WTRUE_RE = re.compile(r'while\s*\(\s*true\s*\)')
+_ST_LOOP_RE = re.compile(r'(for|while|switch|do)\b')
+_ST_RET_RE = re.compile(r'return\b.*;$')
+_WORD_RE = re.compile(r"\b[A-Za-z_]\w*\b")
 
 def _idchar(c):
     return bool(c) and bool(_IDCHAR_RE.match(c))
@@ -814,9 +827,9 @@ def _stmt_completes(stmt):
     s = stmt.strip()
     if not s:
         return True
-    if re.match(r'(return|continue|break|throw)\b', s):
+    if _ST_JUMP_RE.match(s):
         return False
-    if re.match(r'if\b', s):
+    if _ST_IF_RE.match(s):
         i = s.index('(')
         e = _fa_balanced(s, i)
         then_stmt = s[e:_fa_substmt_end(s, e)].strip()
@@ -827,7 +840,7 @@ def _stmt_completes(stmt):
     if s.startswith('{'):
         inners = _fa_top_statements(s[1:_fa_balanced(s, 0) - 1])
         return _stmt_completes(inners[-1]) if inners else True
-    if re.match(r'try\b', s):
+    if _FA_TRY_RE.match(s):
         # JLS 14.21: try-catch(-finally) 문의 정상 완료 =
         #   finally 가 비정상 완료면 전체 비정상, 아니면 (try 블록 정상) ∨ (어떤 catch 블록 정상).
         # 이 규칙이 없으면 try 문이 항상 '정상 완료'(기본값 True)로 오판된다 — catch 가 빈
@@ -853,9 +866,9 @@ def _stmt_completes(stmt):
             if not _stmt_completes(rest[b:be]):
                 return False
         return try_ok or any_catch_ok
-    if re.match(r'while\s*\(\s*true\s*\)', s):
+    if _ST_WTRUE_RE.match(s):
         return 'break' in s
-    if re.match(r'(for|while|switch|do)\b', s):
+    if _ST_LOOP_RE.match(s):
         return True  # 조건 있는 루프/스위치는 정상 완료 가능(코드젠은 무한루프 미생성)
     return True
 
@@ -899,7 +912,7 @@ def audit_executeReturn(code: str) -> list[str]:
             if _completes_normally(body):
                 issues.append(f"MISSING_RETURN[{sig.split('(')[0].split()[-1]}]")
         stmts = _fa_top_statements(check)
-        if len(stmts) >= 2 and re.match(r'return\b.*;$', stmts[-1].strip()) \
+        if len(stmts) >= 2 and _ST_RET_RE.match(stmts[-1].strip()) \
                 and not _stmt_completes(stmts[-2]):
             issues.append(f"UNREACHABLE_RETURN[{sig.split('(')[0].split()[-1]}]")
     return issues
@@ -1038,7 +1051,7 @@ def _seg_params(seg_body: str) -> tuple[str, str]:
        1회 선언하므로(used/cache_* 가 전체 body 로 계산됨), 조각은 재계산 대신 인자로 받는다.
        (_exName/_pos 치환은 전체 body 에서 이미 수행된 뒤라 여기선 '사용'만 존재.)"""
     scan = "\n".join(l for l in seg_body.split("\n") if not l.lstrip().startswith("//"))
-    used = set(re.findall(r"\b[A-Za-z_]\w*\b", scan))
+    used = set(_WORD_RE.findall(scan))
     # (파라미터명, 자바 타입) — 본체 prelude 선언 타입과 1:1. 순서는 결정적(같은 입력 = 같은 출력).
     order = [
         ("executor", "Entity"),

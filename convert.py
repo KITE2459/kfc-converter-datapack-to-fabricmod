@@ -746,6 +746,36 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     _res_thread = _thr.Thread(target=_res_bg, name="kfc-resources", daemon=True)
     _res_thread.start()
 
+    # ── flatten/const-fold 준비(lines_map 로드 + 상수 분석)도 pass-2 와 병행 ──
+    # 메인은 pass-2 동안 pool 대기(GIL 유휴)이므로 스레드에서 json 파싱/분석을 흡수.
+    _prep_result = {}
+    def _prep_bg():
+        try:
+            lm = None
+            _lj = Path(trees_path).parent / "lines.json"
+            if _lj.exists():
+                try:
+                    _try = json.loads(_lj.read_text(encoding="utf-8"))
+                    if (all_fids and len(set(_try) & all_fids) >= len(all_fids) * 0.99
+                            and len(_try) <= len(all_fids) * 1.05):   # 상위집합(다른 팩 잔재) 거부
+                        lm = _try
+                        _prep_result["src"] = f"extract lines.json ({len(lm)} fns)"
+                except Exception:
+                    lm = None
+            if lm is None:
+                import tree_flatten as _tfm
+                lm = _tfm.collect_function_lines(dp_src)
+                _prep_result["src"] = "datapack scan"
+            _prep_result["lines"] = lm
+            import const_fold as _cfm
+            _prep_result["consts"] = _cfm.analyze(lm)
+        except BaseException as _e:
+            _prep_result["exc"] = _e
+    _prep_thread = None
+    if merge and dp_src is not None:
+        _prep_thread = _thr.Thread(target=_prep_bg, name="kfc-linesmap", daemon=True)
+        _prep_thread.start()
+
     # ── [pass-2] 함수별 변환 -> 파일 쓰기 (멀티프로세싱) ──
     # JSONL(신규 ParseDumper): 같은 함수가 연속 → 스트리밍으로 (fid,objs) 청크를 만들어
     # 워커 풀에 분배. 워커는 자바 코드 문자열만 반환, 파일 쓰기는 메인(디스크 경합 방지).
@@ -939,21 +969,18 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     # (무결성 논증·안전 게이트는 tree_flatten.py 헤더 — 실패는 fail-closed 로 원형 유지.)
     if merge and _records is not None and dp_src is not None:
         _lines_map = None
+        _pre_consts = None
         try:
             import tree_flatten as _tf_mod
-            # extract 가 만든 lines.json 이 trees 옆에 있으면 재사용(19만 파일 재스캔 생략).
-            # 규칙 동일(kartall 194,133 fid 전수 값 비교 일치). fid 커버리지가 어긋나면
-            # (다른 팩의 잔재 등) fail-closed 로 데이터팩 재스캔.
-            _lj = Path(trees_path).parent / "lines.json"
-            if _lj.exists():
-                try:
-                    _lm_try = json.loads(_lj.read_text(encoding="utf-8"))
-                    if (all_fids and len(set(_lm_try) & all_fids) >= len(all_fids) * 0.99
-                            and len(_lm_try) <= len(all_fids) * 1.05):   # 상위집합(다른 팩 잔재) 거부
-                        _lines_map = _lm_try
-                        print(f"[generate] pass-2.7: reusing extract lines.json ({len(_lines_map)} fns)")
-                except Exception:
-                    _lines_map = None
+            # lines_map 은 pass-2 와 병행한 준비 스레드가 로드/분석 완료(위 _prep_bg).
+            if _prep_thread is not None:
+                _prep_thread.join()
+            if "exc" in _prep_result:
+                raise _prep_result["exc"]
+            _lines_map = _prep_result.get("lines")
+            _pre_consts = _prep_result.get("consts")
+            if _lines_map is not None:
+                print(f"[generate] pass-2.7: lines_map ready via {_prep_result.get('src')} (prepared concurrently with pass-2)")
             if _lines_map is None:
                 _lines_map = _tf_mod.collect_function_lines(dp_src)
             tstats = _tf_mod.flatten_trees(_records, src_root, group, dp_src,
@@ -970,7 +997,8 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         #    (증명 조건·시맨틱 논증은 const_fold.py 헤더. 실패는 fail-closed 로 원형 유지.)
         try:
             import const_fold as _cf_mod
-            cstats = _cf_mod.fold_const_scores(_records, _lines_map, verbose=True)
+            cstats = _cf_mod.fold_const_scores(_records, _lines_map, verbose=True,
+                                               consts=_pre_consts)
             print(f"[generate] pass-2.8 const-fold: {cstats}")
         except Exception as _ce:
             import traceback; traceback.print_exc()

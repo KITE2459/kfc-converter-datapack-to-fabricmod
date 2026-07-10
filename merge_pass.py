@@ -344,12 +344,29 @@ def _bb_rewrite(text):
     return _BB_CALL_RE.sub(_r, text)
 
 def _build_bucket(task):
-    """워커: 버킷 하나 조립+기록. task=(path, bucket_pkg, cls_name, n_members, methods, import_lines)"""
-    path_str, bucket_pkg, cls_name, n_members, methods, imports = task
+    """워커: 버킷 하나를 원문 레코드에서 끝까지 처리(추출→호출 재작성→조립→호이스팅→기록).
+       task=(path, bucket_pkg, cls_name, [(fid, mang, text), ...])
+       [융합 근거] 종전엔 '전처리 풀(추출)' 결과 272MB 를 메인으로 회수했다가 '조립 풀'로
+       다시 보냈다(왕복 IPC + 이중 순회). 버킷별로 원문을 1회만 보내고 워커가 전 단계를
+       수행하면 산출 바이트는 동일하고 IPC 는 절반이 된다."""
+    path_str, bucket_pkg, cls_name, members = task
     group = _BB_GROUP
     body_methods = []
-    for mtext in methods:
-        body_methods.append("    " + _bb_rewrite(mtext).strip())
+    imports = set()
+    n_members = 0
+    for fid, mang, text in members:
+        two = _extract_two_methods(text, mang)
+        if two is None:
+            # 시그니처 존재로 사전 판정되므로 도달하지 않아야 정상(도달 시 종전 경로와
+            # 동일하게 컴파일 단계에서 부재가 드러난다 — fail-loud).
+            print(f"[bucketize][warn] method extraction failed: {fid} (bucket {cls_name})")
+            continue
+        ex_t, rt_t, seg_ts = two
+        body_methods.append("    " + _bb_rewrite(rt_t).strip())
+        for st in seg_ts:   # JIT 분할 조각(있으면) — 개명본을 함께 이동
+            body_methods.append("    " + _bb_rewrite(st).strip())
+        imports.update(_imports_of(text))
+        n_members += 1
     base_imp = {f"{group}.generated.KfcGen", "net.minecraft.server.command.ServerCommandSource"}
     imp_lines = sorted(set(l[len("import "):].rstrip(";") for l in imports) | base_imp)
     proj = [i for i in imp_lines if i.startswith(group)]
@@ -703,41 +720,21 @@ def bucketize_records(records, src_root: Path, group: str,
         return {"buckets": 0, "functions": 0, "bridged": 0}
 
     # 1) 오버사이즈(>64KB 메서드) → mcfunction 브릿지 (메모리상 text 치환; 기준은 파일 기반과 동일)
-    #    + 메서드 추출까지 레코드별 병렬 전처리(_prep_record). 산출은 직렬과 바이트 동일 —
-    #    레코드별 독립 연산이라 순서 무관, 결과는 원래 순서(pool.map)로 회수.
+    #    [경량화] 인코딩 크기 < 56KB 는 초과 불가(증명: _oversized 주석) → C 레벨 encode 만.
+    #    임계 이상 희소 레코드(kartall 0건)만 전체 판정+브릿지. 판정·산출은 종전과 동일.
+    #    메서드 추출은 버킷 워커(_build_bucket)로 이동 — 전처리 풀/왕복 IPC 제거.
     jobs = _mp_jobs()
-    prep = None
-    if jobs > 1 and len(records) >= 2000:
-        import multiprocessing as _mpc
-        ctx = _mpc.get_context("spawn")     # Windows 호환(convert.py 와 동일)
-        try:
-            with ctx.Pool(processes=jobs) as pool:
-                prep = pool.map(_prep_record,
-                                [(c.text, c.fid, c.is_macro) for c in records],
-                                chunksize=32)
-            if verbose:
-                print(f"[bucketize:mem] record prep parallelized with {jobs} workers")
-        except Exception as _pe:
-            print(f"[bucketize:mem][warn] parallel prep failed ({_pe}) — serial fallback")
-            prep = None
     bridged = 0
-    for i, c in enumerate(records):
-        if prep is not None:
-            over, ntext, mang, two, imps = prep[i]
-        else:
-            over = _oversized(c.text)
-            ntext = _bridge_oversized_text(c.text, c.fid, c.is_macro) if over else None
-            mang = _mangle(c.fid)
-            two = _extract_two_methods(ntext if over else c.text, mang)
-            imps = _imports_of(ntext if over else c.text)
-        if over:
-            c.text = ntext
-            c.size = len(ntext.encode("utf-8"))
+    for c in records:
+        # c.size 는 생성 시(Cls)와 모든 뮤테이션 지점(tree_flatten:529, const_fold:206)에서
+        # 갱신되므로 정확 — 272MB 재인코딩 없이 크기 지름길 적용.
+        if c.size >= METHOD_BC_CAP and _oversized(c.text):
+            c.text = _bridge_oversized_text(c.text, c.fid, c.is_macro)
+            c.size = len(c.text.encode("utf-8"))
             bridged += 1
             if verbose:
                 print(f"  [bridge>64KB] {c.fid}")
-        c._mang = mang; c._two = two; c._imps = imps   # 4)에서 재사용(재스캔 제거)
-    _btlog(f"prep (oversize+extract, jobs={jobs if prep is not None else 1})")
+    _btlog("oversize gate (main, size-shortcut)")
 
     # 2) 결정적 순서(파일 기반 bucketize 와 동일: fqcn 정렬)
     items = sorted(records, key=lambda c: c.fqcn)
@@ -759,17 +756,17 @@ def bucketize_records(records, src_root: Path, group: str,
     for bi, group_cls in enumerate(buckets):
         cls_name = f"Bucket{bi}"
         bfqcn = f"{bucket_pkg}.{cls_name}"
-        members = []; imports = set()
+        members = []
         for c in group_cls:
-            mang = c._mang
-            two = c._two
-            if two is None:
+            # _extract_two_methods 의 None 조건(두 시그니처 중 부재)과 동일한 사전 판정 —
+            # 실제 추출/개명은 버킷 워커에서 수행.
+            if ("public static void execute(" not in c.text
+                    or "public static int executeReturn(" not in c.text):
                 continue
-            ex_t, rt_t, seg_ts = two
-            members.append((c, mang, ex_t, rt_t, seg_ts))
-            imports.update(c._imps)
+            mang = _mangle(c.fid)
+            members.append((c.fid, mang, c.text))
             remap[c.fqcn] = (bfqcn, mang)
-        bucket_of[bi] = (cls_name, members, imports)
+        bucket_of[bi] = (cls_name, members)
     _btlog("assign+remap")
 
     # 5) 전역 호출 재작성기 (<oldFQCN>.execute|executeReturn( -> <bfqcn>.<mang>_executeReturn()
@@ -788,15 +785,10 @@ def bucketize_records(records, src_root: Path, group: str,
     # 6) 버킷 클래스 작성 (파일 기반 bucketize 와 동일 템플릿)
     bucket_dir = src_root / Path(*bucket_pkg.split("."))
     bucket_dir.mkdir(parents=True, exist_ok=True)
-    # 버킷별 독립 조립·기록 → 병렬화(_build_bucket). 산출 바이트는 직렬과 동일.
+    # 버킷별 독립 처리(추출→재작성→호이스팅→기록) → 병렬화(_build_bucket). 산출 바이트 동일.
     tasks = []
-    for bi, (cls_name, members, imports) in bucket_of.items():
-        methods = []
-        for (c, mang, ex_t, rt_t, seg_ts) in members:
-            methods.append(rt_t)
-            methods.extend(seg_ts)   # JIT 분할 조각(있으면) — 개명본을 함께 이동
-        tasks.append((str(bucket_dir / f"{cls_name}.java"), bucket_pkg, cls_name,
-                      len(members), methods, sorted(imports)))
+    for bi, (cls_name, members) in bucket_of.items():
+        tasks.append((str(bucket_dir / f"{cls_name}.java"), bucket_pkg, cls_name, members))
     hoisted = None
     if jobs > 1 and len(tasks) >= 32:
         import multiprocessing as _mpc

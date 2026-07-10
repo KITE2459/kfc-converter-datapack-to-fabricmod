@@ -172,7 +172,8 @@ def _fold_text(text: str, consts: dict) -> tuple[str, int]:
     return text, n
 
 
-def fold_const_scores(records: list, lines_map: dict, verbose: bool = True) -> dict:
+def fold_const_scores(records: list, lines_map: dict, verbose: bool = True,
+                      consts: dict | None = None) -> dict:
     """records 텍스트 제자리 폴딩. 반환 {"keys": n, "folded": n}.
 
     [성능] 종전엔 레코드마다 '키 48개 × 패턴 6개' 정규식이 전체 텍스트를 스캔했다
@@ -183,7 +184,8 @@ def fold_const_scores(records: list, lines_map: dict, verbose: bool = True) -> d
     적용 순서는 종전과 동일(consts 삽입 순서)이므로 산출물 바이트 동일."""
     if not FOLD_CONST_SCORES or not lines_map:
         return {"keys": 0, "folded": 0}
-    consts = analyze(lines_map)
+    if consts is None:
+        consts = analyze(lines_map)   # (백그라운드 사전 계산분이 있으면 재사용)
     if not consts:
         return {"keys": 0, "folded": 0}
     compiled = [(f'"{h}"', _compile_key(h, o, v)) for (h, o), v in consts.items()]

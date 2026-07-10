@@ -1424,6 +1424,14 @@ SIMPLE_RULES: dict[tuple, SimpleRule] = {
         java="if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _p) _p.setExperiencePoints({amount});",
         kind="native",
     ),
+    # me <action> — 바닐라 chat.type.emote("* %s %s") 브로드캐스트
+    ("me", "action"): SimpleRule(
+        args={"action": "jstr"},
+        java='source.getServer().getPlayerManager().broadcast('
+             'net.minecraft.text.Text.translatable("chat.type.emote", '
+             'source.getDisplayName(), net.minecraft.text.Text.literal({action})), false);',
+        kind="native",
+    ),
     # say <message> - 전체 브로드캐스트 (서버 소스 기준 mcfunction say 와 동등)
     ("say", "message"): SimpleRule(
         args={"message": "jstr"},
@@ -2201,6 +2209,40 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             em.kind = "native"; return True
         em.reason = "ride 형식 미지원"; return False
 
+    if command in ("msg", "tell", "w"):
+        m = first_arg(args, "message")
+        tgt = first_arg(args, "targets") or "@s"
+        if m is None:
+            em.reason = "msg 텍스트 없음"; return False
+        if "@" in m or "$(" in m:
+            em.reason = "msg 텍스트 내 셀렉터/매크로 미지원"; return False
+        return _fanout_target(
+            tgt, "_mgE",
+            lambda e: (f'if ({e} instanceof net.minecraft.server.network.ServerPlayerEntity _mp)'
+                       f' KfcGen.msgTo(source, _mp, {jstr(m)});'),
+            em, "msg")
+
+    if command == "teammsg":
+        m = first_arg(args, "message")
+        if m is None:
+            em.reason = "teammsg 텍스트 없음"; return False
+        if "@" in m or "$(" in m:
+            em.reason = "teammsg 텍스트 내 셀렉터/매크로 미지원"; return False
+        em.java.append(f'KfcGen.teamMsg(ctx, source, {jstr(m)});')
+        em.kind = "native"; return True
+
+    if command == "kick":
+        tgt = first_arg(args, "targets")
+        if not tgt:
+            em.reason = "kick 대상 없음"; return False
+        reason = first_arg(args, "reason")
+        rj = "null" if reason is None else jstr(reason)
+        return _fanout_target(
+            tgt, "_kkE",
+            lambda e: (f'if ({e} instanceof net.minecraft.server.network.ServerPlayerEntity _kp)'
+                       f' KfcGen.kickPlayer(_kp, {rj});'),
+            em, "kick")
+
     if command == "advancement":
         verb = nn[1] if len(nn) > 1 else None
         if verb not in ("grant", "revoke"):
@@ -2214,8 +2256,19 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                 lambda e: f'KfcGen.advancementAll(server, {e}, {grant});',
                 em, "advancement everything")
         if "only" not in nn:
-            scope = next((s for s in ("from", "through", "until") if s in nn), "?")
-            em.reason = f"advancement {verb} {scope} (범위 1차 미지원)"; return False
+            scope = next((s for s in ("from", "through", "until") if s in nn), None)
+            if scope is not None:
+                advid = first_arg(args, "advancement")
+                if not advid:
+                    em.reason = f"advancement {scope} id 없음"; return False
+                tgt = first_arg(args, "targets") or "@s"
+                grant = "true" if verb == "grant" else "false"
+                return _fanout_target(
+                    tgt, "_aas",
+                    lambda e: (f'KfcGen.advancementScope(server, {e}, '
+                               f'{jstr(advid)}, {jstr(scope)}, {grant});'),
+                    em, f"advancement {scope}")
+            em.reason = f"advancement {verb} (범위 미지원)"; return False
         advid = first_arg(args, "advancement")
         tgt = first_arg(args, "targets") or "@s"
         grant = "true" if verb == "grant" else "false"
@@ -2231,6 +2284,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         if verb not in ("give", "take"):
             em.reason = f"recipe {verb} 미지원"; return False
         rec = first_arg(args, "recipe")        # 레시피 id 또는 '*'(전체)
+        if rec is None and "*" in nn:
+            rec = "*"                          # '*' 는 리터럴 노드로 옴
         tgt = first_arg(args, "targets") or "@s"
         if rec is None:
             em.reason = "recipe id 없음"; return False

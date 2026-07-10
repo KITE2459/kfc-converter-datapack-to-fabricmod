@@ -818,6 +818,80 @@ public final class KfcGen {
         }
     }
 
+    /** advancement grant|revoke <t> from|until|through <id> — AdvancementCommand.Selection 동일:
+     *  from=자신+자손 전체, until=루트→자신 경로(자신 포함), through=합집합.
+     *  (부모 링크 대신 루트에서의 DFS 경로 탐색 — PlacedAdvancement.getChildren/getRoot 사용) */
+    public static void advancementScope(net.minecraft.server.MinecraftServer server,
+                                        net.minecraft.entity.Entity e,
+                                        String advId, String scope, boolean grant) {
+        if (!(e instanceof net.minecraft.server.network.ServerPlayerEntity p)) return;
+        net.minecraft.advancement.AdvancementEntry target =
+                server.getAdvancementLoader().get(net.minecraft.util.Identifier.of(advId));
+        if (target == null) return;
+        net.minecraft.advancement.PlacedAdvancement placed =
+                server.getAdvancementLoader().getManager().get(target);
+        if (placed == null) return;
+        java.util.LinkedHashSet<net.minecraft.advancement.AdvancementEntry> sel = new java.util.LinkedHashSet<>();
+        boolean up = !"from".equals(scope);      // until/through: 루트→자신 경로
+        boolean down = !"until".equals(scope);   // from/through: 자신+자손
+        if (up) {
+            java.util.ArrayDeque<net.minecraft.advancement.PlacedAdvancement> path = new java.util.ArrayDeque<>();
+            findPathTo(placed.getRoot(), target, path);
+            for (net.minecraft.advancement.PlacedAdvancement pa : path) sel.add(pa.getAdvancementEntry());
+        }
+        if (down) collectDescendants(placed, sel);
+        for (net.minecraft.advancement.AdvancementEntry adv : sel) {
+            for (String c : adv.value().criteria().keySet()) {
+                if (grant) p.getAdvancementTracker().grantCriterion(adv, c);
+                else       p.getAdvancementTracker().revokeCriterion(adv, c);
+            }
+        }
+    }
+    private static boolean findPathTo(net.minecraft.advancement.PlacedAdvancement node,
+                                      net.minecraft.advancement.AdvancementEntry target,
+                                      java.util.ArrayDeque<net.minecraft.advancement.PlacedAdvancement> path) {
+        path.addLast(node);
+        if (node.getAdvancementEntry() == target) return true;
+        for (net.minecraft.advancement.PlacedAdvancement ch : node.getChildren())
+            if (findPathTo(ch, target, path)) return true;
+        path.removeLast();
+        return false;
+    }
+    private static void collectDescendants(net.minecraft.advancement.PlacedAdvancement node,
+                                           java.util.Set<net.minecraft.advancement.AdvancementEntry> out) {
+        out.add(node.getAdvancementEntry());
+        for (net.minecraft.advancement.PlacedAdvancement ch : node.getChildren())
+            collectDescendants(ch, out);
+    }
+
+    /** msg/tell/w — 바닐라 incoming/outgoing 중 수신측(incoming) 표기: 회색 이탤릭 귓속말. */
+    public static void msgTo(net.minecraft.server.command.ServerCommandSource src,
+                             net.minecraft.server.network.ServerPlayerEntity to, String text) {
+        to.sendMessage(net.minecraft.text.Text.translatable("commands.message.display.incoming",
+                src.getDisplayName(), net.minecraft.text.Text.literal(text))
+                .formatted(net.minecraft.util.Formatting.GRAY, net.minecraft.util.Formatting.ITALIC));
+    }
+
+    /** teammsg — 실행자 팀 전원에게 chat.type.team.text 형식 전송(팀 없으면 no-op=바닐라 실패). */
+    public static void teamMsg(GameContext ctx, net.minecraft.server.command.ServerCommandSource src, String text) {
+        net.minecraft.entity.Entity e = src.getEntity();
+        if (e == null) return;
+        net.minecraft.scoreboard.Team t = ctx.scoreboard.getScoreHolderTeam(e.getNameForScoreboard());
+        if (t == null) return;
+        net.minecraft.text.Text msg = net.minecraft.text.Text.translatable("chat.type.team.text",
+                t.getFormattedName(), src.getDisplayName(), net.minecraft.text.Text.literal(text));
+        java.util.Collection<String> members = t.getPlayerList();
+        for (net.minecraft.server.network.ServerPlayerEntity mp : ctx.allPlayers)
+            if (members.contains(mp.getNameForScoreboard())) mp.sendMessage(msg);
+    }
+
+    /** kick <player> [<reason>] */
+    public static void kickPlayer(net.minecraft.server.network.ServerPlayerEntity p, String reason) {
+        p.networkHandler.disconnect(reason == null
+                ? net.minecraft.text.Text.translatable("multiplayer.disconnect.kicked")
+                : net.minecraft.text.Text.literal(reason));
+    }
+
     /** forceload add <fromX> <fromZ> [toX] [toZ] — 블록좌표 사각형이 덮는 청크 전부 강제로드. */
     public static void forceloadAdd(net.minecraft.server.world.ServerWorld world,
                                     int fx, int fz, int tx, int tz) {

@@ -53,9 +53,40 @@ def _strip_str_contents(text: str) -> str:
             if ch=='"': ins=True
     return ''.join(out)
 
+def _strip_noncode(text: str) -> str:
+    """문자열 '내용' + 주석(// 및 /* */)을 제거한 코드 골격.
+    [근거] 둘 다 바이트코드 0바이트: 문자열 내용은 상수풀로, 주석은 아예 클래스파일에
+    없다. 종전 근사는 주석을 코드로 세어, 62KB 원본 명령을 그대로 담은 `// 주석` 한 줄
+    때문에 소환 2줄짜리 모델 함수(lpeng/cutscene 계열 156개)를 과잉 브릿지했다.
+    문자열 상태를 먼저 판정하므로 문자열 안의 `//`(URL 등)는 주석으로 오인하지 않는다."""
+    out = []; ins = False; esc = False; lc = False; bc = False
+    i = 0; n = len(text); prev = ''
+    while i < n:
+        ch = text[i]
+        if lc:
+            if ch == '\n':
+                lc = False; out.append(ch)
+        elif bc:
+            if prev == '*' and ch == '/':
+                bc = False; prev = ''; i += 1; continue
+        elif ins:
+            if esc: esc = False
+            elif ch == '\\': esc = True
+            elif ch == '"':
+                ins = False; out.append('"')
+        else:
+            if ch == '/' and i + 1 < n and text[i+1] == '/':
+                lc = True; i += 2; prev = ''; continue
+            if ch == '/' and i + 1 < n and text[i+1] == '*':
+                bc = True; i += 2; prev = ''; continue
+            out.append(ch)
+            if ch == '"': ins = True
+        prev = ch; i += 1
+    return ''.join(out)
+
 def _bc_proxy_size(text: str) -> int:
-    """문자열 내용 제외 소스 바이트 — 메서드 바이트코드 상한의 보수적 근사."""
-    return len(_strip_str_contents(text).encode("utf-8"))
+    """문자열 내용·주석 제외 소스 바이트 — 메서드 바이트코드 상한의 보수적 근사."""
+    return len(_strip_noncode(text).encode("utf-8"))
 
 # javac Code 속성 한계(65535B)는 '메서드별'이며, seg 분할이 이미 메서드를 잘게 쪼개므로
 # 오버사이즈 판정도 메서드별이어야 한다(클래스 총합 기준은 seg 이후 과잉 브릿지).
@@ -99,7 +130,9 @@ def _oversized(text: str) -> bool:
         return True
     if _bc_proxy_max_method(text) > METHOD_BC_CAP:
         return True
-    pool = len(set(_LIT_STR_RE.findall(text))) + len(set(_LIT_NUM_RE.findall(text)))
+    # 상수풀 근사: 문자열 리터럴은 원문에서(내용 무관 1엔트리), 수치 리터럴은 주석·문자열
+    # 내용을 제외한 코드 골격에서만 센다(주석 속 행렬 숫자 등 가짜 엔트리 방지).
+    pool = len(set(_LIT_STR_RE.findall(text))) + len(set(_LIT_NUM_RE.findall(_strip_noncode(text))))
     return pool > CONST_POOL_GUARD
 CLASS_CAP = 600 * 1024
 
@@ -796,6 +829,7 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
        리터럴일 때만 승격(부분 승격 시 매칭 오버로드 없음). 리터럴 아닌 인자(매크로/동적)는 원판 유지."""
     seq = start_seq; n = 0
     # (needle, 허용 인자수 집합|None, [(arg_idx, ftype, parse_fn, prefix), ...])
+    _OBJR = ("KfcGen.ObjRef", "KfcGen.objRef", "KFC_OBJ_")
     specs = [
         ("KfcGen.entityMergeSnbt(", {2}, [
             (1, "net.minecraft.nbt.NbtCompound", "KfcGen.snbtCompound", "KFC_NBTC_")]),
@@ -805,6 +839,19 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
             (1, "net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>",
              "KfcGen.soundEvent", "KFC_SND_"),
             (2, "net.minecraft.sound.SoundCategory", "KfcGen.soundCat", "KFC_SCAT_")]),
+        # ── objective 핸들 승격: 상수 objective 이름 → static final ObjRef ──
+        # 호출당 sb.getNullableObjective(문자열 해시+맵 조회) → 세대검사 1회 + 필드 참조.
+        # 리터럴 인자만 승격(매크로/동적 objective 는 String 판 유지). opScore 는 두
+        # objective 가 전부 리터럴일 때만(원자성 — 부분 승격 시 매칭 오버로드 없음).
+        ("KfcGen.scoreMatches(",       {5}, [(2, *_OBJR)]),
+        ("KfcGen.scoreMatchesEntity(", {5}, [(2, *_OBJR)]),
+        ("KfcGen.readScoreEnt(",       {3}, [(2, *_OBJR)]),
+        ("KfcGen.readScore(",          {3}, [(2, *_OBJR)]),
+        ("KfcGen.getScore(",           {3}, [(2, *_OBJR)]),
+        ("KfcGen.getScoreOfEntity(",   {3}, [(2, *_OBJR)]),
+        ("KfcGen.setScore(",           {4}, [(2, *_OBJR)]),
+        ("KfcGen.addScore(",           {4}, [(2, *_OBJR)]),
+        ("KfcGen.opScore(",            {6}, [(2, *_OBJR), (5, *_OBJR)]),
     ]
 
     def _field_for(ftype, pfn, prefix, lit_s):

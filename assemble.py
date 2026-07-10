@@ -180,9 +180,23 @@ ENTITY_TAG_CSE = True   # 회귀 시 즉시 차단용 단일 토글
 #   · advancement(보상 함수 실행 가능), summon/kill/damage 류(통계·criteria 유발 가능성)
 # 쓰기의 표적 무효화: 리터럴 (h,o) 쓰기는 그 키만, 동적 홀더 쓰기는 그 objective 전체.
 SCORE_READ_CSE = True   # 회귀 시 즉시 차단용 토글
+# ── 스코어 store-to-load 포워딩 ──
+# 무조건부 단일문 `KfcGen.setScore(sb, "H", "O", <정수리터럴>);` 이후, 그 키가 무효화되기
+# 전까지의 읽기(scoreMatches/getScore, 리터럴 홀더)를 쓴 값 그대로 인라인한다.
+#   · store 자체는 유지(다른 함수/바닐라가 나중에 읽을 수 있음) — 읽기만 값으로 대체.
+#   · set 직후는 '반드시 설정됨' → scoreMatches 는 순수 범위비교(javac 상수 접힘),
+#     getScore(readOrZero) 는 리터럴 그 자체. mcfunction 의 미설정 시맨틱과 무관해짐.
+#   · 무효화는 read-CSE 와 동일 규칙(_score_effects/_scr_apply_inv) 공유 — 그 키를 쓸 수
+#     있는 호출/브릿지/동적 홀더에서 즉시 폐기(fail-closed).
+#   · 수제 포팅의 "값이 스코어보드가 아닌 자바 로컬로 흐르는" 구조의 자동화 버전.
+SCORE_STORE_FORWARD = True
 _SCR_LIT = r'"(?:[^"\\]|\\.)*"'
 _SCR_INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
 _SCR_ARG = rf'(?:{_SCR_LIT}|KfcGen\.nameOf\([^()]*\)|\([^()]*(?:\([^()]*\))?[^()]*\)|[^,()]+)'
+_SCR_LITSET_RE = re.compile(
+    r'^\s*KfcGen\.setScore\(sb, (' + _SCR_LIT + r'), (' + _SCR_LIT + r'), (-?\d+)\);\s*$')
+_SCR_LITADD_RE = re.compile(
+    r'^\s*KfcGen\.addScore\(sb, (' + _SCR_LIT + r'), (' + _SCR_LIT + r'), (-?\d+)\);\s*$')
 _SCR_MATCH_RE = re.compile(rf'KfcGen\.scoreMatches\(sb, ({_SCR_LIT}), ({_SCR_LIT}), ({_SCR_INT}), ({_SCR_INT})\)')
 _SCR_GET_RE   = re.compile(rf'KfcGen\.getScore\(sb, ({_SCR_LIT}), ({_SCR_LIT})\)')
 _SCR_WRITE_RE = re.compile(rf'KfcGen\.(?:setScore|addScore|resetScore|enableTrigger)\(sb, ({_SCR_ARG}), ({_SCR_ARG})\s*[,)]')
@@ -1062,6 +1076,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     cse_set_cache: dict[str, str] = {}  # full-set expr -> _esetN (재사용 구간 내 1회 수집)
     cse_tag_cache: dict[str, str] = {}  # 태그스캔 expr -> _tselN (태그/멤버 변동 전까지 배리어 관통)
     scr_cache: dict[tuple, str] = {}    # (holder,obj) -> _svN (그 키를 쓰기 전까지 재사용)
+    scr_lit: dict[tuple, int] = {}      # (holder,obj) -> 마지막 무조건부 리터럴 set 값 (store→load 포워딩)
     cse_tag_tags: dict[str, tuple] = {}  # _tselN 이 의존하는 (pos, neg) 태그집합
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
     reused_tags = _find_reused_tag_exprs(emitted) if ENTITY_TAG_CSE else set()
@@ -1089,6 +1104,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             cse_set_cache.clear()
             cse_tag_cache.clear(); cse_tag_tags.clear()  # _tsel 은 세그먼트 지역변수 → 경계 못 넘음
             scr_cache.clear()                            # _sv 도 세그먼트 지역변수
+            scr_lit.clear()                              # 포워딩 값도 무효화 규칙 단일화
             seg_acc = 0
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
@@ -1170,9 +1186,41 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 _nj2.append(_CSE_TAG_RE.sub(_repl_tag, line))
             new_java = _nj2
 
+        # 이 명령의 점수 캐시 영향(read-CSE·store-forward 공용).
+        scr_eff = _score_effects(em) if (SCORE_READ_CSE or SCORE_STORE_FORWARD) else None
+
+        # ── 스코어 store-to-load 포워딩: 직전 무조건부 리터럴 set 값이 살아있는 키의
+        #    읽기를 리터럴로 인라인(스토어는 유지). set 직후는 '반드시 설정됨'이므로
+        #    scoreMatches=순수 범위비교(javac 상수 접힘), getScore=리터럴 그 자체.
+        #    read-CSE 보다 먼저 적용해야 함(치환된 자리는 CSE 대상에서 자연 제외). ──
+        if SCORE_STORE_FORWARD and scr_lit:
+            def _fwd_written(k):
+                if scr_eff is None:
+                    return True                # 미지 쓰기 = 이 em 동안 라이브 유지
+                return (k in scr_eff) or (("OBJ", k[1]) in scr_eff) or (("HLD", k[0]) in scr_eff)
+            def _fwd_sm(m):
+                k = (m.group(1), m.group(2))
+                v = scr_lit.get(k)
+                if v is None or _fwd_written(k):
+                    return m.group(0)
+                return f"({v} >= {m.group(3)} && {v} <= {m.group(4)})"
+            def _fwd_sg(m):
+                k = (m.group(1), m.group(2))
+                v = scr_lit.get(k)
+                if v is None or _fwd_written(k):
+                    return m.group(0)
+                return f"({v})"
+            _njf = []
+            for line in new_java:
+                if line.lstrip().startswith("//"):
+                    _njf.append(line); continue
+                line = _SCR_MATCH_RE.sub(_fwd_sm, line)
+                line = _SCR_GET_RE.sub(_fwd_sg, line)
+                _njf.append(line)
+            new_java = _njf
+
         # 스코어 read CSE: 리터럴 (holder,obj) 반복 읽기를 _svN(Integer·nullable) 1회 읽기로.
         # 무효화는 아래 _score_effects 결과로 정밀 처리(그 키/objective 를 쓰는 지점에서만).
-        scr_eff = _score_effects(em) if SCORE_READ_CSE else None
         if SCORE_READ_CSE and reused_scores:
             # [정확성] 같은 명령(em)이 그 키를 '쓰는' 경우 그 키의 읽기는 호이스트하지 않는다.
             # 이유: `execute store result ... run scoreboard players add/set/remove/operation`
@@ -1265,6 +1313,21 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                         el = cse_tag_tags.get(e, (frozenset(), frozenset(), False))
                         if (el[0] & mtags) or (el[1] & mtags) or (mmove and not el[2]):
                             cse_tag_cache.pop(e, None); cse_tag_tags.pop(e, None)
+        # 포워딩 값 갱신 후보 감지(무효화 '이전' 값 기준 — addScore 누적은 옛 값 필요)
+        _fwd_pending = None
+        if SCORE_STORE_FORWARD:
+            _cl = [l for l in em.java if l.strip() and not l.lstrip().startswith("//")]
+            if len(_cl) == 1:
+                _mset = _SCR_LITSET_RE.match(_cl[0])
+                if _mset:
+                    _fwd_pending = ((_mset.group(1), _mset.group(2)), int(_mset.group(3)))
+                else:
+                    _madd = _SCR_LITADD_RE.match(_cl[0])
+                    if _madd:
+                        _ak = (_madd.group(1), _madd.group(2))
+                        if _ak in scr_lit:      # 알던 값에만 누적(미지 기저값이면 미기록)
+                            _fwd_pending = (_ak, scr_lit[_ak] + int(_madd.group(3)))
+
         # 스코어 캐시 무효화(치환 뒤 적용 — 같은 줄의 읽기는 쓰기 '이전' 값이 맞다: 조건이 run 보다 먼저)
         if SCORE_READ_CSE and scr_cache:
             if scr_eff is None:
@@ -1274,6 +1337,15 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 if _reassigns_source("\n".join(em.java)):   # 실행자 변경 → @EXEC 무효화(배리어)
                     for _k in [k for k in scr_cache if k[0] == "@EXEC"]:
                         scr_cache.pop(_k, None)
+        # 포워딩 값도 동일 규칙으로 무효화 후, 이 em 의 쓰기 값을 기록
+        if SCORE_STORE_FORWARD:
+            if scr_lit:
+                if scr_eff is None:
+                    scr_lit.clear()
+                else:
+                    _scr_apply_inv(scr_lit, scr_eff)
+            if _fwd_pending is not None:
+                scr_lit[_fwd_pending[0]] = _fwd_pending[1]
 
         if em.terminal:
             hit_terminal = True       # 이후 줄은 도달불가 → 주석 처리

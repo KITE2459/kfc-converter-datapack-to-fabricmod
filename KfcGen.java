@@ -100,6 +100,35 @@ public final class KfcGen {
         return out;
     }
 
+    // ──────────────── objective 핸들 캐시 (ObjRef) ────────────────
+    // 모든 점수 헬퍼는 호출마다 sb.getNullableObjective(이름)(문자열 해시+맵 조회)을 탔다
+    // (kartall 실측 점수 호출부 18만+). objective 는 사실상 load 때 만들고 이후 불변이므로,
+    // 상수 objective 이름을 클래스 static final ObjRef 로 승격(merge_pass pass-4)하고
+    // 세대(OBJ_GEN) 검사 한 번으로 재사용한다.
+    // 무효화(OBJ_GEN++) 지점 — objective 집합이 바뀔 수 있는 모든 경로:
+    //   · ensureObjective 실제 추가 / removeObjective 실제 제거 (우리 코드의 유일한 변경점)
+    //   · 브릿지/디스패처(instantExecute*): 바닐라가 objectives add/remove 가능
+    //   · 서버 틱 변경(getOrCreateContext에서 감지): 콘솔/플레이어 명령·바닐라 함수 등
+    //     우리 코드 밖에서 벌어진 변경은 다음 우리-코드 진입 시점(틱 단위)에 재해소.
+    //     (우리 코드 실행 중에는 외부 명령이 인터리브되지 않는다 — 단일 스레드 tick.)
+    static long OBJ_GEN = 0;
+    private static int OBJ_TICK = Integer.MIN_VALUE;
+    public static final class ObjRef {
+        final String name;
+        net.minecraft.scoreboard.ScoreboardObjective obj;
+        long gen = -1;
+        ObjRef(String name) { this.name = name; }
+    }
+    /** merge_pass 승격 필드 초기화용. */
+    public static ObjRef objRef(String name) { return new ObjRef(name); }
+    private static ScoreboardObjective obj(ServerScoreboard sb, ObjRef r) {
+        if (r.gen != OBJ_GEN) {
+            r.obj = sb.getNullableObjective(r.name);
+            r.gen = OBJ_GEN;
+        }
+        return r.obj;
+    }
+
     // ──────────────── 실행 컨텍스트 (구 kfcutil 통합) ────────────────
     // 생성 코드가 ctx.world / ctx.scoreboard / ctx.allPlayers / ctx.server 를 쓴다.
     public static final class GameContext {
@@ -123,6 +152,8 @@ public final class KfcGen {
         GameContext c = CTX_CACHE;
         net.minecraft.server.MinecraftServer s = src.getServer();
         if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
+        int t = s.getTicks();
+        if (t != OBJ_TICK) { OBJ_TICK = t; OBJ_GEN++; }   // 외부(콘솔/바닐라) objective 변경 재해소
         return c;
     }
 
@@ -1678,11 +1709,12 @@ public final class KfcGen {
                         .orElse(net.minecraft.scoreboard.ScoreboardCriterion.DUMMY);
         sb.addObjective(name, crit, net.minecraft.text.Text.literal(name),
                 crit.getDefaultRenderType(), false, null);
+        OBJ_GEN++;   // 같은 이름의 'null 캐시' ObjRef 재해소
     }
 
     public static void removeObjective(ServerScoreboard sb, String name) {
         net.minecraft.scoreboard.ScoreboardObjective o = sb.getNullableObjective(name);
-        if (o != null) sb.removeObjective(o);
+        if (o != null) { sb.removeObjective(o); OBJ_GEN++; }
     }
 
     /** scoreboard objectives add/modify 의 displayname(Text) 설정. */
@@ -2762,6 +2794,7 @@ public final class KfcGen {
         try {
             source.getServer().getCommandManager().executeWithPrefix(source, command);
             ENTITY_GEN++;   // 디스패처 실행이 summon/kill 했을 수 있으므로 스냅샷 무효화
+            OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
         } catch (Exception ex) {
             System.err.println("[KFC-CMD] '" + command + "' : " + ex);
         }
@@ -2840,6 +2873,7 @@ public final class KfcGen {
                 context.run();
             });
             ENTITY_GEN++;   // 브릿지가 summon/kill 했을 수 있으므로 스냅샷/타입버킷 무효화(위 설명 참조)
+            OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
         } catch (Exception ex) {
             System.err.println("[KFC-BRIDGE-ERROR] " + functionId + ": " + ex);
         }
@@ -3031,6 +3065,96 @@ public final class KfcGen {
         ReadableScoreboardScore sc = sb.getScore(e, ob);
         if (sc == null) return null;
         return sc.getScore();
+    }
+
+    // ──────────────── ObjRef 오버로드 (merge_pass pass-4 가 상수 objective 를 승격) ────────────────
+    // String 판과 시맨틱 완전 동일 — objective 해소만 캐시(obj(sb, ref)) 경유.
+    public static boolean scoreMatches(ServerScoreboard sb, String holder, ObjRef o,
+                                       Integer min, Integer max) {
+        Integer v = readScore(sb, holder, o);
+        if (v == null) return false;
+        if (min != null && v < min) return false;
+        if (max != null && v > max) return false;
+        return true;
+    }
+    public static boolean scoreMatches(ServerScoreboard sb, String holder, ObjRef o, int min, int max) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return false;
+        ReadableScoreboardScore sc = sb.getScore(holderOf(holder), ob);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        return v >= min && v <= max;
+    }
+    public static boolean scoreMatchesEntity(ServerScoreboard sb, net.minecraft.entity.Entity e,
+                                             ObjRef o, int min, int max) {
+        if (e == null) return false;
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return false;
+        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        return v >= min && v <= max;
+    }
+    public static Integer readScoreEnt(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
+        if (e == null) return null;
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return null;
+        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        if (sc == null) return null;
+        return sc.getScore();
+    }
+    public static Integer readScore(ServerScoreboard sb, String holder, ObjRef o) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return null;
+        ReadableScoreboardScore s = sb.getScore(holderOf(holder), ob);
+        return s == null ? null : s.getScore();
+    }
+    public static int getScore(ServerScoreboard sb, String holder, ObjRef o) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return 0;
+        ReadableScoreboardScore s = sb.getScore(holderOf(holder), ob);
+        return s == null ? 0 : s.getScore();
+    }
+    public static int getScoreOfEntity(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
+        if (e == null) return 0;
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return 0;
+        ReadableScoreboardScore s = sb.getScore(e, ob);
+        return s == null ? 0 : s.getScore();
+    }
+    public static void setScore(ServerScoreboard sb, String holder, ObjRef o, int v) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return;
+        sb.getOrCreateScore(holderOf(holder), ob).setScore(v);
+    }
+    public static void addScore(ServerScoreboard sb, String holder, ObjRef o, int n) {
+        ScoreboardObjective ob = obj(sb, o);
+        if (ob == null) return;
+        net.minecraft.scoreboard.ScoreAccess a = sb.getOrCreateScore(holderOf(holder), ob);
+        a.setScore(a.getScore() + n);
+    }
+    public static void opScore(ServerScoreboard sb, String dh, ObjRef dobj, String op,
+                               String sh, ObjRef sobj) {
+        // String 판 opScore 와 동일: 대상·소스 getOrCreateScore(존재화 부수효과 포함)
+        ScoreboardObjective od = obj(sb, dobj), os = obj(sb, sobj);
+        if (od == null || os == null) return;
+        net.minecraft.scoreboard.ScoreAccess da = sb.getOrCreateScore(holderOf(dh), od);
+        net.minecraft.scoreboard.ScoreAccess sa = sb.getOrCreateScore(holderOf(sh), os);
+        int b = sa.getScore();
+        int r;
+        switch (op) {
+            case "=":  r = b; break;
+            case "+=": r = da.getScore() + b; break;
+            case "-=": r = da.getScore() - b; break;
+            case "*=": r = da.getScore() * b; break;
+            case "/=": if (b == 0) return; r = Math.floorDiv(da.getScore(), b); break;
+            case "%=": if (b == 0) return; r = Math.floorMod(da.getScore(), b); break;
+            case "<":  { int a = da.getScore(); r = Math.min(a, b); break; }
+            case ">":  { int a = da.getScore(); r = Math.max(a, b); break; }
+            case "><": { int a = da.getScore(); da.setScore(b); sa.setScore(a); return; }
+            default: return;
+        }
+        da.setScore(r);
     }
 
     /** if score <a> OP <b> (비교형). 둘 중 하나라도 값 없으면 false(=mcfunction 시맨틱). */

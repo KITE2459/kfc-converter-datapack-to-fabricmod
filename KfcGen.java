@@ -1440,12 +1440,34 @@ public final class KfcGen {
         playSound(p, soundId, category, pos.x, pos.y, pos.z, vol, pitch);
     }
 
+    /** String 판 minVolume 오버로드 — 조회 캐시 후 완전 미러 코어로 위임. */
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 String soundId, String category,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch, float minVol) {
+        if (p == null || pos == null) return;
+        playSound(p, soundEventCached(soundId), soundCatCached(category),
+                  pos.x, pos.y, pos.z, vol, pitch, minVol, p.getWorld().getRandom().nextLong());
+    }
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 String soundId, String category,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch, float minVol, long seed) {
+        if (p == null || pos == null) return;
+        playSound(p, soundEventCached(soundId), soundCatCached(category),
+                  pos.x, pos.y, pos.z, vol, pitch, minVol, seed);
+    }
+
     public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
                                  String soundId, String category,
                                  double x, double y, double z, float vol, float pitch) {
         if (p == null) return;
-        net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev =
-                SOUND_CACHE.computeIfAbsent(soundId, sid -> {
+        // minVolume 0 = 종전 시그니처 시맨틱(범위 밖 미재생은 클라 감쇠와 가청 동일, 패킷만 절약)
+        playSound(p, soundEventCached(soundId), soundCatCached(category),
+                  x, y, z, vol, pitch, 0.0f, p.getWorld().getRandom().nextLong());
+    }
+
+    private static net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>
+            soundEventCached(String soundId) {
+        return SOUND_CACHE.computeIfAbsent(soundId, sid -> {
             net.minecraft.util.Identifier id = idOf(
                     sid.contains(":") ? sid : "minecraft:" + sid);
             net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
@@ -1454,20 +1476,17 @@ public final class KfcGen {
             return net.minecraft.registry.entry.RegistryEntry.of(
                     e != null ? e : net.minecraft.sound.SoundEvent.of(id));  // 미등록도 id 그대로 재생(바닐라 허용)
         });
-        net.minecraft.sound.SoundCategory cat = SOUND_CAT_CACHE.computeIfAbsent(category, c -> {
-            // /playsound 의 source 인자명(record/block/player)은 SoundCategory enum 상수명
-            // (RECORDS/BLOCKS/PLAYERS)과 다르다. valueOf(c.toUpperCase()) 는 이 셋에서
-            // IllegalArgumentException 이 나 catch 의 MASTER 로 폴백됐다
-            // = record 카테고리 BGM 이 master 슬라이더로 조절되는 버그.
-            // 바닐라처럼 getName()(=인자명)으로 매칭한다(바로 위 stopSound 와 동일 방식).
+    }
+
+    private static net.minecraft.sound.SoundCategory soundCatCached(String category) {
+        return SOUND_CAT_CACHE.computeIfAbsent(category, c -> {
+            // /playsound 의 source 인자명(record/block/player)은 SoundCategory enum 상수명과 다르다
+            // — 바닐라처럼 getName()(=인자명)으로 매칭, 미매칭 = MASTER.
             for (net.minecraft.sound.SoundCategory sc : net.minecraft.sound.SoundCategory.values()) {
                 if (sc.getName().equalsIgnoreCase(c)) return sc;
             }
             return net.minecraft.sound.SoundCategory.MASTER;
         });
-        p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
-                ev, cat,
-                x, y, z, vol, pitch, p.getWorld().getRandom().nextLong()));
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -1503,15 +1522,63 @@ public final class KfcGen {
         playSound(p, ev, cat, pos.x, pos.y, pos.z, vol, pitch);
     }
 
-    /** pre-parsed 오버로드(x,y,z) — 파싱/조회만 생략, 패킷 전송은 String 판과 완전 동일. */
+    /** pre-parsed 오버로드(x,y,z) — minVolume 없는 종전 시그니처(= minVolume 0). */
     public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
                                  net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
                                  net.minecraft.sound.SoundCategory cat,
                                  double x, double y, double z, float vol, float pitch) {
         if (p == null) return;
+        playSound(p, ev, cat, x, y, z, vol, pitch, 0.0f, p.getWorld().getRandom().nextLong());
+    }
+
+    // ── /playsound 완전 미러 (PlaySoundCommand.execute 와 동일) ──
+    // 가청 반경 = (vol > 1 ? vol*16 : 16). 범위 안: 지정 좌표·지정 볼륨으로 재생.
+    // 범위 밖: minVolume ≤ 0 이면 미재생(패킷 자체를 안 보냄 — 바닐라 동일, 종전의
+    // '무조건 전송'도 클라이언트 감쇠로 가청 결과는 같았으나 이제 패킷도 절약),
+    // minVolume > 0 이면 '플레이어 위치 + 소리방향 단위벡터×2' 지점에서 minVolume 으로 재생.
+    // seed: 바닐라는 명령 실행 1회당 난수 시드 1개를 전 대상에 공유(랜덤 변형 동일) —
+    // 다중 대상 루프는 emit 이 시드를 루프 밖에서 1회 뽑아 전달한다.
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch, float minVol) {
+        if (p == null || pos == null) return;
+        playSound(p, ev, cat, pos.x, pos.y, pos.z, vol, pitch, minVol, p.getWorld().getRandom().nextLong());
+    }
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 net.minecraft.util.math.Vec3d pos, float vol, float pitch, float minVol, long seed) {
+        if (p == null || pos == null) return;
+        playSound(p, ev, cat, pos.x, pos.y, pos.z, vol, pitch, minVol, seed);
+    }
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 double x, double y, double z, float vol, float pitch, float minVol) {
+        if (p == null) return;
+        playSound(p, ev, cat, x, y, z, vol, pitch, minVol, p.getWorld().getRandom().nextLong());
+    }
+    public static void playSound(net.minecraft.server.network.ServerPlayerEntity p,
+                                 net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
+                                 net.minecraft.sound.SoundCategory cat,
+                                 double x, double y, double z, float vol, float pitch, float minVol, long seed) {
+        if (p == null) return;
+        double lim = vol > 1.0f ? (double) (vol * 16.0f) : 16.0;
+        double dx = x - p.getX(), dy = y - p.getY(), dz = z - p.getZ();
+        double d2 = dx * dx + dy * dy + dz * dz;
+        double sx = x, sy = y, sz = z;
+        float v = vol;
+        if (d2 > lim * lim) {
+            if (minVol <= 0.0f) return;             // 바닐라: 범위 밖 + minVolume 0 = 미재생
+            double dist = Math.sqrt(d2);
+            sx = p.getX() + dx / dist * 2.0;        // 플레이어 위치 + 소리방향×2 (바닐라 동일)
+            sy = p.getY() + dy / dist * 2.0;
+            sz = p.getZ() + dz / dist * 2.0;
+            v = minVol;
+        }
         p.networkHandler.sendPacket(new net.minecraft.network.packet.s2c.play.PlaySoundS2CPacket(
-                ev, cat,
-                x, y, z, vol, pitch, p.getWorld().getRandom().nextLong()));
+                ev, cat, sx, sy, sz, v, pitch, seed));
     }
 
     /** on vehicle — source 의 엔티티를 그 탈것으로 재바인딩(없으면 null 소스 표식). */

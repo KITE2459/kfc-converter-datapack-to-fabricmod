@@ -835,7 +835,7 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
             (1, "net.minecraft.nbt.NbtCompound", "KfcGen.snbtCompound", "KFC_NBTC_")]),
         ("KfcGen.storagePutSnbt(", {5}, [
             (3, "net.minecraft.nbt.NbtElement", "KfcGen.snbtValue", "KFC_NBTV_")]),
-        ("KfcGen.playSound(", {6, 8}, [   # (p, sound, cat, [Vec3d|x,y,z], vol, pitch)
+        ("KfcGen.playSound(", {6, 7, 8, 9, 10}, [   # (p, snd, cat, [Vec3d|xyz], vol, pitch[, minVol[, seed]])
             (1, "net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>",
              "KfcGen.soundEvent", "KFC_SND_"),
             (2, "net.minecraft.sound.SoundCategory", "KfcGen.soundCat", "KFC_SCAT_")]),

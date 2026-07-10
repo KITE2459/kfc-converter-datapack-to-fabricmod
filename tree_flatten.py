@@ -187,12 +187,15 @@ def _tag_fids(dp_src) -> set:
 
 
 def flatten_trees(records: list, src_root: Path, group: str, dp_src,
-                  tags: dict, fid_to_fqcn, verbose: bool = True) -> dict:
-    """records 를 제자리 수정(엔트리 교체·내부 노드 제거)하고 KfcTree 클래스를 디스크에 쓴다."""
+                  tags: dict, fid_to_fqcn, verbose: bool = True,
+                  lines_map: dict | None = None) -> dict:
+    """records 를 제자리 수정(엔트리 교체·내부 노드 제거)하고 KfcTree 클래스를 디스크에 쓴다.
+       lines_map 을 주면 데이터팩 재스캔을 생략(convert 가 pass-2.8 과 공유)."""
     src_root = Path(src_root)
     stats = {"clusters": 0, "nodes": 0, "removed": 0, "entries": 0, "skipped": 0}
 
-    lines_map = collect_function_lines(dp_src)
+    if lines_map is None:
+        lines_map = collect_function_lines(dp_src)
     if not lines_map:
         return stats
 

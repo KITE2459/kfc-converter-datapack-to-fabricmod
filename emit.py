@@ -2838,10 +2838,18 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     pos = first_arg(args, "pos") or "~ ~ ~"
     vol = first_arg(args, "volume")
     pitch = first_arg(args, "pitch")
+    minvol = first_arg(args, "minVolume")
     vol = vol if vol is not None else "1"
     pitch = pitch if pitch is not None else "1"
+    minvol = minvol if minvol is not None else "0"
     if not sound or not holder:
         em.reason = "playsound 인자 부족"
+        return False
+    try:
+        _mv = float(minvol)
+    except ValueError:
+        # 매크로/비상수 minVolume — 시맨틱 무시(종전 동작)는 고증 위반이므로 함수 폴백
+        em.reason = f"playsound minVolume({minvol[:20]}) 비상수"
         return False
     pe = cond_pos_expr(pos)
     if pe is None:
@@ -2851,13 +2859,23 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "p", "r", "s"):
         em.reason = f"playsound 셀렉터({holder[:25]}) 미지원(플레이어 한정)"
         return False
-    call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
-            f'{pe}, {jfloat(vol)}, {jfloat(pitch)});')
+    # minVolume 시맨틱(바닐라 PlaySoundCommand): 가청 반경(vol>1?vol*16:16) 밖 대상은
+    # minVolume ≤ 0 이면 미재생, > 0 이면 '플레이어 위치+소리방향×2'에서 minVolume 으로 재생.
+    # KfcGen.playSound minVolume 오버로드가 완전 미러 — 0 이면 종전 시그니처(무변화) 유지.
+    _mv_arg = f', {jfloat(minvol)}' if _mv != 0.0 else ''
     if sel.base == "s":
+        call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
+                f'{pe}, {jfloat(vol)}, {jfloat(pitch)}{_mv_arg});')
         em.java.append('if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _ps) '
                        + call)
         em.kind = "native"
         return True
+    # 다중 대상: 바닐라는 명령 실행 1회당 난수 시드 1개를 전 대상에 공유(랜덤 변형 동일)
+    # → 시드를 루프 밖에서 1회 뽑아 전달한다.
+    _sd = _fresh_var("_sndSd")
+    em.java.append(f'long {_sd} = ctx.world.getRandom().nextLong();')
+    call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
+            f'{pe}, {jfloat(vol)}, {jfloat(pitch)}, {jfloat(minvol)}, {_sd});')
     em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
     conds = _tag_conds(sel, '_ps')
     _vc = _volume_cond(sel, "_ps")

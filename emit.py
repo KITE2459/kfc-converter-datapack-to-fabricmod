@@ -1535,6 +1535,36 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
     nodes, args = split_chain(chain)
     nn = [n["node"] for n in nodes]
 
+    # ---- 침묵 조회형(standalone) → 네이티브 no-op ----
+    # [근거] 함수는 침묵 소스(CommandFunctionManager withSilent — 바이트코드 확인)로 실행되어
+    # 조회형 명령의 유일한 효과(채팅 피드백)가 억제된다. 반환값이 필요한 자리는
+    # store/if/return 경로가 별도 처리하므로(여기 도달 = standalone) 관측효과가 없다.
+    _sq = None
+    if command in ("seed", "list"):
+        _sq = command
+    elif command == "locate":
+        _sq = "locate"                      # 탐색만 하고 상태 불변(피드백 억제) — no-op 가 더 빠름
+    elif command == "xp" and len(nn) > 1 and nn[1] == "query":
+        _sq = "xp query"
+    elif command == "time" and len(nn) > 1 and nn[1] == "query":
+        _sq = "time query"
+    elif command == "worldborder" and len(nn) > 1 and nn[1] == "get":
+        _sq = "worldborder get"
+    elif command == "scoreboard" and nn[1:3] == ["players", "get"]:
+        _sq = "scoreboard players get"
+    elif command == "tag" and len(nn) > 2 and nn[2] == "list":
+        _sq = "tag list"
+    elif command == "forceload" and len(nn) > 1 and nn[1] == "query":
+        _sq = "forceload query"
+    elif command == "data" and len(nn) > 1 and nn[1] == "get":
+        _sq = "data get"                    # 부수효과 없음(기존 브릿지 사유에도 명시)
+    elif command == "attribute" and nn and nn[-1] == "get" and not ({"set", "add", "remove"} & set(nn)):
+        _sq = "attribute get"
+    if _sq is not None:
+        em.java.append(f"// (침묵 조회) {_sq} — 함수 소스는 피드백 억제, standalone 은 관측효과 없음")
+        em.kind = "native"
+        return True
+
     # ---- 0) 선언적 규칙 테이블 (노드 경로 -> 템플릿) ----
     r = try_simple_rule(command, nn, args, em)
     if r is not None:
@@ -1592,6 +1622,39 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
         em.reason = f"time {verb} (query/형식 미지원)"
         return False
 
+    if command == "tick":
+        # tick rate <float> | tick freeze | tick unfreeze  (1.20.3+)
+        # [검증] yarn 1.21.5 바이트코드: TickCommand.executeRate → ServerTickManager.setTickRate(F)V,
+        # freeze/unfreeze → setFrozen(Z). server.getTickManager() 가 ServerTickManager 를 반환하므로
+        # 가상 디스패치로 바닐라와 동일 경로(클라이언트 동기화 포함). rate 인자 범위(1..10000)는
+        # 파서가 이미 강제(범위 밖은 파스 실패=trees 에 안 옴). step/sprint 은 1차 폴백.
+        sub = nn[1] if len(nn) > 1 else None
+        if sub == "rate":
+            r = first_arg(args, "rate")
+            if r is not None:
+                em.java.append(f"ctx.server.getTickManager().setTickRate({jfloat(r)});")
+                em.kind = "native"
+                return True
+        elif sub in ("freeze", "unfreeze"):
+            em.java.append(f"ctx.server.getTickManager().setFrozen({'true' if sub == 'freeze' else 'false'});")
+            em.kind = "native"
+            return True
+        elif sub == "step":
+            # tick step <time> | tick step stop  (yarn: ServerTickManager.step(I)Z / stopStepping)
+            tm = first_arg(args, "time")
+            if tm is not None:
+                em.java.append(f"ctx.server.getTickManager().step({jint(tm)});")
+                em.kind = "native"
+                return True
+        elif sub == "sprint":
+            tm = first_arg(args, "time")
+            if tm is not None:
+                em.java.append(f"ctx.server.getTickManager().startSprint({jint(tm)});")
+                em.kind = "native"
+                return True
+        em.reason = f"tick {sub} 미지원"
+        return False
+
     if command == "weather":
         wk = nn[1] if len(nn) > 1 else None
         if wk in ("clear", "rain", "thunder"):
@@ -1615,6 +1678,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
 
     if command == "difficulty":
         lvl = first_arg(args, "difficulty")
+        if lvl is None and len(nn) > 1 and nn[1] in ("peaceful", "easy", "normal", "hard"):
+            lvl = nn[1]                      # 리터럴 노드 형태(brigadier literal)
         if lvl is None:
             em.reason = "difficulty query(인자 없음) 미지원"; return False
         em.java.append(f"KfcGen.setDifficulty(server, {jstr(lvl)});")
@@ -1860,6 +1925,8 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
     if command == "particle":
         name = first_arg(args, "name")
         pos = first_arg(args, "pos")
+        if name and pos is None:
+            pos = "~ ~ ~"                    # 바닐라: pos 생략 = 소스 위치
         if not name or not pos:
             em.reason = "particle 인자 부족"
             return False
@@ -2056,6 +2123,18 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                     mem or "@s", "_tmE",
                     lambda e: f'KfcGen.teamLeave(sb, {e}.getNameForScoreboard());',
                     em, "team leave")
+            if verb == "empty":
+                tname = first_arg(args, "team")
+                if not tname:
+                    em.reason = "team empty 팀명 없음"; return False
+                em.java.append(f'KfcGen.teamEmpty(ctx, {jstr(tname)});')
+                em.kind = "native"; return True
+            if verb == "remove":
+                tname = first_arg(args, "team")
+                if not tname:
+                    em.reason = "team remove 팀명 없음"; return False
+                em.java.append(f'KfcGen.teamRemove(ctx, {jstr(tname)});')
+                em.kind = "native"; return True
             em.reason = f"team {verb} (1차 미지원)"; return False
         em.reason = f"team {verb} 미지원"; return False
 
@@ -3600,6 +3679,11 @@ def emit_bossbar(nn: list[str], args: dict, em: Emitted) -> bool:
         em.kind = "native"
         return True
 
+    if verb == "get":
+        em.java.append("// (침묵 조회) bossbar get — 함수 소스 피드백 억제, standalone 관측효과 없음")
+        em.kind = "native"
+        return True
+
     if verb == "set":
         prop = nn[3] if len(nn) > 3 else None
         if prop == "value":
@@ -3626,6 +3710,11 @@ def emit_bossbar(nn: list[str], args: dict, em: Emitted) -> bool:
                 return False
             em.java.append(f'KfcGen.bossbarSetName(source, {idj}, {jstr(name)});')
             em.kind = "native"; return True
+        if prop == "visible":
+            v = first_arg(args, "visible")
+            if v in ("true", "false"):
+                em.java.append(f'KfcGen.bossbarSetVisible(source, {idj}, {v});')
+                em.kind = "native"; return True
         if prop == "visible":
             vis = nn[4] if len(nn) > 4 else None       # true/false 리터럴
             if vis not in ("true", "false"):
@@ -3983,6 +4072,17 @@ def emit_scoreboard_objectives(nn: list[str], args: dict, em: Emitted) -> bool:
                 em.java.append(f'KfcGen.objectiveNumberFormatReset(sb, {jstr(name)});')
             em.kind = "native"
             return True
+        if "rendertype" in nn:
+            rt = "hearts" if "hearts" in nn else "integer"
+            em.java.append(f'KfcGen.objectiveRenderType(sb, {jstr(name)}, {jstr(rt)});')
+            em.kind = "native"
+            return True
+        if "displayautoupdate" in nn:
+            v = first_arg(args, "value")
+            if v in ("true", "false"):
+                em.java.append(f'KfcGen.objectiveDisplayAutoUpdate(sb, {jstr(name)}, {v});')
+                em.kind = "native"
+                return True
         em.reason = f"objectives modify {[n for n in nn if n not in ('scoreboard','objectives','modify')]} 1차 미지원"
         return False
     if verb == "setdisplay":
@@ -5878,6 +5978,15 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 conds.append(f'!({c})' if neg else c)
                 i = skip_after(nn, i, "block")
                 continue
+            elif sub == "dimension":
+                d = next_arg("dimension")
+                if not d:
+                    return ("UNS", [], "if dimension 인자 없음", [])
+                _did = d["raw"] if ":" in d["raw"] else "minecraft:" + d["raw"]
+                c = f'{cur_src}.getWorld().getRegistryKey().getValue().toString().equals({jstr(_did)})'
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "dimension")
+                continue
             else:
                 return ("UNS", [], f"if {sub} (미지원)", [])
         elif tok == "as":
@@ -6071,7 +6180,23 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
             cur_src = nv
             i = skip_after(nn, i, "anchor") if anchor else (i + 2)
             continue
-        elif tok in ("on", "in"):
+        elif tok == "in":
+            # [검증] ExecuteCommand: withWorld + DimensionType.getCoordinateScaleFactor 로
+            # x/z 만 스케일(y 불변). 미존재 차원 → null 소스(fork 사망 — nullable 전파).
+            d = next_arg("dimension")
+            if not d:
+                return ("UNS", [], "in 차원 인자 없음", [])
+            _did = d["raw"] if ":" in d["raw"] else "minecraft:" + d["raw"]
+            nv = f"kfcSrc{_uid()}"
+            _inx = f'KfcGen.inDimension({cur_src}, {jstr(_did)})'
+            if src_nullable:
+                _inx = f'({cur_src} == null ? null : {_inx})'
+            rebinds.append(f'ServerCommandSource {nv} = {_inx};')
+            cur_src = nv
+            src_nullable = True
+            i = skip_after(nn, i, "dimension")
+            continue
+        elif tok == "on":
             return ("UNS", [], f"{tok} (컨텍스트 수정자 - 1차 미지원)", [])
         elif tok == "store":
             return (conds, [], "__STORE__", _nullprop_rebinds(rebinds))

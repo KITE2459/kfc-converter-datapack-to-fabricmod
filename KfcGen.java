@@ -5578,6 +5578,50 @@ public final class KfcGen {
         net.minecraft.entity.boss.CommandBossBar b = bossbarGet(src, idStr);
         if (b != null) b.setName(bbText(src, nameJson, idStr));
     }
+    /** execute in <dim>: withWorld + x/z 좌표 스케일(y 불변) — ExecuteCommand 와 동일. */
+    public static net.minecraft.server.command.ServerCommandSource inDimension(
+            net.minecraft.server.command.ServerCommandSource src, String dimId) {
+        net.minecraft.registry.RegistryKey<net.minecraft.world.World> key =
+                net.minecraft.registry.RegistryKey.of(net.minecraft.registry.RegistryKeys.WORLD,
+                        net.minecraft.util.Identifier.of(dimId));
+        net.minecraft.server.world.ServerWorld w = src.getServer().getWorld(key);
+        if (w == null) return null;                       // 미존재 차원 — fork 사망
+        double f = net.minecraft.world.dimension.DimensionType.getCoordinateScaleFactor(
+                src.getWorld().getDimension(), w.getDimension());
+        net.minecraft.util.math.Vec3d p = src.getPosition();
+        return src.withWorld(w).withPosition(new net.minecraft.util.math.Vec3d(p.x * f, p.y, p.z * f));
+    }
+
+    /** team empty <team>: 전 구성원 제거(TeamCommand executeEmpty 와 동일). */
+    public static void teamEmpty(GameContext ctx, String name) {
+        net.minecraft.scoreboard.Team t = ctx.scoreboard.getTeam(name);
+        if (t == null) return;
+        for (String m : new java.util.ArrayList<>(t.getPlayerList()))
+            ctx.scoreboard.removeScoreHolderFromTeam(m, t);
+    }
+
+    /** team remove <team>. */
+    public static void teamRemove(GameContext ctx, String name) {
+        net.minecraft.scoreboard.Team t = ctx.scoreboard.getTeam(name);
+        if (t != null) ctx.scoreboard.removeTeam(t);
+    }
+
+    /** scoreboard objectives modify <obj> rendertype hearts|integer. */
+    public static void objectiveRenderType(ServerScoreboard sb, String objName, String type) {
+        net.minecraft.scoreboard.ScoreboardObjective o = sb.getNullableObjective(objName);
+        if (o != null) o.setRenderType("hearts".equals(type)
+                ? net.minecraft.scoreboard.ScoreboardCriterion.RenderType.HEARTS
+                : net.minecraft.scoreboard.ScoreboardCriterion.RenderType.INTEGER);
+        OBJ_GEN++;
+    }
+
+    /** scoreboard objectives modify <obj> displayautoupdate <bool>. */
+    public static void objectiveDisplayAutoUpdate(ServerScoreboard sb, String objName, boolean v) {
+        net.minecraft.scoreboard.ScoreboardObjective o = sb.getNullableObjective(objName);
+        if (o != null) o.setDisplayAutoUpdate(v);
+        OBJ_GEN++;
+    }
+
     public static void bossbarSetVisible(net.minecraft.server.command.ServerCommandSource src, String idStr, boolean vis) {
         net.minecraft.entity.boss.CommandBossBar b = bossbarGet(src, idStr);
         if (b != null) b.setVisible(vis);

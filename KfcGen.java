@@ -565,6 +565,17 @@ public final class KfcGen {
         }
     }
 
+    /** [고증 버그픽스] 바닐라 SetBlock/Fill/Clone 커맨드는 블록을 교체하기 전에
+     *  Clearable.clear(블록엔티티)로 내용물을 비운다. 이게 없으면 컨테이너(상자 등)가
+     *  onStateReplaced → ItemScatterer 로 내용물을 밖으로 뱉는다
+     *  (실증: security-chest 상자↔통 전환에서 아이템 산란 — 바닐라에는 없던 현상). */
+    private static void clearBeforeReplace(net.minecraft.server.world.ServerWorld world,
+                                           net.minecraft.util.math.BlockPos pos) {
+        // yarn 1.21.5 의 Clearable 은 인스턴스 clear() 만 제공(정적 헬퍼 없음 — 컴파일러 확인).
+        net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
+        if (be instanceof net.minecraft.util.Clearable c) c.clear();
+    }
+
     public static void setBlock(net.minecraft.server.world.ServerWorld world,
                                 net.minecraft.util.math.BlockPos pos, String blockStr, String mode) {
         if (world == null) return;
@@ -574,6 +585,7 @@ public final class KfcGen {
         if ("keep".equals(mode) && !world.getBlockState(pos).isAir()) return;
         // destroy: 기존 블록을 부수고(드롭 발생) 배치
         if ("destroy".equals(mode)) world.breakBlock(pos, true, null, 512);
+        clearBeforeReplace(world, pos);   // 바닐라 SetBlockCommand 동일(컨테이너 산란 방지)
         arg.setBlockState(world, pos, net.minecraft.block.Block.NOTIFY_ALL);
     }
 
@@ -692,13 +704,15 @@ public final class KfcGen {
                     || p.getZ() == minZ || p.getZ() == maxZ;
             if ("outline".equals(mode) && !onShell) continue;
             if ("hollow".equals(mode) && !onShell) {
-                // hollow: 내부는 공기로
+                // hollow: 내부는 공기로 (교체 전 clear — 바닐라 FillCommand 동일)
+                clearBeforeReplace(world, p);
                 world.setBlockState(p, net.minecraft.block.Blocks.AIR.getDefaultState(), net.minecraft.block.Block.NOTIFY_ALL);
                 continue;
             }
             if ("keep".equals(mode) && !world.getBlockState(p).isAir()) continue;
             if (("replace".equals(mode) || mode == null) && !fillFilterMatches(world, p, filter)) continue;
             if ("destroy".equals(mode)) world.breakBlock(p, true, null, 512);
+            clearBeforeReplace(world, p);   // 바닐라 FillCommand 동일(컨테이너 산란 방지)
             arg.setBlockState(world, p.toImmutable(), net.minecraft.block.Block.NOTIFY_ALL);
         }
     }
@@ -723,6 +737,7 @@ public final class KfcGen {
         }
         for (int i = 0; i < dst.size(); i++) {
             net.minecraft.util.math.BlockPos pos = dst.get(i);
+            clearBeforeReplace(world, pos);   // 바닐라 CloneCommand 동일(컨테이너 산란 방지)
             world.setBlockState(pos, sts.get(i), net.minecraft.block.Block.NOTIFY_ALL);
             if (nbts.get(i) != null) {
                 net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
@@ -766,6 +781,7 @@ public final class KfcGen {
         java.util.Set<net.minecraft.util.math.BlockPos> dstSet = new java.util.HashSet<>(dst);
         for (int i = 0; i < dst.size(); i++) {
             net.minecraft.util.math.BlockPos pos = dst.get(i);
+            clearBeforeReplace(world, pos);   // 바닐라 CloneCommand 동일(컨테이너 산란 방지)
             world.setBlockState(pos, sts.get(i), net.minecraft.block.Block.NOTIFY_ALL);
             if (nbts.get(i) != null) {
                 net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
@@ -775,7 +791,10 @@ public final class KfcGen {
         if (move) {
             net.minecraft.block.BlockState air = net.minecraft.block.Blocks.AIR.getDefaultState();
             for (net.minecraft.util.math.BlockPos p : src)
-                if (!dstSet.contains(p)) world.setBlockState(p, air, net.minecraft.block.Block.NOTIFY_ALL);
+                if (!dstSet.contains(p)) {
+                    clearBeforeReplace(world, p);   // move: 원본 소거도 산란 없이(바닐라 동일)
+                    world.setBlockState(p, air, net.minecraft.block.Block.NOTIFY_ALL);
+                }
         }
     }
 
@@ -5138,6 +5157,111 @@ public final class KfcGen {
     }
 
     /** data merge storage <id> {snbt} — 컴파운드를 스토리지 루트에 깊은 병합. */
+    /** data 블록 대상 접근 — 바닐라 BlockDataObject(getNbt/setNbt: markDirty+동기화 포함) 그대로 사용. */
+    private static net.minecraft.command.BlockDataObject blockData(
+            net.minecraft.server.world.ServerWorld w, net.minecraft.util.math.BlockPos pos) {
+        net.minecraft.block.entity.BlockEntity be = (w == null ? null : w.getBlockEntity(pos));
+        return be == null ? null : new net.minecraft.command.BlockDataObject(be, pos);
+    }
+
+    /** data modify block <pos> <path> set|append|prepend|merge value <snbt>. 블록엔티티 없으면 no-op(바닐라 실패). */
+    public static void blockPutSnbt(net.minecraft.server.world.ServerWorld w,
+                                    net.minecraft.util.math.BlockPos pos,
+                                    String path, String snbt, String mode) {
+        try {
+            net.minecraft.command.BlockDataObject bd = blockData(w, pos);
+            if (bd == null) return;
+            net.minecraft.nbt.NbtCompound w0 =
+                    net.minecraft.nbt.StringNbtReader.readCompound("{v:" + snbt + "}");
+            net.minecraft.nbt.NbtElement val = w0.get("v");
+            if (val == null) return;
+            net.minecraft.nbt.NbtCompound root = bd.getNbt();
+            boolean changed;
+            switch (mode) {
+                case "append"  -> changed = appendAtPath(root, path, val, false);
+                case "prepend" -> changed = appendAtPath(root, path, val, true);
+                case "merge"   -> changed = mergeAtPath(root, path, val);
+                default        -> changed = putAtPath(root, path, val);   // set
+            }
+            if (changed) bd.setNbt(root);
+        } catch (Exception ignored) {}
+    }
+
+    /** data modify block <pos> <path> set from … — 읽어온 NbtElement 를 블록 경로에 기록. */
+    public static void blockSetElement(net.minecraft.server.world.ServerWorld w,
+                                       net.minecraft.util.math.BlockPos pos,
+                                       String path, net.minecraft.nbt.NbtElement v) {
+        try {
+            net.minecraft.command.BlockDataObject bd = blockData(w, pos);
+            if (bd == null || v == null) return;
+            net.minecraft.nbt.NbtCompound root = bd.getNbt();
+            if (putAtPath(root, path, v.copy())) bd.setNbt(root);
+        } catch (Exception ignored) {}
+    }
+
+    /** execute store result|success block <pos> <path> <type> <scale>. */
+    public static void blockStoreNumber(net.minecraft.server.world.ServerWorld w,
+                                        net.minecraft.util.math.BlockPos pos,
+                                        String path, double value, String type) {
+        try {
+            net.minecraft.command.BlockDataObject bd = blockData(w, pos);
+            if (bd == null) return;
+            net.minecraft.nbt.NbtCompound root = bd.getNbt();
+            if (putAtPath(root, path, numberNbt(type, value))) bd.setNbt(root);
+        } catch (Exception ignored) {}
+    }
+
+    /** data merge storage 의 store success 판정판 — 바닐라 executeMerge 와 동일하게
+     *  '병합 결과가 원본과 같으면 실패(0)'. */
+    public static boolean storageMergeSnbtChanged(net.minecraft.server.MinecraftServer server,
+                                                  String id, String snbt) {
+        try {
+            net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
+                try { return net.minecraft.nbt.StringNbtReader.readCompound(s); }
+                catch (Exception ex) { return SNBT_INVALID; }
+            });
+            if (tmpl == SNBT_INVALID || !(tmpl instanceof net.minecraft.nbt.NbtCompound tc)) return false;
+            net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+            net.minecraft.nbt.NbtCompound before = root.copy();
+            root.copyFrom(tc.copy());
+            boolean changed = !root.equals(before);
+            if (changed) storageSave(server, id, root);
+            return changed;
+        } catch (Exception ignored) { return false; }
+    }
+
+    /** execute if blocks <start> <end> <dest> all|masked — ExecuteCommand testBlocksCondition 동일:
+     *  상태 동일 + (블록엔티티 있으면) NBT 동일. masked 는 소스가 공기인 칸 건너뜀.
+     *  바닐라 한계(32768블록) 초과는 커맨드 실패 = 조건 거짓과 동일 관측. */
+    public static boolean blocksMatch(net.minecraft.server.world.ServerWorld w,
+                                      int x1, int y1, int z1, int x2, int y2, int z2,
+                                      int dx, int dy, int dz, boolean masked) {
+        int sx = Math.min(x1, x2), ex = Math.max(x1, x2);
+        int sy = Math.min(y1, y2), ey = Math.max(y1, y2);
+        int sz = Math.min(z1, z2), ez = Math.max(z1, z2);
+        long vol = (long)(ex-sx+1) * (ey-sy+1) * (ez-sz+1);
+        if (vol > 32768L) return false;          // 바닐라 TOOBIG = 실행 실패
+        int ox = dx - sx, oy = dy - sy, oz = dz - sz;
+        net.minecraft.util.math.BlockPos.Mutable a = new net.minecraft.util.math.BlockPos.Mutable();
+        net.minecraft.util.math.BlockPos.Mutable b = new net.minecraft.util.math.BlockPos.Mutable();
+        for (int x = sx; x <= ex; x++) for (int y = sy; y <= ey; y++) for (int z = sz; z <= ez; z++) {
+            a.set(x, y, z);
+            net.minecraft.block.BlockState sa = w.getBlockState(a);
+            if (masked && sa.isAir()) continue;
+            b.set(x + ox, y + oy, z + oz);
+            if (sa != w.getBlockState(b)) return false;
+            net.minecraft.block.entity.BlockEntity ba = w.getBlockEntity(a);
+            if (ba != null) {
+                net.minecraft.block.entity.BlockEntity bb = w.getBlockEntity(b);
+                if (bb == null) return false;
+                net.minecraft.nbt.NbtCompound na = new net.minecraft.command.BlockDataObject(ba, a.toImmutable()).getNbt();
+                net.minecraft.nbt.NbtCompound nb = new net.minecraft.command.BlockDataObject(bb, b.toImmutable()).getNbt();
+                if (!na.equals(nb)) return false;
+            }
+        }
+        return true;
+    }
+
     public static void storageMergeSnbt(net.minecraft.server.MinecraftServer server, String id, String snbt) {
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {

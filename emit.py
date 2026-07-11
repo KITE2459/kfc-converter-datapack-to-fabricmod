@@ -4384,6 +4384,13 @@ def _data_target_write(tkind: str, args: dict, valvar: str):
         if not tid:
             return None
         return f'KfcGen.nbtSetStorage(server, {jstr(tid)}, {jstr(tpath)}, {valvar})'
+    if tkind == "block":
+        tpos = first_arg(args, "targetPos")
+        pe = cond_pos_expr(tpos) if tpos else None
+        if pe is None:
+            return None
+        return (f'KfcGen.blockSetElement(source.getWorld(), '
+                f'net.minecraft.util.math.BlockPos.ofFloored({pe}), {jstr(tpath)}, {valvar})')
     return None
 
 
@@ -4582,6 +4589,23 @@ def emit_data(nn: list[str], args: dict, em: Emitted) -> bool:
                 em.reason = "data modify storage 값 raw 없음"
                 return False
             em.java.append(f'KfcGen.storagePutSnbt(server, {jstr(sid)}, {jstr(path)}, {jstr(raw)}, {jstr(mode)});')
+            em.kind = "native"
+            return True
+        if tgtkind == "block":
+            pos = first_arg(args, "targetPos")
+            path = first_arg(args, "targetPath")
+            mode = next((m for m in ("set", "append", "prepend", "merge") if m in nn), "set")
+            if "insert" in nn or "from" in nn or "string" in nn:
+                em.reason = "data modify block insert/from/string 1차 미지원"
+                return False
+            valr = args.get("value", [{}])[0].get("raw")
+            pe = cond_pos_expr(pos) if pos else None
+            if pe is None or not path or valr is None:
+                em.reason = "data modify block 좌표/경로/값 미지원"
+                return False
+            em.java.append(f'KfcGen.blockPutSnbt(source.getWorld(), '
+                           f'net.minecraft.util.math.BlockPos.ofFloored({pe}), '
+                           f'{jstr(path)}, {jstr(valr)}, {jstr(mode)});')
             em.kind = "native"
             return True
         return False
@@ -6062,6 +6086,22 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 conds.append(f'!({c})' if neg else c)
                 i = skip_after(nn, i, "block")
                 continue
+            elif sub == "blocks":
+                p1 = next_arg("start"); p2 = next_arg("end"); pd = next_arg("destination")
+                bmode = "masked" if "masked" in nn else "all"
+                e1 = cond_pos_expr(p1["raw"], cur_src) if p1 else None
+                e2 = cond_pos_expr(p2["raw"], cur_src) if p2 else None
+                ed = cond_pos_expr(pd["raw"], cur_src) if pd else None
+                if e1 is None or e2 is None or ed is None:
+                    return ("UNS", [], "if blocks 좌표 미지원", [])
+                _mk = "true" if bmode == "masked" else "false"
+                c = (f'KfcGen.blocksMatch({cur_src}.getWorld(), '
+                     f'net.minecraft.util.math.MathHelper.floor(({e1}).x), net.minecraft.util.math.MathHelper.floor(({e1}).y), net.minecraft.util.math.MathHelper.floor(({e1}).z), '
+                     f'net.minecraft.util.math.MathHelper.floor(({e2}).x), net.minecraft.util.math.MathHelper.floor(({e2}).y), net.minecraft.util.math.MathHelper.floor(({e2}).z), '
+                     f'net.minecraft.util.math.MathHelper.floor(({ed}).x), net.minecraft.util.math.MathHelper.floor(({ed}).y), net.minecraft.util.math.MathHelper.floor(({ed}).z), {_mk})')
+                conds.append(f'!({c})' if neg else c)
+                i = skip_after(nn, i, "destination")
+                continue
             elif sub == "dimension":
                 d = next_arg("dimension")
                 if not d:
@@ -6885,6 +6925,14 @@ def store_success_value_expr(tail: list[dict], em: Emitted,
         em.side_effects = [f'int {sres} = 0;',
                            f'if ({guard}) {{ {stmt} {sres} = 1; }}']
         return sres
+    if nn[0] == "data" and len(nn) > 1 and nn[1] == "merge" and (nn[2] if len(nn) > 2 else "") == "storage":
+        # 바닐라 executeMerge: 병합 결과가 원본과 같으면 실패(0) — Changed 판정판 사용.
+        sid = first_arg(args, "target")
+        raw = first_arg(args, "nbt")
+        if not sid or raw is None:
+            em.reason = "store success data merge storage 인자 없음"
+            return None
+        return f'(KfcGen.storageMergeSnbtChanged(server, {jstr(sid)}, {jstr(raw)}) ? 1 : 0)'
     if nn[0] != "data" or "modify" not in nn:
         em.reason = "store success <non-data-modify> 소스 1차 미지원"
         return None
@@ -7048,6 +7096,19 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
             f'{{ net.minecraft.entity.Entity _se = {ent};'
             f' if (_se != null) KfcGen.entityPutNumberPath(_se, {jstr(epath)}, {jstr(etype)}, '
             f'{scaled(valexpr, escale)}); }}')
+    elif dst_kind == "block":
+        bpos = first_arg(args, "targetPos")
+        bpath = first_arg(args, "path")
+        btype = nbt_store_type(nn, si)
+        bscale = first_arg(args, "scale") or "1"
+        bpe = cond_pos_expr(bpos) if bpos else None
+        if bpe is None or not bpath:
+            em.reason = "store block 좌표/경로 미지원"
+            return False
+        dst_writer = lambda valexpr: (
+            f'KfcGen.blockStoreNumber(source.getWorld(), '
+            f'net.minecraft.util.math.BlockPos.ofFloored({bpe}), '
+            f'{jstr(bpath)}, {scaled(valexpr, bscale)}, {jstr(btype)});')
     elif dst_kind == "bossbar":
         # store result bossbar <id> value|max run <소스>  -> 보스바 값/최대값 설정
         bid = first_arg(args, "id")

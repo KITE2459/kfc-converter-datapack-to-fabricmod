@@ -3563,8 +3563,23 @@ def emit_worldborder(nn: list[str], args: dict, em: Emitted) -> bool:
 
 def emit_damage(nn: list[str], args: dict, em: Emitted) -> bool:
     """damage <target> <amount> [<type>] - 엔티티에 데미지. by/at/from 동반은 1차 폴백."""
-    if any(x in nn for x in ("by", "at", "from")):
-        em.reason = "damage by/at/from 1차 미지원"; return False
+    if any(x in nn for x in ("at", "from")):
+        em.reason = "damage at/from 1차 미지원"; return False
+    if "by" in nn:
+        # by <attacker>: DamageSources.create(key, attacker) — DamageCommand 동일(직접=원인=attacker)
+        tgt = first_arg(args, "target")
+        amount = _num(first_arg(args, "amount"))
+        if tgt is None or amount is None:
+            em.reason = "damage 대상/양 없음"; return False
+        dtype = first_arg(args, "damageType")
+        tj = "null" if dtype is None else jstr(str(dtype))
+        arw = first_arg(args, "entity")
+        aent = "executor" if arw == "@s" else (single_entity_expr(arw) if arw else None)
+        if aent is None:
+            em.reason = f"damage by 대상({arw}) 미해소"; return False
+        body = lambda exp: (f'{{ net.minecraft.entity.Entity _dby = {aent};'
+                            f' KfcGen.applyDamageBy({exp}, source.getWorld(), {amount}f, {tj}, _dby); }}')
+        return _fanout_target(tgt, "_dmgE", body, em, "damage by")
     tgt = first_arg(args, "target")
     amount = _num(first_arg(args, "amount"))
     if tgt is None or amount is None:
@@ -4537,8 +4552,22 @@ def emit_data(nn: list[str], args: dict, em: Emitted) -> bool:
                 return False
             mode = next((m for m in ("set", "append", "prepend", "merge", "insert") if m in nn), "set")
             if mode == "insert":
-                em.reason = "data modify storage insert (인덱스 삽입) 1차 미지원"
-                return False
+                idxr = first_arg(args, "index")
+                valr = args.get("value", [{}])[0].get("raw")
+                if idxr is None or valr is None:
+                    em.reason = "data modify storage insert 인자 없음"
+                    return False
+                try:
+                    idx = int(idxr)
+                except ValueError:
+                    em.reason = "data modify storage insert 인덱스 파싱불가"
+                    return False
+                if idx < 0:
+                    em.reason = "data modify storage insert 음수 인덱스 1차 미지원"
+                    return False
+                em.java.append(f'KfcGen.storageInsertSnbt(server, {jstr(sid)}, {jstr(path)}, {idx}, {jstr(valr)});')
+                em.kind = "native"
+                return True
             val = args.get("value", [{}])[0]
             jval = nbt_value_java(val)
             if mode == "set" and jval is not None:
@@ -4922,7 +4951,7 @@ def _v2_segments(head: list[dict]):
             i = pre_start = j
         elif node == "on":
             rel = head[i + 1].get("node") if i + 1 < len(head) else None
-            if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller"):
+            if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller", "owner"):
                 return None
             flush(i)
             segs.append(("on", rel))
@@ -5118,7 +5147,7 @@ def _v2_fanout_as(sel_raw, exe, src, depth):
 
 def _v2_fanout_on(rel, exe, src, depth):
     ne, ns = f"_vE{depth}", f"_vS{depth}"
-    _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController"}
+    _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController", "owner": "onOwner"}
     if rel in _single:
         opens = [f"{{ ServerCommandSource {ns} = KfcGen.{_single[rel]}({src});",
                  f"  if ({ns} != null) {{",
@@ -5569,7 +5598,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
         rel = None
         for s in head[on_idx + 1:on_idx + 2]:
             rel = s.get("node")
-        if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller"):
+        if rel not in ("passengers", "vehicle", "attacker", "target", "origin", "controller", "owner"):
             em.reason = f"on {rel} (1차 미지원)"
             return False
         _on_depth += 1
@@ -5616,7 +5645,7 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
         inner_body = [re.sub(r'\bexecutor\b', oe, b) for b in inner_body]
         _on_depth -= 1
         out = []
-        _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController"}
+        _single = {"vehicle": "onVehicle", "attacker": "onAttacker", "target": "onTarget", "origin": "onOrigin", "controller": "onController", "owner": "onOwner"}
         if rel in _single:
             out.append(f"{{ ServerCommandSource {ov} = KfcGen.{_single[rel]}({pre_src});")
             out.append(f"  if ({ov} != null) {{")

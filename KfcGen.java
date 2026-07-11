@@ -1206,6 +1206,17 @@ public final class KfcGen {
         e.damage(w, ds, amount);
     }
 
+    /** damage ... by <attacker>: DamageSources.create(key, attacker) — DamageCommand 동일. */
+    public static void applyDamageBy(net.minecraft.entity.Entity e, net.minecraft.server.world.ServerWorld w,
+                                     float amount, String typeId, net.minecraft.entity.Entity attacker) {
+        net.minecraft.util.Identifier id = (typeId == null ? null : net.minecraft.util.Identifier.tryParse(typeId));
+        net.minecraft.entity.damage.DamageSource ds = (id == null)
+                ? w.getDamageSources().generic()
+                : w.getDamageSources().create(net.minecraft.registry.RegistryKey.of(
+                        net.minecraft.registry.RegistryKeys.DAMAGE_TYPE, id), attacker);
+        e.damage(w, ds, amount);
+    }
+
     // ── trigger: @s 의 트리거 목표 점수. isLocked/lock 으로 enable->1회->lock 시맨틱 재현 ──
     public static void triggerScore(net.minecraft.server.command.ServerCommandSource src,
                                     String objName, int mode, int value) {
@@ -1662,6 +1673,15 @@ public final class KfcGen {
         if (e == null || e.getVehicle() == null) return null;
         // 바닐라 on 은 실행자(엔티티)만 교체하고 위치/회전/차원은 유지한다(위치 변경은 뒤의 at @s 가 담당).
         return src.withEntity(e.getVehicle());
+    }
+
+    // execute on owner — 실행자가 Ownable(투사체/길들인 동물 등)이면 소유자로 교체(ExecuteCommand 동일).
+    public static net.minecraft.server.command.ServerCommandSource onOwner(
+            net.minecraft.server.command.ServerCommandSource src) {
+        net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
+        if (!(e instanceof net.minecraft.entity.Ownable ow)) return null;
+        net.minecraft.entity.Entity o = ow.getOwner();
+        return o == null ? null : src.withEntity(o);
     }
 
     // execute on attacker — 실행자가 Attackable 이면 마지막 공격자(LivingEntity)로 교체, 없으면 null(미실행).
@@ -5056,6 +5076,31 @@ public final class KfcGen {
                 case "prepend" -> changed = appendAtPath(root, path, val, true);
                 case "merge"   -> changed = mergeAtPath(root, path, val);
                 default        -> changed = putAtPath(root, path, val);   // set
+            }
+            if (changed) storageSave(server, id, root);
+        } catch (Exception ignored) {}
+    }
+
+    /** data modify storage <id> <path> insert <index> value <snbt> — 리스트 index 앞 삽입.
+     *  범위 밖(index > size)은 바닐라와 동일하게 실패(no-op). 음수 인덱스는 emit 단계에서 폴백. */
+    public static void storageInsertSnbt(net.minecraft.server.MinecraftServer server, String id,
+                                         String path, int index, String snbt) {
+        try {
+            net.minecraft.nbt.NbtCompound w0 =
+                    net.minecraft.nbt.StringNbtReader.readCompound("{v:" + snbt + "}");
+            net.minecraft.nbt.NbtElement val = w0.get("v");
+            if (val == null) return;
+            net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
+            if (root == null) return;
+            net.minecraft.command.argument.NbtPathArgumentType.NbtPath np = nbtPath(path);
+            if (np == null) return;
+            boolean changed = false;
+            for (net.minecraft.nbt.NbtElement el : np.get(root)) {
+                if (el instanceof net.minecraft.nbt.AbstractNbtList lst
+                        && index >= 0 && index <= lst.size()
+                        && lst.addElement(index, val.copy())) {
+                    changed = true;
+                }
             }
             if (changed) storageSave(server, id, root);
         } catch (Exception ignored) {}

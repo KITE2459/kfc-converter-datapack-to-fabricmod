@@ -427,11 +427,15 @@ public final class KfcGen {
     private static net.minecraft.server.MinecraftServer TB_SERVER;
     private static int  TB_TICK = Integer.MIN_VALUE;
     private static long TB_GEN  = -1;
+    // TAG_BUCKETS 가 clear 될 때마다(=틱/gen/서버 변화 rebuild, NBT 리로드 태그변경) 증가.
+    // 정적 승격된 Tags 핸들(pass-4)이 (서버,틱,gen,epoch) 4-스탬프가 모두 일치할 때만
+    // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
+    private static long TB_EPOCH = 0;
 
     static java.util.List<net.minecraft.entity.Entity> tagBucket(GameContext ctx, String tag) {
         int tk = ctx.server.getTicks();
         if (TB_SERVER != ctx.server || TB_TICK != tk || TB_GEN != ENTITY_GEN) {
-            TAG_BUCKETS.clear(); TB_SERVER = ctx.server; TB_TICK = tk; TB_GEN = ENTITY_GEN;
+            TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_TICK = tk; TB_GEN = ENTITY_GEN;
         }
         java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
         if (b == null) {
@@ -483,6 +487,45 @@ public final class KfcGen {
         return b != null ? b : entitiesSnapshot(ctx);
     }
 
+    // ──────────────── Tags: 상수 태그셋의 후보버킷 해소 정적 승격 ────────────────
+    // pass-4 가 firstEntity/nearestEntity 의 상수 tagsPos(KFC_SA_n) 를 static final
+    // Tags(KFC_TAGS_n) 로 승격한다. tagCandidates(ctx, Tags) 는 (서버,틱,gen,epoch)
+    // 4-스탬프가 모두 일치하면 지난 틱-내 해소 결과(TAG_BUCKETS.get 없이)를 그대로 반환하고,
+    // 하나라도 어긋나면 String[] 경로로 위임해 재해소 후 재스탬프한다. 위임 경로가 진실의
+    // 원천이므로 관측 결과는 String[] 판과 동일(캐시는 맵 조회만 절약). 다중 태그의 '최소
+    // 버킷 선택'이 틱 내 크기변화로 달라질 수 있으나, 호출측이 전 태그를 라이브 재검사하므로
+    // 어느 버킷(수퍼셋)을 잡아도 결과 집합은 동일 — 관측 동등.
+    public static final class Tags {
+        final String[] pos;
+        java.util.List<net.minecraft.entity.Entity> b;   // 캐시된 후보 리스트(라이브 버킷 참조)
+        net.minecraft.server.MinecraftServer srv;
+        int  tick  = Integer.MIN_VALUE;
+        long gen   = -1;
+        long epoch = Long.MIN_VALUE;
+        Tags(String[] pos) { this.pos = pos; }
+    }
+    public static Tags tags(String[] pos) { return new Tags(pos); }
+
+    static java.util.List<net.minecraft.entity.Entity> tagCandidates(GameContext ctx, Tags t) {
+        int tk = ctx.server.getTicks();
+        if (t.b != null && t.srv == ctx.server && t.tick == tk && t.gen == ENTITY_GEN && t.epoch == TB_EPOCH) {
+            return t.b;   // fast-path: TAG_BUCKETS 조회 없이 캐시 반환
+        }
+        java.util.List<net.minecraft.entity.Entity> r = tagCandidates(ctx, t.pos);  // 위임(진실의 원천)
+        t.b = r; t.srv = ctx.server; t.tick = tk; t.gen = ENTITY_GEN; t.epoch = TB_EPOCH;
+        return r;
+    }
+
+    static java.util.List<net.minecraft.entity.Entity> tagCandidatesBounded(GameContext ctx, Tags t) {
+        java.util.List<net.minecraft.entity.Entity> b = tagCandidates(ctx, t);
+        return (b != null && b.size() <= TAG_BOUNDED_MAX) ? b : null;
+    }
+
+    static java.util.List<net.minecraft.entity.Entity> tagOrSnap(GameContext ctx, Tags t) {
+        java.util.List<net.minecraft.entity.Entity> b = tagCandidates(ctx, t);
+        return b != null ? b : entitiesSnapshot(ctx);
+    }
+
     /** 생성 코드의 `tag <sel> add` 는 전부 이 헬퍼를 경유한다(엔티티 직접 호출 금지 — 버킷 증분 유지). */
     public static void addTag(net.minecraft.entity.Entity e, String tag) {
         if (e == null) return;
@@ -523,7 +566,7 @@ public final class KfcGen {
         if (TAG_BUCKETS.isEmpty()) { e.readNbt(n); return; }
         java.util.HashSet<String> before = new java.util.HashSet<>(e.getCommandTags());
         e.readNbt(n);
-        if (!before.equals(e.getCommandTags())) TAG_BUCKETS.clear();
+        if (!before.equals(e.getCommandTags())) { TAG_BUCKETS.clear(); TB_EPOCH++; }
     }
 
     // ── Sepals(Catheter) 호환 타입-박스 질의 ──
@@ -4022,6 +4065,50 @@ public final class KfcGen {
         return best;
     }
 
+public static net.minecraft.entity.Entity nearestEntity(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        net.minecraft.entity.Entity best = null;
+        double bestD = Double.MAX_VALUE;
+        // 거리 상한이 있으면 box 한정 섹션 스캔(allEntities/anyEntity 와 동일한 정확한 의미).
+        // typeBucket 전체(월드의 해당 타입 전부) 순회를 피한다 — onkartcollision 등 핫패스에서
+        // maxDist 가 작아(예: 4) box 스캔이 훨씬 적게 본다. 결과 집합/최근접 동일.
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!typeMatch(e, types)) continue;
+                    if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
+            net.minecraft.util.math.Box _bx = rangeBox(origin, maxDist);
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : entitiesByTypeBox(ctx, t, _bx,
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+            }
+            return best;
+        }
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {   // 거리 무제한
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입 필터
+                if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+                if (!inRange(origin, e, minDist, maxDist)) continue;
+                double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
+                if (d < bestD) { bestD = d; best = e; }
+            }
+        }
+        return best;
+    }
+
     public static net.minecraft.entity.Entity nearestEntityAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
@@ -4345,6 +4432,20 @@ public final class KfcGen {
             for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {
                 if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입-우선 순회 순서 보존
                 if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
+            }
+        }
+        return null;
+    }
+
+public static net.minecraft.entity.Entity firstEntity(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, t))) {
+                if (_tb != null && e.getType() != t) continue;   // 태그버킷 경로: 타입-우선 순회 순서 보존
+                if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return e;
             }
         }
         return null;

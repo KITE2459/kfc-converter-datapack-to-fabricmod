@@ -1077,6 +1077,39 @@ def _collapse_score_handles(body: str, decls: list, fields: dict, start_seq: int
     return body, n, seq
 
 
+# ── Tags 승격: firstEntity/nearestEntity 의 상수 tagsPos(KFC_SA_n) → KFC_TAGS_k(정적 핸들) ──
+#   런타임 tagCandidates(ctx, KFC_SA)→TAG_BUCKETS.get(tag) 맵조회를, (서버,틱,gen,epoch)
+#   스탬프가 맞으면 조회를 건너뛰는 static final Tags 핸들로 대체한다. 7-인자 typed 오버로드의
+#   tagsPos 자리가 KFC_SA_ 필드일 때만(동적/NO_TAGS 는 원판 유지). KFC_SA 당 한 핸들로 dedup.
+_TAGS_ARR_FIELD = re.compile(r'\s*KFC_SA_\d+\s*\Z')
+
+def _promote_tags(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
+    seq = start_seq; n = 0
+    specs = [("KfcGen.firstEntity(", 7, 3), ("KfcGen.nearestEntity(", 7, 3)]
+    repls = []   # (arg_start, arg_end, field_name)
+    for needle, argc, ti in specs:
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if len(args) != argc:
+                continue
+            a0, a1 = args[ti]
+            arr = body[a0:a1]
+            if not _TAGS_ARR_FIELD.match(arr):
+                continue
+            afld = arr.strip()
+            key = ("TAGS", afld)
+            name = fields.get(key)
+            if name is None:
+                name = f"KFC_TAGS_{seq}"; seq += 1
+                fields[key] = name
+                decls.append(f"    private static final KfcGen.Tags {name} = KfcGen.tags({afld});")
+            repls.append((a0, a1, name)); n += 1
+    for a0, a1, name in sorted(repls, key=lambda r: r[0], reverse=True):
+        lead = body[a0:a1]
+        pad = lead[:len(lead)-len(lead.lstrip())]
+        body = body[:a0] + pad + name + body[a1:]
+    return body, n, seq
+
+
 def hoist_constants_text(text: str) -> tuple[str, int]:
     """단일 클래스 소스에서 상수 배열 리터럴을 static final 필드로 호이스팅.
        (변경된 텍스트, 치환 건수) 반환. 클래스 선언을 못 찾으면 무변경."""
@@ -1124,6 +1157,9 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     # 승격 이후 실행해야 objective 가 KFC_OBJ_ 필드로 이미 승격돼 있다.
     body, _sch_n, _ = _collapse_score_handles(body, decls, fields, len(decls))
     n += _sch_n
+    # firstEntity/nearestEntity 의 상수 tagsPos 배열 → static final Tags 핸들(맵 조회 제거).
+    body, _tags_n, _ = _promote_tags(body, decls, fields, len(decls))
+    n += _tags_n
     if n == 0:
         return text, 0
     return text[:insert_at] + "\n" + "\n".join(decls) + body, n

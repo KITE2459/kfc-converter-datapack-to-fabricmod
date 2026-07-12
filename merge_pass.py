@@ -1039,6 +1039,44 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
     return body, n, seq
 
 
+# ── ScoreHandle(Sch) 승격: setScore/addScore(sb,"홀더",KFC_OBJ_n,v) → setScore(sb,KFC_SCH_k,v) ──
+#   런타임 SCORE_HANDLES(ObjRef→홀더 이중 맵) 조회를 static final Sch(+epoch 가드)로 인라인.
+#   대상: 쓰기 전용(setScore/addScore) 중 홀더가 순수 문자열 리터럴이고 objective 가 이미
+#   승격된 KFC_OBJ_ 필드인 4-인자 호출. 읽기/엔티티홀더/동적 objective 는 미대상(원판 유지).
+_SCH_OBJ_FIELD = re.compile(r'\s*KFC_OBJ_\d+\s*\Z')
+
+def _collapse_score_handles(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
+    seq = start_seq; n = 0
+    specs = [("KfcGen.setScore(", 4), ("KfcGen.addScore(", 4)]
+    repls = []   # (arg1_start, arg2_end, field_name)
+    for needle, argc in specs:
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if len(args) != argc:
+                continue
+            h0, h1 = args[1]                    # 홀더 인자
+            o0, o1 = args[2]                    # objective 인자
+            holder = body[h0:h1]
+            objf   = body[o0:o1]
+            if not _SNBT_STR_FULL.match(holder):   # 홀더 = 순수 문자열 리터럴만
+                continue
+            if not _SCH_OBJ_FIELD.match(objf):     # objective = 이미 승격된 KFC_OBJ_ 필드만
+                continue
+            hlit = holder.strip(); ofld = objf.strip()
+            key = ("SCH", hlit, ofld)
+            name = fields.get(key)
+            if name is None:
+                name = f"KFC_SCH_{seq}"; seq += 1
+                fields[key] = name
+                decls.append(f"    private static final KfcGen.Sch {name} = KfcGen.sch({hlit}, {ofld});")
+            # 홀더~objective(중간 쉼표 포함) 구간을 단일 필드 인자로 접는다.
+            repls.append((h0, o1, name)); n += 1
+    for a0, a1, name in sorted(repls, key=lambda r: r[0], reverse=True):
+        lead = body[a0:a1]
+        pad = lead[:len(lead)-len(lead.lstrip())]   # 선행 공백 보존(포맷 유지)
+        body = body[:a0] + pad + name + body[a1:]
+    return body, n, seq
+
+
 def hoist_constants_text(text: str) -> tuple[str, int]:
     """단일 클래스 소스에서 상수 배열 리터럴을 static final 필드로 호이스팅.
        (변경된 텍스트, 치환 건수) 반환. 클래스 선언을 못 찾으면 무변경."""
@@ -1082,6 +1120,10 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     # SNBT 리터럴 → 파싱된 static final 필드 승격(pre-parsed 오버로드 호출로 재작성)
     body, _snbt_n, _ = _promote_snbt_text(body, decls, fields, len(decls))
     n += _snbt_n
+    # (상수 홀더, 상수 objective) 쓰기 → static final Sch 로 접기(맵 조회 제거). SNBT/ObjRef
+    # 승격 이후 실행해야 objective 가 KFC_OBJ_ 필드로 이미 승격돼 있다.
+    body, _sch_n, _ = _collapse_score_handles(body, decls, fields, len(decls))
+    n += _sch_n
     if n == 0:
         return text, 0
     return text[:insert_at] + "\n" + "\n".join(decls) + body, n

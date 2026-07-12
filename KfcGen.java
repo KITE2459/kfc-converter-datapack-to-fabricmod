@@ -3495,9 +3495,14 @@ public final class KfcGen {
     private static long SH_GEN = Long.MIN_VALUE;
     private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess>>
             SCORE_HANDLES = new java.util.HashMap<>();
+    // SCORE_HANDLES 가 (어떤 이유로든) 비워질 때마다 증가하는 세대 카운터.
+    // 정적 승격된 Sch 셀(pass-4)이 이 값을 스탬프로 삼아, 값이 그대로면 이중 맵 조회를
+    // 건너뛰고 캐시된 ScoreAccess 를 직접 쓴다. 맵이 비워지면(=OBJ_GEN 변화 / reset 엔트리 제거)
+    // epoch 가 바뀌어 모든 Sch 가 재해소된다 → scoreHandle 매 호출과 정적 동등.
+    private static long SCORE_EPOCH = 0;
 
     private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
-        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); SH_GEN = OBJ_GEN; }
+        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
         java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(o);
         if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(o, m); }
         net.minecraft.scoreboard.ScoreAccess a = m.get(holderKey);
@@ -3512,7 +3517,38 @@ public final class KfcGen {
         return a;
     }
 
-    private static void invalidateScoreHandles() { SCORE_HANDLES.clear(); }
+    private static void invalidateScoreHandles() { SCORE_HANDLES.clear(); SCORE_EPOCH++; }
+
+    // ──────────────── Sch: (상수 홀더, 상수 objective) 쓰기 핸들의 정적 승격 ────────────────
+    // pass-4 가 setScore/addScore(sb, "리터럴홀더", KFC_OBJ_n, v) 를 static final Sch 필드로
+    // 접어(collapse) sb·값만 남긴다. resolve 는 SCORE_EPOCH 스탬프가 일치하면 SCORE_HANDLES
+    // 이중 조회(ObjRef→홀더)를 통째로 건너뛰고 캐시된 ScoreAccess 를 반환한다. epoch 불일치/
+    // 최초 접근 시에만 기존 scoreHandle(맵 경로)로 폴백 — getOrCreateScore 부수효과·무효화가
+    // 종전과 완전히 동일하므로 관측 동등(쓰기 전용; 읽기는 엔트리 생성 부수효과 때문에 미승격).
+    public static final class Sch {
+        final String holder; final ObjRef obj;
+        net.minecraft.scoreboard.ScoreAccess acc;
+        long gen = Long.MIN_VALUE;
+        Sch(String holder, ObjRef obj) { this.holder = holder; this.obj = obj; }
+    }
+    public static Sch sch(String holder, ObjRef o) { return new Sch(holder, o); }
+
+    private static net.minecraft.scoreboard.ScoreAccess resolve(ServerScoreboard sb, Sch h) {
+        if (h.acc == null || h.gen != SCORE_EPOCH) {
+            h.acc = scoreHandle(sb, h.holder, h.obj);   // 미스: 맵 경로(엔트리 존재화 포함) — 종전 동일
+            h.gen = SCORE_EPOCH;                          // scoreHandle 이 epoch 를 올렸다면 그 값으로 스탬프
+        }
+        return h.acc;
+    }
+
+    public static void setScore(ServerScoreboard sb, Sch h, int v) {
+        net.minecraft.scoreboard.ScoreAccess a = resolve(sb, h);
+        if (a != null) a.setScore(v);
+    }
+    public static void addScore(ServerScoreboard sb, Sch h, int n) {
+        net.minecraft.scoreboard.ScoreAccess a = resolve(sb, h);
+        if (a != null) a.setScore(a.getScore() + n);
+    }
 
     // ──────────────── ObjRef 오버로드 (merge_pass pass-4 가 상수 objective 를 승격) ────────────────
     // String 판과 시맨틱 완전 동일 — objective 해소만 캐시(obj(sb, ref)) 경유.

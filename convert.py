@@ -992,6 +992,17 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             print(f"[generate][warn] tree-flatten skipped due to error: {_te}")
         _tlog("pass-2.7 (tree-flatten)")
 
+        # ── [pass-2.75] 엔티티 직접 홀더 재작성 — setScore(sb, nameOf(e), …) 류의
+        #    문자열 왕복을 Entity 오버로드 호출로(opt_post.py 헤더 참조, fail-closed).
+        try:
+            import opt_post as _op_mod
+            estats = _op_mod.rewrite_entity_holders(_records, verbose=True)
+            print(f"[generate] pass-2.75 entity-holder: {estats}")
+        except Exception as _ee:
+            import traceback; traceback.print_exc()
+            print(f"[generate][warn] entity-holder rewrite skipped due to error: {_ee}")
+        _tlog("pass-2.75 (entity-holder)")
+
         # ── [pass-2.8] 상수 스코어 폴딩 — 전 팩 라인 분석으로 '항상 같은 리터럴'임이
         #    증명된 (#가짜플레이어, dummy objective) 읽기를 리터럴로 재작성.
         #    (증명 조건·시맨틱 논증은 const_fold.py 헤더. 실패는 fail-closed 로 원형 유지.)
@@ -1004,6 +1015,17 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             import traceback; traceback.print_exc()
             print(f"[generate][warn] const-fold skipped due to error: {_ce}")
         _tlog("pass-2.8 (const-fold)")
+
+        # ── [pass-2.9] 점수 체인 지역변수 강등 — 직선 구간의 (#홀더, 안전 objective)
+        #    산술 연쇄를 자바 int 지역변수로('어셈블리 탈피' 1단계, opt_post.py 헤더 논증).
+        try:
+            import opt_post as _op_mod2
+            dstats = _op_mod2.demote_scores(_records, _lines_map, verbose=True)
+            print(f"[generate] pass-2.9 score-demote: {dstats}")
+        except Exception as _de:
+            import traceback; traceback.print_exc()
+            print(f"[generate][warn] score-demote skipped due to error: {_de}")
+        _tlog("pass-2.9 (score-demote)")
 
     # ── [pass-3] 후처리: 오버사이즈 브릿지 + 버킷화(여러 함수를 한 클래스로 묶어 클래스 수 감축) ──
     # ModEntry(tick) 가 생성된 뒤라 외부 FQCN 참조가 자동 핀된다. tick/load 는 명시 핀으로도 전달.
@@ -1391,6 +1413,7 @@ public final class ModEntry implements ModInitializer {{
         ServerTickEvents.START_SERVER_TICK.register(server -> {{
             ServerCommandSource src = server.getCommandSource().withSilent();
 {tick_body}
+            {group}.generated.KfcGen.tickNativeSchedule(server);
         }});
     }}
 }}

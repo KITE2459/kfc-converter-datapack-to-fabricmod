@@ -997,6 +997,7 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
         ("KfcGen.setScore(",           {4}, [(2, *_OBJR)]),
         ("KfcGen.addScore(",           {4}, [(2, *_OBJR)]),
         ("KfcGen.opScore(",            {6}, [(2, *_OBJR), (5, *_OBJR)]),
+        ("KfcGen.opScoreN(",           {5}, [(2, *_OBJR)]),
     ]
 
     def _field_for(ftype, pfn, prefix, lit_s):

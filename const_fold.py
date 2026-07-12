@@ -159,6 +159,34 @@ def _compile_key(h: str, o: str, v: int) -> list:
         out.append((re.compile(
             r'KfcGen\.opScore\(sb, ((?:[^,()]|\([^()]*\))+), ((?:[^,()]|\([^()]*\))+), '
             + re.escape(f'"{op}"') + rf', {hq}, {oq}\);'), repl))
+    # 잔여 연산(*, /, %, <, >)의 상수 소스 → opScoreN(대상만 접근, 상수 직접 적용).
+    # 소스 getOrCreateScore 부수효과는 '이미 존재+무변경' — 위 3종과 동일 논증.
+    for op in ("*=", "/=", "%=", "<", ">"):
+        out.append((re.compile(
+            r'KfcGen\.opScore\(sb, ((?:[^,()]|\([^()]*\))+), ((?:[^,()]|\([^()]*\))+), '
+            + re.escape(f'"{op}"') + rf', {hq}, {oq}\);'),
+            rf'KfcGen.opScoreN(sb, \1, \2, "{op}", {v});'))
+    # ── scoreCmp 확장(#3①): 폴딩 상수와의 비교를 직접 int 비교로 ──
+    _OPS = r'(<=|>=|<|>|=)'
+    # (a) 좌측 상수: scoreCmp(sb,"H","O","op", <나머지>) → scoreCmpL(sb, N, "op", <나머지>)
+    #     나머지(문자열/엔티티/neg 조합)는 그대로 두면 scoreCmpL 오버로드가 해소한다.
+    out.append((re.compile(rf'KfcGen\.scoreCmp\(sb, {hq}, {oq}, "{_OPS}", '),
+                rf'KfcGen.scoreCmpL(sb, {v}, "\1", '))
+    # (b) 우측 상수: scoreCmp(sb, A, B, "op", "H", "O"[, neg]) → scoreCmpR(sb, A, B, "op", N[, neg])
+    _ARG = r'((?:[^,()]|\([^()]*\))+)'
+    out.append((re.compile(
+        rf'KfcGen\.scoreCmp\(sb, {_ARG}, {_ARG}, "{_OPS}", {hq}, {oq}\)'),
+        rf'KfcGen.scoreCmpR(sb, \1, \2, "\3", {v})'))
+    out.append((re.compile(
+        rf'KfcGen\.scoreCmp\(sb, {_ARG}, {_ARG}, "{_OPS}", {hq}, {oq}, (true|false)\)'),
+        rf'KfcGen.scoreCmpR(sb, \1, \2, "\3", {v}, \4)'))
+    # (c) 양측 상수: (a) 적용 후 남은 scoreCmpL(sb, M, "op", "H", "O") → 순수 불리언 리터럴
+    def _both(m, _v=v):
+        a = int(m.group(1)); op2 = m.group(2)
+        r = {"<": a < _v, "<=": a <= _v, "=": a == _v, ">=": a >= _v, ">": a > _v}[op2]
+        return "true" if r else "false"
+    out.append((re.compile(
+        rf'KfcGen\.scoreCmpL\(sb, (-?\d+), "{_OPS}", {hq}, {oq}\)'), _both))
     return out
 
 

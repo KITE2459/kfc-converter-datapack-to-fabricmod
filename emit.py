@@ -3606,6 +3606,54 @@ def emit_trigger(nn: list[str], args: dict, em: Emitted) -> bool:
     em.kind = "native"; return True
 
 
+# ── as @e[type=..] 루프 본문의 '엔티티 집합 불변' 증명(화이트리스트, fail-closed) ──
+# typeBucketRO(무복사 순회)는 순회 중 버킷이 증분 변형(snapAdd/snapRemove)되면
+# ConcurrentModificationException / '선택 시점 고정 집합' 위반이 생긴다. 본문에
+# 스폰·킬·브릿지·임의 함수호출·탑승/차원이동이 전혀 없음을 텍스트로 증명한다:
+#   · 모든 KfcGen.<name>( 호출이 SAFE 집합에 속해야 하고 (미지 호출 = 거부)
+#   · FQCN.execute*/instantExecute/원시 엔티티 제거·탑승 토큰이 없어야 한다.
+_LOOP_SAFE_KFC = frozenset((
+    "nameOf", "setScore", "addScore", "opScore", "resetScore", "getScore", "getScoreOfEntity",
+    "readScore", "readScoreEnt", "scoreMatches", "scoreMatchesEntity", "entityScoreMatches",
+    "scoreCmp", "scoreCmpL", "scoreCmpR", "enableTrigger", "addTag", "removeTag",
+    "teamIs", "nameIs", "nbtMatches", "levelInRange", "entityInTypeTag", "entityTypeIs",
+    "playSound", "soundEvent", "soundCat", "stopSound", "tellraw", "titleText",
+    "titleActionbar", "titleTimes", "titleClear", "msgTo", "teamMsg",
+    "localOffset", "floorScale", "decodeInts", "cat", "objRef", "snbtCompound", "snbtValue",
+    "entityMergeSnbt", "entityPutSnbt", "entityGetDouble", "nbtGetEntity", "nbtGetStorage",
+    "nbtGetBlock", "storagePutSnbt", "storagePutNumber", "storageGetDouble",
+    "entityPathCount", "storagePathCount", "storageHasPath",
+    "effectGive", "effectClear", "effectClearAll", "spawnParticle",
+    "setBlock", "blockMatches", "blockStateMatches", "blockInTag", "posLoaded", "posInRange",
+    "rangeBox", "anyEntity", "anyEntityAnyType", "anyEntityWhere", "anyPlayerWhere", "anyPlayer",
+    "anyEntityInBox", "anyEntityScored", "anyEntityAnyTypeWhere", "anyEntityInTypeTag",
+    "anyEntityItemsCond", "anyEntityItemsMatch",
+    "firstEntity", "firstEntityWhere", "firstEntityAnyType", "firstEntityAnyTypeWhere",
+    "nearestEntity", "nearestEntityWhere", "nearestEntityAnyType", "nearestEntityAnyTypeWhere",
+    "nearestPlayer", "nearestPlayerWhere", "allEntities", "allEntitiesAny", "allEntitiesAnyType",
+    "entitiesByTypeBox", "entitiesSnapshot", "typeBucketCopy", "typeBucketRO", "passengerFirst",
+    "onPassengers", "onVehicle", "entityByUuid", "atEntity", "facing",
+    "scheduleFunction", "scheduleNative", "scheduleClear", "getOrCreateContext",
+))
+_LOOP_UNSAFE_TOKENS = (
+    ".execute(", ".executeReturn(", "_executeReturn(", "instantExecute", "runCommand",
+    "startRiding", "stopRiding", "dismount", "teleport", ".kill(", ".discard(",
+    "spawnEntity", "kickPlayer",
+)
+_KFC_CALL_RE = re.compile(r"KfcGen\.(\w+)\(")
+
+
+def _loop_body_entity_safe(stmts) -> bool:
+    text = "\n".join(s for s in stmts if s)
+    for tok in _LOOP_UNSAFE_TOKENS:
+        if tok in text:
+            return False
+    for name in _KFC_CALL_RE.findall(text):
+        if name not in _LOOP_SAFE_KFC:
+            return False
+    return True
+
+
 def emit_schedule(nn: list[str], args: dict, em: Emitted) -> bool:
     """schedule function <fn> <time> [append|replace] | schedule clear <fn>."""
     fn = first_arg(args, "function")
@@ -3622,7 +3670,18 @@ def emit_schedule(nn: list[str], args: dict, em: Emitted) -> bool:
     if ticks is None:
         em.reason = f"schedule 시간({time}) 파싱불가"; return False
     append = "append" in nn
-    em.java.append(f"KfcGen.scheduleFunction(source, {jstr(fn)}, {ticks}L, {str(append).lower()});")
+    if ALL_FIDS and fn in ALL_FIDS and fn not in MACRO_FNS:
+        # (#15) 변환된 네이티브 함수 → 자체 큐 스케줄러로 디스패치. 바닐라 타이머의
+        # NBT 영속화 + FunctionTimerCallback(원본 mcfunction 인터프리트) 경로를 우회해
+        # 발화 시 네이티브 호출 1회가 된다. 진입점이 tick 함수 디스패치 직후
+        # KfcGen.tickNativeSchedule 을 호출(바닐라 #tick→타이머 상대 순서 보존).
+        # 람다(비캡처=JVM 싱글턴) 사용 — merge_pass 의 호출부 재작성 정규식이
+        # 본문 `FQCN.executeReturn(` 을 버킷 메서드로 함께 재작성한다.
+        em.java.append(f"KfcGen.scheduleNative(source, {jstr(fn)}, {ticks}L, {str(append).lower()}, "
+                       f"_sch -> {fqcn(fn)}.executeReturn(_sch));")
+    else:
+        # 미변환(외부 네임스페이스)/매크로 함수는 종전대로 바닐라 타이머(고증 동일).
+        em.java.append(f"KfcGen.scheduleFunction(source, {jstr(fn)}, {ticks}L, {str(append).lower()});")
     em.kind = "native"; return True
 
 
@@ -6834,7 +6893,12 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             # 틱 스냅샷 타입버킷 복사 순회(월드 인덱스 재순회 + 결과 리스트 생성 제거).
             # 집합·순서 동일: 버킷 = 스냅샷(EntityIndex 순) 부분수열 = getEntitiesByType 순회 순서.
             # 바닐라 @e 기본 술어 isAlive 는 명시 가드로 재현(위 스냅샷(untyped) 경로와 동일).
-            out.append(f"for (Entity e : KfcGen.typeBucketCopy(ctx, {jtypes[0]})) {{")
+            # (#4) 본문·필터·가드 전체가 '엔티티 집합/버킷을 바꿀 수 없는' 호출만으로 구성됨이
+            # 화이트리스트 검사로 증명되면 복사 자체를 생략(typeBucketRO — 무복사 직접 순회).
+            _bucket_fn = ("typeBucketRO" if _loop_body_entity_safe(
+                [src_line or "", mod_guard or "", filt] + list(mr1) + list(body))
+                else "typeBucketCopy")
+            out.append(f"for (Entity e : KfcGen.{_bucket_fn}(ctx, {jtypes[0]})) {{")
             out.append(f"    Entity en = e; if (!(en.isAlive() && ({filt}))) continue;")
         if src_line: out.append("    " + src_line)
         out.extend(mr1)

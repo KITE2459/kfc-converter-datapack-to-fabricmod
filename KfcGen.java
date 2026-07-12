@@ -21,29 +21,65 @@ public final class KfcGen {
     //  HashMap 은 동시 변형 시 구조 손상 가능.)
     // 변환 출력은 상수 문자열(홀더명/사운드id/태그id/SNBT/텍스트 컴포넌트)을 매 틱 반복
     // 호출하므로, 문자열 → 파싱결과를 캐시해 매 호출 파싱/레지스트리 조회/객체 생성을 없앤다.
-    private static final java.util.HashMap<String, net.minecraft.scoreboard.ScoreHolder>
-            HOLDER_CACHE = new java.util.HashMap<>();
+    /** 상한 있는 삽입순(FIFO) 맵 — 매크로 산출 '동적 문자열 키' 유입 시 무한 성장/해시 열화 방지.
+     *  상수 키 워킹셋(수백~수천)보다 훨씬 큰 상한이라 정상 팩에서는 축출이 사실상 없다. */
+    private static <K, V> java.util.LinkedHashMap<K, V> boundedMap(final int cap) {
+        return new java.util.LinkedHashMap<K, V>(256, 0.75f, false) {
+            @Override protected boolean removeEldestEntry(java.util.Map.Entry<K, V> eldest) {
+                return size() > cap;
+            }
+        };
+    }
+
+    private static final java.util.Map<String, net.minecraft.scoreboard.ScoreHolder>
+            HOLDER_CACHE = boundedMap(16384);
     private static final java.util.HashMap<String, net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>>
             SOUND_CACHE = new java.util.HashMap<>();
     private static final java.util.HashMap<String, net.minecraft.sound.SoundCategory>
             SOUND_CAT_CACHE = new java.util.HashMap<>();
     private static final java.util.HashMap<String, net.minecraft.registry.tag.TagKey<net.minecraft.block.Block>>
             BLOCK_TAG_CACHE = new java.util.HashMap<>();
-    private static final java.util.HashMap<String, net.minecraft.nbt.NbtElement>
-            SNBT_CACHE = new java.util.HashMap<>();
+    private static final java.util.Map<String, net.minecraft.nbt.NbtElement>
+            SNBT_CACHE = boundedMap(8192);
     // NbtPath 는 파싱 후 완전 불변(string/nodeEndIndices/nodes 전부 final, 적용 시 root 만 다룸)이라
     // 재사용 안전. data 경로는 전부 상수 리터럴(storagePutSnbt 895 등 매 틱 호출)이므로 문자열→
     // NbtPath 캐시로 NbtPathArgumentType 재파싱을 제거한다.
-    private static final java.util.HashMap<String, net.minecraft.command.argument.NbtPathArgumentType.NbtPath>
-            NBTPATH_CACHE = new java.util.HashMap<>();
+    private static final java.util.Map<String, net.minecraft.command.argument.NbtPathArgumentType.NbtPath>
+            NBTPATH_CACHE = boundedMap(8192);
     // display transformation 행렬형 리터럴의 파싱+TRS 분해(matrix→translation/rotation/scale)는
     // setTransformation 이 매 호출 수행하는 핫 비용이다. AffineTransformation 은 불변이고 분해를
     // 인스턴스 내부에 1회 memoize(initialized 플래그)하므로, NbtElement 값 기준으로 캐시해 동일
     // 행렬의 재파싱·재분해를 제거한다(distinct 행렬당 1회). 캐시 인스턴스 공유는 불변이라 안전.
-    private static final java.util.HashMap<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
-            TRANSFORM_CACHE = new java.util.HashMap<>();
-    private static final java.util.HashMap<String, net.minecraft.text.Text>
-            TEXT_CACHE = new java.util.HashMap<>();
+    private static final java.util.Map<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
+            TRANSFORM_CACHE = boundedMap(8192);
+    /** 파싱된 텍스트 + '정적(재해석 불필요)' 플래그. score/selector/nbt 컴포넌트가 없는 트리는
+     *  Texts.parse 가 항등(불변 Text 복제)이므로 파싱된 인스턴스를 그대로 재사용해도 관측 동일. */
+    private static final class CachedText {
+        final net.minecraft.text.Text text; final boolean isStatic;
+        CachedText(net.minecraft.text.Text t, boolean s) { text = t; isStatic = s; }
+    }
+    private static final java.util.Map<String, CachedText>
+            TEXT_CACHE = boundedMap(8192);
+
+    /** 텍스트 트리에 런타임 해석(score/selector/nbt) 컴포넌트가 없으면 true.
+     *  translatable 인자·siblings 까지 재귀 검사. 모르는 콘텐츠 타입은 false(fail-closed). */
+    private static boolean isStaticText(net.minecraft.text.Text t) {
+        net.minecraft.text.TextContent c = t.getContent();
+        if (c instanceof net.minecraft.text.ScoreTextContent
+                || c instanceof net.minecraft.text.SelectorTextContent
+                || c instanceof net.minecraft.text.NbtTextContent) return false;
+        if (c instanceof net.minecraft.text.TranslatableTextContent tr) {
+            for (Object a : tr.getArgs()) {
+                if (a instanceof net.minecraft.text.Text at && !isStaticText(at)) return false;
+            }
+        } else if (!(c instanceof net.minecraft.text.PlainTextContent
+                || c instanceof net.minecraft.text.KeybindTextContent)) {
+            return false;   // 미지의 콘텐츠 타입 — 보수적으로 동적 취급
+        }
+        for (net.minecraft.text.Text s : t.getSiblings()) if (!isStaticText(s)) return false;
+        return true;
+    }
+
     private static final net.minecraft.nbt.NbtElement SNBT_INVALID = new net.minecraft.nbt.NbtCompound();
 
     /** 셀렉터 음수태그/빈 태그 인자용 공유 빈 배열 — 호출마다 new String[0] 할당을 없앤다.
@@ -246,7 +282,23 @@ public final class KfcGen {
         for (net.minecraft.entity.Entity e : list) {
             if (e != null && e.hasVehicle()) { anyRider = true; break; }
         }
-        if (anyRider) list.sort((a, b) -> Integer.compare(ridingDepth(b), ridingDepth(a)));
+        if (anyRider) {
+            // 비교자 내 ridingDepth 재계산(O(n log n × 깊이)) 대신 깊이를 1회 사전계산해
+            // (depth, 원래 인덱스) 키로 정렬한다. 인덱스 tie-break = 안정 정렬과 동일 순서
+            // (기존 TimSort 안정성 재현) — 결과 순서 완전 동일, 비교 비용만 감소.
+            final int n = list.size();
+            long[] keys = new long[n];   // 상위 32비트: -depth(내림차순), 하위 32비트: 인덱스
+            for (int i = 0; i < n; i++) {
+                net.minecraft.entity.Entity e = list.get(i);
+                int d = (e == null) ? 0 : ridingDepth(e);
+                keys[i] = ((long) (Integer.MAX_VALUE - d) << 32) | (i & 0xFFFFFFFFL);
+            }
+            java.util.Arrays.sort(keys);
+            java.util.ArrayList<net.minecraft.entity.Entity> sorted = new java.util.ArrayList<>(n);
+            java.util.List<net.minecraft.entity.Entity> src0 = list;
+            for (int i = 0; i < n; i++) sorted.add(src0.get((int) keys[i]));
+            return sorted;
+        }
         return list;
     }
 
@@ -304,6 +356,15 @@ public final class KfcGen {
         return new java.util.ArrayList<>(typeBucket(ctx, t));
     }
 
+    /** as @e[type=..] 루프 본문이 '엔티티 집합을 바꾸지 않음'이 변환 시점에 증명된 경우의
+     *  무복사 순회용(emit 이 본문 화이트리스트 검사 통과 시에만 이 판을 방출).
+     *  스폰/킬/브릿지/함수호출이 본문에 없으면 버킷의 증분 변형이 일어나지 않아
+     *  ConcurrentModificationException 및 '선택 시점 고정 집합' 위반이 없다 — 복사와 관측 동일. */
+    public static java.util.List<net.minecraft.entity.Entity> typeBucketRO(
+            GameContext ctx, net.minecraft.entity.EntityType<?> t) {
+        return typeBucket(ctx, t);
+    }
+
     /** 스폰/킬의 타입 인덱스 증분 반영(전체 재빌드 방지 — snapAdd/snapRemove 전용). */
     private static void typeIndexAdd(net.minecraft.entity.Entity e) {
         if (TYPE_INDEX == null || e == null) return;
@@ -313,6 +374,41 @@ public final class KfcGen {
         if (TYPE_INDEX == null || e == null) return;
         java.util.List<net.minecraft.entity.Entity> b = TYPE_INDEX.get(e.getType());
         if (b != null) b.remove(e);
+    }
+
+    // ── 틱 내 무제한 존재검사(@e[type/tag] 존재여부) 메모 ──
+    // 거리 필터가 없는 존재검사는 위치와 무관 — 같은 (타입, 태그) 시그니처의 반복 질의가
+    // 한 틱에 수십 회 발생한다(조건부 tick 함수). 배열 신원 기반 키로 boolean 결과를 캐시.
+    // 무효화 3축: 틱 경계 / ENTITY_GEN(스폰·킬·브릿지) / QUERY_MUT(태그 증분·생사 변화).
+    static long QUERY_MUT = 0;
+    private static final class QKey {
+        final Object a, b, c;
+        QKey(Object a, Object b, Object c) { this.a = a; this.b = b; this.c = c; }
+        @Override public boolean equals(Object o) {
+            return (o instanceof QKey k) && k.a == a && k.b == b && k.c == c;   // 신원 비교
+        }
+        @Override public int hashCode() {
+            return System.identityHashCode(a) * 31 * 31
+                 + System.identityHashCode(b) * 31 + System.identityHashCode(c);
+        }
+    }
+    private static final java.util.HashMap<QKey, Boolean> ANY_MEMO = new java.util.HashMap<>();
+    private static int  AM_TICK = Integer.MIN_VALUE;
+    private static long AM_GEN = -1, AM_MUT = -1;
+    private static net.minecraft.server.MinecraftServer AM_SERVER;
+
+    private static Boolean anyMemoGet(GameContext ctx, Object type, String[] tagsPos, String[] tagsNeg) {
+        int tk = ctx.server.getTicks();
+        if (AM_SERVER != ctx.server || AM_TICK != tk || AM_GEN != ENTITY_GEN || AM_MUT != QUERY_MUT) {
+            ANY_MEMO.clear();
+            AM_SERVER = ctx.server; AM_TICK = tk; AM_GEN = ENTITY_GEN; AM_MUT = QUERY_MUT;
+            return null;
+        }
+        return ANY_MEMO.get(new QKey(type, tagsPos, tagsNeg));
+    }
+    private static boolean anyMemoPut(Object type, String[] tagsPos, String[] tagsNeg, boolean v) {
+        ANY_MEMO.put(new QKey(type, tagsPos, tagsNeg), v);
+        return v;
     }
 
     // ── 틱 단위 태그→엔티티 버킷 (@e[tag=..] 무제한 스캔 핫패스용) ──
@@ -361,15 +457,24 @@ public final class KfcGen {
 
     private static final int TAG_BOUNDED_MAX = 128;
     static java.util.List<net.minecraft.entity.Entity> tagCandidatesBounded(GameContext ctx, String[] tagsPos) {
-        if (tagsPos == null || tagsPos.length == 0) return null;
-        java.util.List<net.minecraft.entity.Entity> b = tagBucket(ctx, tagsPos[0]);
-        return b.size() <= TAG_BOUNDED_MAX ? b : null;
+        java.util.List<net.minecraft.entity.Entity> b = tagCandidates(ctx, tagsPos);
+        return (b != null && b.size() <= TAG_BOUNDED_MAX) ? b : null;
     }
 
     /** 무제한 스캔의 후보 축소: 양성 태그가 있으면 그 태그 버킷(대개 소수), 없으면 null(기존 소스 사용).
      *  호출측은 반드시 기존 필터(matchTagsAlive/타입/거리)를 그대로 재적용해야 한다 — 버킷은 1차 후보일 뿐. */
     static java.util.List<net.minecraft.entity.Entity> tagCandidates(GameContext ctx, String[] tagsPos) {
-        return (tagsPos != null && tagsPos.length > 0) ? tagBucket(ctx, tagsPos[0]) : null;
+        if (tagsPos == null || tagsPos.length == 0) return null;
+        // 양성 태그가 여럿이면 가장 작은 버킷을 순회 기반으로 선택(호출측이 전체 태그를
+        // 라이브 재검사하므로 어느 버킷을 골라도 결과 집합 동일 — 순회량만 최소화).
+        // 버킷은 태그별 틱-캐시라 추가 버킷 구축 비용은 태그당 틱당 1회로 상한된다.
+        java.util.List<net.minecraft.entity.Entity> best = tagBucket(ctx, tagsPos[0]);
+        for (int i = 1; i < tagsPos.length; i++) {
+            if (best.isEmpty()) return best;
+            java.util.List<net.minecraft.entity.Entity> b = tagBucket(ctx, tagsPos[i]);
+            if (b.size() < best.size()) best = b;
+        }
+        return best;
     }
 
     /** 타입 미지정 무제한 스캔용: 양성 태그가 있으면 태그 버킷, 없으면 스냅샷(종전 소스). */
@@ -382,6 +487,7 @@ public final class KfcGen {
     public static void addTag(net.minecraft.entity.Entity e, String tag) {
         if (e == null) return;
         if (e.addCommandTag(tag)) {   // false(이미 있음/1024 초과) = 변화 없음 → 버킷 불변
+            QUERY_MUT++;               // 태그 변화 → 존재검사 메모 무효화
             java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
             if (b != null && !b.contains(e)) b.add(e);
         }
@@ -391,6 +497,7 @@ public final class KfcGen {
     public static void removeTag(net.minecraft.entity.Entity e, String tag) {
         if (e == null) return;
         if (e.removeCommandTag(tag)) {
+            QUERY_MUT++;               // 태그 변화 → 존재검사 메모 무효화
             java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
             if (b != null) b.remove(e);
         }
@@ -412,6 +519,7 @@ public final class KfcGen {
     /** e.readNbt(n) 대체 — readNbt 는 n.Tags 로 커맨드태그를 통째로 재로드할 수 있다(data merge/
      *  modify entity, store ... entity 등). 전후 태그가 실제로 달라졌을 때만 버킷을 무효화한다. */
     private static void readNbtTagAware(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound n) {
+        QUERY_MUT++;   // NBT 재로드는 Tags/Health(생사)를 바꿀 수 있음 → 존재검사 메모 무효화
         if (TAG_BUCKETS.isEmpty()) { e.readNbt(n); return; }
         java.util.HashSet<String> before = new java.util.HashSet<>(e.getCommandTags());
         e.readNbt(n);
@@ -1222,6 +1330,7 @@ public final class KfcGen {
                  : w.getDamageSources().create(net.minecraft.registry.RegistryKey.of(
                        net.minecraft.registry.RegistryKeys.DAMAGE_TYPE, id));
         }
+        QUERY_MUT++;   // 피해로 즉사 가능(isAlive 변화) → 존재검사 메모 무효화
         e.damage(w, ds, amount);
     }
 
@@ -1233,6 +1342,7 @@ public final class KfcGen {
                 ? w.getDamageSources().generic()
                 : w.getDamageSources().create(net.minecraft.registry.RegistryKey.of(
                         net.minecraft.registry.RegistryKeys.DAMAGE_TYPE, id), attacker);
+        QUERY_MUT++;   // 피해로 즉사 가능 → 존재검사 메모 무효화
         e.damage(w, ds, amount);
     }
 
@@ -1260,11 +1370,72 @@ public final class KfcGen {
         if (id == null) return;
         long trigger = src.getServer().getOverworld().getTime() + delayTicks;
         net.minecraft.world.timer.Timer<net.minecraft.server.MinecraftServer> timer = _fnTimer(src);
-        if (!append) timer.remove(fnId);
+        if (!append) { timer.remove(fnId); schedNativeRemove(fnId); }   // replace 는 양쪽 큐 모두 대체
         timer.setEvent(fnId, trigger, new net.minecraft.world.timer.FunctionTimerCallback(id));
     }
     public static void scheduleClear(net.minecraft.server.command.ServerCommandSource src, String fnId) {
         _fnTimer(src).remove(fnId);
+        schedNativeRemove(fnId);   // 네이티브 큐에 있어도 clear 시맨틱 유지
+    }
+
+    // ── 네이티브 스케줄러(#15): 변환된 함수 대상 schedule 을 바닐라 타이머(리플렉션 콜백 →
+    //    mcfunction 인터프리트) 대신 자체 큐 + 네이티브 호출로 디스패치한다.
+    //    발화 시점: 진입점 START_SERVER_TICK 의 tick 함수 디스패치 '직후'(= tick 함수 → 스케줄
+    //    함수 순서 — 바닐라의 #tick 함수 → 월드 타이머 순서와 상대 순서 동일).
+    //    소스: 바닐라 FunctionTimerCallback 과 동일(server.getCommandSource().withLevel(2).withSilent()).
+    //    참고(계약 편차·문서화): 바닐라 타이머는 level.dat 에 영속돼 서버 재시작 후 복원되지만
+    //    네이티브 큐는 메모리 상주라 재시작 시 소실된다(수 틱 단위 연쇄 스케줄 용도에선 무영향).
+    private static final class SchedEntry {
+        final long due, seq; final String key;
+        final java.util.function.Consumer<net.minecraft.server.command.ServerCommandSource> fn;
+        boolean cancelled;
+        SchedEntry(long due, long seq, String key,
+                   java.util.function.Consumer<net.minecraft.server.command.ServerCommandSource> fn) {
+            this.due = due; this.seq = seq; this.key = key; this.fn = fn;
+        }
+    }
+    private static final java.util.PriorityQueue<SchedEntry> SCHED_Q = new java.util.PriorityQueue<>(
+            (a, b) -> a.due != b.due ? Long.compare(a.due, b.due) : Long.compare(a.seq, b.seq));
+    private static final java.util.HashMap<String, java.util.ArrayList<SchedEntry>> SCHED_BY_KEY =
+            new java.util.HashMap<>();
+    private static long SCHED_NOW = 0, SCHED_SEQ = 0;
+
+    private static void schedNativeRemove(String key) {
+        java.util.ArrayList<SchedEntry> l = SCHED_BY_KEY.remove(key);
+        if (l != null) for (SchedEntry e : l) e.cancelled = true;   // PQ 에선 지연 제거
+    }
+
+    /** schedule function <fnId>(변환된 네이티브 함수) — emit 이 대상 함수의 메서드 참조를 넘긴다. */
+    public static void scheduleNative(net.minecraft.server.command.ServerCommandSource src,
+                                      String fnId, long delayTicks, boolean append,
+                                      java.util.function.Consumer<net.minecraft.server.command.ServerCommandSource> fn) {
+        if (!append) { schedNativeRemove(fnId); _fnTimer(src).remove(fnId); }   // replace: 양쪽 큐 대체
+        SchedEntry e = new SchedEntry(SCHED_NOW + Math.max(delayTicks, 0L), SCHED_SEQ++, fnId, fn);
+        SCHED_Q.add(e);
+        SCHED_BY_KEY.computeIfAbsent(fnId, k -> new java.util.ArrayList<>(2)).add(e);
+    }
+
+    /** 진입점이 매 틱(tick 함수 디스패치 직후) 호출. 같은 틱 재-스케줄은 다음 틱 발화(바닐라 동일). */
+    public static void tickNativeSchedule(net.minecraft.server.MinecraftServer server) {
+        SCHED_NOW++;
+        if (SCHED_Q.isEmpty()) return;
+        java.util.ArrayList<SchedEntry> due = null;
+        while (!SCHED_Q.isEmpty() && SCHED_Q.peek().due <= SCHED_NOW) {
+            SchedEntry e = SCHED_Q.poll();
+            if (e.cancelled) continue;
+            java.util.ArrayList<SchedEntry> l = SCHED_BY_KEY.get(e.key);
+            if (l != null) { l.remove(e); if (l.isEmpty()) SCHED_BY_KEY.remove(e.key); }
+            if (due == null) due = new java.util.ArrayList<>(4);
+            due.add(e);
+        }
+        if (due == null) return;
+        // 발화 목록을 먼저 확정한 뒤 실행 — 실행 중 재스케줄(0~1t 연쇄)은 다음 틱으로(바닐라 동일).
+        net.minecraft.server.command.ServerCommandSource src =
+                server.getCommandSource().withLevel(2).withSilent();   // 바닐라 getScheduledCommandSource 동일
+        for (SchedEntry e : due) {
+            try { e.fn.accept(src); }
+            catch (Exception ex) { System.err.println("[KFC-SCHED] " + e.key + ": " + ex); }
+        }
     }
 
     // ── give: 아이템 지급(스택 한도 초과 시 분할, 오버플로우는 giveItemStack 이 드롭) ──
@@ -1407,6 +1578,7 @@ public final class KfcGen {
         // 기존 discard() 는 단순 despawn(사망 이벤트·드롭 없음)이고 플레이어를 통째로 무시해
         // 바닐라와 시맨틱이 달랐다.
         if (!(e.getWorld() instanceof net.minecraft.server.world.ServerWorld sw)) return;
+        QUERY_MUT++;   // 생사 변화(생물은 제거 지연이라 ENTITY_GEN 이 안 오름) → 메모 무효화
         e.kill(sw);
         // 생물은 death 처리(실제 제거는 이후) → death 프레임 동안 셀렉터에 잡히는 바닐라 동작을
         // 위해 스냅샷을 건드리지 않고 틱 경계 재수집(entitiesSnapshot)에 맡긴다.
@@ -1808,6 +1980,7 @@ public final class KfcGen {
 
     /** scoreboard players reset <holder> [<obj>] — obj null 이면 전 목표에서 제거. */
     public static void resetScore(ServerScoreboard sb, String holder, String o) {
+        invalidateScoreHandles();   // 엔트리 제거 — 캐시된 ScoreAccess 가 고아 엔트리를 참조하지 않도록
         if ("*".equals(holder)) { resetScoreWildcard(sb, o); return; }
         ScoreHolder sh = holderOf(holder);
         if (o == null) {
@@ -1821,6 +1994,7 @@ public final class KfcGen {
     /** scoreboard players reset * [obj] — 와일드카드. 추적 중인 '모든' 홀더의 점수를 리셋.
      *  obj 가 null 이면 전 오브젝티브, 아니면 해당 오브젝티브만. (바닐라 '*' 시맨틱) */
     public static void resetScoreWildcard(ServerScoreboard sb, String o) {
+        invalidateScoreHandles();
         java.util.List<ScoreHolder> holders =
                 new java.util.ArrayList<>(sb.getKnownScoreHolders());
         if (o == null) {
@@ -1927,16 +2101,20 @@ public final class KfcGen {
         // 같은 파서를 사용한다. (이전 fromJson 경로는 액션바 게이지의 storage/interpret/
         // separator 컴포넌트가 바닐라와 미묘하게 달라 외부 HUD 모드가 인식하지 못했음.)
         try {
-            net.minecraft.text.Text cached = TEXT_CACHE.get(json);
+            CachedText cached = TEXT_CACHE.get(json);
             if (cached == null) {
                 net.minecraft.command.CommandRegistryAccess cra =
                         net.minecraft.command.CommandRegistryAccess.of(
                                 source.getRegistryManager(), source.getEnabledFeatures());
-                cached = net.minecraft.command.argument.TextArgumentType.text(cra)
+                net.minecraft.text.Text parsed = net.minecraft.command.argument.TextArgumentType.text(cra)
                         .parse(new com.mojang.brigadier.StringReader(json));
-                TEXT_CACHE.put(json, cached);  // 컴포넌트 리터럴은 상수 — 파싱 1회면 충분 (resolve 는 매 호출)
+                // 컴포넌트 리터럴은 상수 — 파싱 1회면 충분. 정적 여부도 1회 판정해 함께 캐시.
+                cached = new CachedText(parsed, isStaticText(parsed));
+                TEXT_CACHE.put(json, cached);
             }
-            return net.minecraft.text.Texts.parse(source, cached, sender, 0);
+            // 정적 트리는 Texts.parse 가 항등(동등 복제)이므로 생략 — 파싱 인스턴스 재사용(불변).
+            if (cached.isStatic) return cached.text;
+            return net.minecraft.text.Texts.parse(source, cached.text, sender, 0);
         } catch (Exception ex) {
             try {  // 폴백: 구 JSON 경로
                 net.minecraft.text.Text raw = net.minecraft.text.Text.Serialization.fromJson(
@@ -2946,6 +3124,28 @@ public final class KfcGen {
         instantExecuteFunction(source, functionId, null);
     }
 
+    // ── CommandFunction 핸들 캐시(#12) — 브릿지마다 manager.getFunction(id) Optional 조회 제거.
+    // 무효화: 틱 경계(리로드는 명령 처리 틱에 일어나므로 다음 틱이면 항상 재해소) +
+    //         runCommand 의 reload/datapack 계열 실행 직후(같은 틱 내 재조회 정합).
+    private static final java.util.HashMap<net.minecraft.util.Identifier,
+            net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource>>
+            FN_CACHE = new java.util.HashMap<>();
+    private static int FN_TICK = Integer.MIN_VALUE;
+    private static net.minecraft.server.MinecraftServer FN_SERVER;
+
+    private static net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource>
+            functionHandle(net.minecraft.server.MinecraftServer server, net.minecraft.util.Identifier id) {
+        int tk = server.getTicks();
+        if (FN_SERVER != server || FN_TICK != tk) { FN_CACHE.clear(); FN_SERVER = server; FN_TICK = tk; }
+        net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource> fn =
+                FN_CACHE.get(id);
+        if (fn == null) {
+            fn = server.getCommandFunctionManager().getFunction(id).orElse(null);
+            if (fn != null) FN_CACHE.put(id, fn);
+        }
+        return fn;
+    }
+
     /** 브릿지 폴백에서 mcfunction 매크로에 넘길 NbtCompound 를 만든다.
      *  SnapMacroArgs(= `with entity/storage/block <path>` 로 만든 인자)면 바인드 시점 원본 타입 NBT 를
      *  그대로 넘겨, 바닐라 Macro.withMacroReplaced/Macro.toString 이 직접 포맷하게 한다(고증 완전 일치).
@@ -2973,11 +3173,45 @@ public final class KfcGen {
     public static void runCommand(net.minecraft.server.command.ServerCommandSource source, String command) {
         try {
             source.getServer().getCommandManager().executeWithPrefix(source, command);
-            ENTITY_GEN++;   // 디스패처 실행이 summon/kill 했을 수 있으므로 스냅샷 무효화
-            OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
+            // 선별적 무효화(#11): 명령 문자열은 변환 시점 상수 — 첫 토큰으로 분류해
+            // 엔티티 집합/태그/탑승/objective 에 영향을 줄 수 없는 명령은 GEN 스래싱을 생략.
+            // 분류 불가/미지 명령은 종전대로 전체 무효화(fail-closed).
+            int cls = classifyCommand(command);
+            if ((cls & CMD_SAFE) == 0) {
+                ENTITY_GEN++;   // 디스패처 실행이 summon/kill/tag/ride 했을 수 있으므로 무효화
+                OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
+            }
+            if ((cls & CMD_RELOADS) != 0) FN_CACHE.clear();   // reload/datapack — 함수 핸들 재해소
         } catch (Exception ex) {
             System.err.println("[KFC-CMD] '" + command + "' : " + ex);
         }
+    }
+
+    private static final int CMD_SAFE = 1, CMD_RELOADS = 2;
+    private static final java.util.HashMap<String, Integer> CMD_CLASS = new java.util.HashMap<>();
+    /** 엔티티 집합·태그·탑승·objective 어느 것도 바꿀 수 없는 명령 첫 토큰(화이트리스트).
+     *  여기 없는 명령(execute/function/summon/kill/tag/ride/scoreboard/data/tp/give/loot/
+     *  advancement/place/spreadplayers/reload/datapack …)은 전부 전체 무효화 유지. */
+    private static final java.util.Set<String> CMD_SAFE_ROOTS = java.util.Set.of(
+            "weather", "time", "difficulty", "gamerule", "playsound", "stopsound", "music",
+            "particle", "title", "tellraw", "say", "tell", "msg", "w", "teammsg", "tm",
+            "bossbar", "worldborder", "gamemode", "defaultgamemode", "xp", "experience",
+            "clear", "item", "recipe", "fill", "setblock", "clone", "forceload",
+            "effect", "enchant", "spawnpoint", "setworldspawn");
+
+    private static int classifyCommand(String command) {
+        Integer c = CMD_CLASS.get(command);
+        if (c != null) return c;
+        String s = command;
+        int b = 0;
+        while (b < s.length() && (s.charAt(b) == '/' || s.charAt(b) == ' ')) b++;
+        int sp = s.indexOf(' ', b);
+        String root = (sp < 0 ? s.substring(b) : s.substring(b, sp));
+        int v = 0;
+        if (CMD_SAFE_ROOTS.contains(root)) v |= CMD_SAFE;
+        if (root.equals("reload") || root.equals("datapack")) v |= CMD_RELOADS;
+        if (CMD_CLASS.size() < 4096) CMD_CLASS.put(command, v);   // 상수 명령만 유입 — 상한은 방어용
+        return v;
     }
 
     /** 함수 폴백 + 반환값 캡처 — 폴백 함수의 executeReturn 이 mcfunction return 값을
@@ -2990,7 +3224,7 @@ public final class KfcGen {
             net.minecraft.server.MinecraftServer server = source.getServer();
             net.minecraft.server.function.CommandFunctionManager manager = server.getCommandFunctionManager();
             net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource> fn =
-                    manager.getFunction(functionId).orElse(null);
+                    functionHandle(server, functionId);
             if (fn == null) { System.err.println("[KFC-BRIDGE-ERROR] function not loaded: " + functionId); return 0; }
             net.minecraft.nbt.NbtCompound nbt = bridgeMacroNbt(macroArgs);
             net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
@@ -3035,7 +3269,7 @@ public final class KfcGen {
             net.minecraft.server.MinecraftServer server = source.getServer();
             net.minecraft.server.function.CommandFunctionManager manager = server.getCommandFunctionManager();
             net.minecraft.server.function.CommandFunction<net.minecraft.server.command.ServerCommandSource> fn =
-                    manager.getFunction(functionId).orElse(null);
+                    functionHandle(server, functionId);
             if (fn == null) { System.err.println("[KFC-BRIDGE-ERROR] function not loaded: " + functionId); return; }
             net.minecraft.nbt.NbtCompound nbt = bridgeMacroNbt(macroArgs);
             net.minecraft.server.function.Procedure<net.minecraft.server.command.ServerCommandSource> procedure;
@@ -3247,6 +3481,36 @@ public final class KfcGen {
         return sc.getScore();
     }
 
+    // ──────────────── ScoreAccess 핸들 캐시 ────────────────
+    // setScore/addScore/opScore 가 매 호출 getOrCreateScore(홀더 문자열 해시 조회 + ScoreAccess
+    // 래퍼 할당)를 타던 것을 (ObjRef, 홀더)별 핸들 재사용으로 대체한다. 핸들은 스코어보드의
+    // 라이브 엔트리에 바인딩되므로 '엔트리가 제거될 수 있는' 모든 지점에서 무효화해야 한다:
+    //   · OBJ_GEN 변화(틱 경계 재해소 / objective add·remove / 브릿지·runCommand) → 전체 클리어
+    //   · 우리 resetScore/resetScoreWildcard(엔트리 제거) → 전체 클리어
+    // 시맨틱: 캐시 미스 시 getOrCreateScore(엔트리 존재화 부수효과 포함) — 종전과 동일.
+    // 히트 시에도 '이미 존재하는 엔트리'에 대한 재-getOrCreate 는 무변경이므로 관측 동일.
+    private static long SH_GEN = Long.MIN_VALUE;
+    private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess>>
+            SCORE_HANDLES = new java.util.HashMap<>();
+
+    private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
+        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); SH_GEN = OBJ_GEN; }
+        java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(o);
+        if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(o, m); }
+        net.minecraft.scoreboard.ScoreAccess a = m.get(holderKey);
+        if (a == null) {
+            ScoreboardObjective ob = obj(sb, o);
+            if (ob == null) return null;
+            ScoreHolder h = (holderKey instanceof net.minecraft.entity.Entity e)
+                    ? e : holderOf((String) holderKey);
+            a = sb.getOrCreateScore(h, ob);
+            m.put(holderKey, a);
+        }
+        return a;
+    }
+
+    private static void invalidateScoreHandles() { SCORE_HANDLES.clear(); }
+
     // ──────────────── ObjRef 오버로드 (merge_pass pass-4 가 상수 objective 를 승격) ────────────────
     // String 판과 시맨틱 완전 동일 — objective 해소만 캐시(obj(sb, ref)) 경유.
     public static boolean scoreMatches(ServerScoreboard sb, String holder, ObjRef o,
@@ -3303,23 +3567,100 @@ public final class KfcGen {
         return s == null ? 0 : s.getScore();
     }
     public static void setScore(ServerScoreboard sb, String holder, ObjRef o, int v) {
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return;
-        sb.getOrCreateScore(holderOf(holder), ob).setScore(v);
+        net.minecraft.scoreboard.ScoreAccess a = scoreHandle(sb, holder, o);
+        if (a != null) a.setScore(v);
     }
     public static void addScore(ServerScoreboard sb, String holder, ObjRef o, int n) {
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return;
-        net.minecraft.scoreboard.ScoreAccess a = sb.getOrCreateScore(holderOf(holder), ob);
-        a.setScore(a.getScore() + n);
+        net.minecraft.scoreboard.ScoreAccess a = scoreHandle(sb, holder, o);
+        if (a != null) a.setScore(a.getScore() + n);
+    }
+    // ── 엔티티 직접판(#2) — nameOf→holderOf 문자열 왕복 제거. 홀더 키 = 엔티티 신원. ──
+    public static void setScore(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o, int v) {
+        if (e == null) return;
+        net.minecraft.scoreboard.ScoreAccess a = scoreHandle(sb, e, o);
+        if (a != null) a.setScore(v);
+    }
+    public static void addScore(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o, int n) {
+        if (e == null) return;
+        net.minecraft.scoreboard.ScoreAccess a = scoreHandle(sb, e, o);
+        if (a != null) a.setScore(a.getScore() + n);
+    }
+    public static void setScore(ServerScoreboard sb, net.minecraft.entity.Entity e, String o, int v) {
+        if (e == null) return;
+        setScore(sb, nameOf(e), o, v);
+    }
+    public static void addScore(ServerScoreboard sb, net.minecraft.entity.Entity e, String o, int n) {
+        if (e == null) return;
+        addScore(sb, nameOf(e), o, n);
+    }
+    public static void resetScore(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
+        if (e == null) return;
+        resetScore(sb, nameOf(e), o);
+    }
+    public static int getScore(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
+        return getScoreOfEntity(sb, e, o);
+    }
+    public static int getScore(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
+        return getScoreOfEntity(sb, e, o);
+    }
+    public static Integer readScore(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
+        return readScoreEnt(sb, e, o);
+    }
+    public static Integer readScore(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
+        if (e == null) return null;
+        return readScore(sb, nameOf(e), o);
+    }
+    public static void enableTrigger(ServerScoreboard sb, net.minecraft.entity.Entity e, String o) {
+        if (e == null) return;
+        enableTrigger(sb, nameOf(e), o);
+    }
+    // opScore 엔티티 홀더 조합(String objective 판 — pass-4 이전 레코드용 위임)
+    public static void opScore(ServerScoreboard sb, net.minecraft.entity.Entity de, String dobj, String op,
+                               String sh, String sobj) {
+        if (de == null) return;
+        opScore(sb, nameOf(de), dobj, op, sh, sobj);
+    }
+    public static void opScore(ServerScoreboard sb, String dh, String dobj, String op,
+                               net.minecraft.entity.Entity se, String sobj) {
+        if (se == null) return;
+        opScore(sb, dh, dobj, op, nameOf(se), sobj);
+    }
+    public static void opScore(ServerScoreboard sb, net.minecraft.entity.Entity de, String dobj, String op,
+                               net.minecraft.entity.Entity se, String sobj) {
+        if (de == null || se == null) return;
+        opScore(sb, nameOf(de), dobj, op, nameOf(se), sobj);
+    }
+    // opScore 엔티티 홀더 조합(ObjRef 판 — pass-4 승격 후, 핸들 캐시 직결)
+    public static void opScore(ServerScoreboard sb, net.minecraft.entity.Entity de, ObjRef dobj, String op,
+                               String sh, ObjRef sobj) {
+        if (de == null) return;
+        opScoreH(sb, de, dobj, op, sh, sobj);
+    }
+    public static void opScore(ServerScoreboard sb, String dh, ObjRef dobj, String op,
+                               net.minecraft.entity.Entity se, ObjRef sobj) {
+        if (se == null) return;
+        opScoreH(sb, dh, dobj, op, se, sobj);
+    }
+    public static void opScore(ServerScoreboard sb, net.minecraft.entity.Entity de, ObjRef dobj, String op,
+                               net.minecraft.entity.Entity se, ObjRef sobj) {
+        if (de == null || se == null) return;
+        opScoreH(sb, de, dobj, op, se, sobj);
     }
     public static void opScore(ServerScoreboard sb, String dh, ObjRef dobj, String op,
                                String sh, ObjRef sobj) {
-        // String 판 opScore 와 동일: 대상·소스 getOrCreateScore(존재화 부수효과 포함)
-        ScoreboardObjective od = obj(sb, dobj), os = obj(sb, sobj);
-        if (od == null || os == null) return;
-        net.minecraft.scoreboard.ScoreAccess da = sb.getOrCreateScore(holderOf(dh), od);
-        net.minecraft.scoreboard.ScoreAccess sa = sb.getOrCreateScore(holderOf(sh), os);
+        opScoreH(sb, dh, dobj, op, sh, sobj);
+    }
+    /** opScore 공통 본체 — 홀더 키(String|Entity) 불문 핸들 캐시 경유. String 판과 시맨틱 동일. */
+    private static void opScoreH(ServerScoreboard sb, Object dh, ObjRef dobj, String op,
+                                 Object sh, ObjRef sobj) {
+        // String 판 opScore 와 동일: 두 objective 해소를 '먼저' 검사(어느 한쪽 부재 시 아무
+        // 부수효과 없이 반환 — 원판과 엔트리 존재화 순서/조건 동일), 그 후 대상·소스
+        // getOrCreateScore(존재화 부수효과 포함) — 핸들 캐시 경유.
+        if (obj(sb, dobj) == null || obj(sb, sobj) == null) return;
+        net.minecraft.scoreboard.ScoreAccess da = scoreHandle(sb, dh, dobj);
+        if (da == null) return;
+        net.minecraft.scoreboard.ScoreAccess sa = scoreHandle(sb, sh, sobj);
+        if (sa == null) return;
         int b = sa.getScore();
         int r;
         switch (op) {
@@ -3384,6 +3725,91 @@ public final class KfcGen {
                                    String op, net.minecraft.entity.Entity eb, String ob, boolean neg) {
         if (ea == null || eb == null) return false;
         return neg ^ scoreCmp(sb, ea.getNameForScoreboard(), oa, op, eb.getNameForScoreboard(), ob);
+    }
+
+    // ──────────────── 상수 소스 opScore (const_fold 확장) ────────────────
+    // `scoreboard players operation D DO <op> #상수 O` 의 소스가 폴딩 상수 N 으로 증명된 경우.
+    // 소스 getOrCreateScore 부수효과는 '이미 존재(load 시 set)+무변경'이라 관측 불변(const_fold 논증).
+    public static void opScoreN(ServerScoreboard sb, String dh, ObjRef dobj, String op, int n) {
+        net.minecraft.scoreboard.ScoreAccess da = scoreHandle(sb, dh, dobj);
+        if (da != null) _opN(da, op, n);
+    }
+    public static void opScoreN(ServerScoreboard sb, net.minecraft.entity.Entity de, ObjRef dobj, String op, int n) {
+        if (de == null) return;
+        net.minecraft.scoreboard.ScoreAccess da = scoreHandle(sb, de, dobj);
+        if (da != null) _opN(da, op, n);
+    }
+    public static void opScoreN(ServerScoreboard sb, String dh, String dobj, String op, int n) {
+        ScoreboardObjective ob = obj(sb, dobj);
+        if (ob == null) return;
+        _opN(sb.getOrCreateScore(holderOf(dh), ob), op, n);
+    }
+    public static void opScoreN(ServerScoreboard sb, net.minecraft.entity.Entity de, String dobj, String op, int n) {
+        if (de == null) return;
+        opScoreN(sb, nameOf(de), dobj, op, n);
+    }
+    private static void _opN(net.minecraft.scoreboard.ScoreAccess da, String op, int b) {
+        int r;
+        switch (op) {
+            case "=":  r = b; break;
+            case "+=": r = da.getScore() + b; break;
+            case "-=": r = da.getScore() - b; break;
+            case "*=": r = da.getScore() * b; break;
+            case "/=": if (b == 0) return; r = Math.floorDiv(da.getScore(), b); break;
+            case "%=": if (b == 0) return; r = Math.floorMod(da.getScore(), b); break;
+            case "<":  r = Math.min(da.getScore(), b); break;
+            case ">":  r = Math.max(da.getScore(), b); break;
+            default: return;
+        }
+        da.setScore(r);
+    }
+
+    /** 강등(score-demote) 지역 연산용 — mcfunction /= 시맨틱(0 나누기 = 무변경, floorDiv). */
+    public static int sdiv(int a, int b) { return b == 0 ? a : Math.floorDiv(a, b); }
+    /** 강등 지역 연산용 — mcfunction %= 시맨틱(0 나머지 = 무변경, floorMod). */
+    public static int smod(int a, int b) { return b == 0 ? a : Math.floorMod(a, b); }
+
+    // ──────────────── 상수 폴딩 비교 헬퍼 (const_fold 확장 #3①) ────────────────
+    // scoreCmp 의 한쪽이 폴딩된 상수일 때: 상수 측은 '항상 설정'이 증명돼 있으므로
+    // 나머지 측 읽기 + null 검사 + 순수 int 비교로 재작성된다. 시맨틱 동일
+    // (양측 미설정 → false 규칙에서 상수 측은 설정 확정).
+    private static boolean _cmpI(int a, String op, int b) {
+        switch (op) {
+            case "<":  return a < b;
+            case "<=": return a <= b;
+            case "=":  return a == b;
+            case ">=": return a >= b;
+            case ">":  return a > b;
+            default:   return false;
+        }
+    }
+    public static boolean scoreCmpL(ServerScoreboard sb, int a, String op, String hb, String ob) {
+        Integer b = read(sb, hb, ob);
+        return b != null && _cmpI(a, op, b);
+    }
+    public static boolean scoreCmpL(ServerScoreboard sb, int a, String op,
+                                    net.minecraft.entity.Entity eb, String ob) {
+        if (eb == null) return false;
+        return scoreCmpL(sb, a, op, eb.getNameForScoreboard(), ob);
+    }
+    public static boolean scoreCmpL(ServerScoreboard sb, int a, String op,
+                                    net.minecraft.entity.Entity eb, String ob, boolean neg) {
+        if (eb == null) return false;
+        return neg ^ scoreCmpL(sb, a, op, eb.getNameForScoreboard(), ob);
+    }
+    public static boolean scoreCmpR(ServerScoreboard sb, String ha, String oa, String op, int b) {
+        Integer a = read(sb, ha, oa);
+        return a != null && _cmpI(a, op, b);
+    }
+    public static boolean scoreCmpR(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
+                                    String op, int b) {
+        if (ea == null) return false;
+        return scoreCmpR(sb, ea.getNameForScoreboard(), oa, op, b);
+    }
+    public static boolean scoreCmpR(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
+                                    String op, int b, boolean neg) {
+        if (ea == null) return false;
+        return neg ^ scoreCmpR(sb, ea.getNameForScoreboard(), oa, op, b);
     }
 
     // ──────────────── if entity <selector> 존재 검사 ────────────────
@@ -3453,12 +3879,18 @@ public final class KfcGen {
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
         // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
+        boolean _unb = (minDist < 0 && maxDist < 0);   // 거리 무제한 = 위치 무관 → 메모 가능
+        if (_unb) {
+            Boolean _m = anyMemoGet(ctx, type, tagsPos, tagsNeg);
+            if (_m != null) return _m;
+        }
         java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
         for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, type))) {
             if (_tb != null && e.getType() != type) continue;   // 태그버킷 경로: 타입 필터
-            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+            if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist))
+                return _unb ? anyMemoPut(type, tagsPos, tagsNeg, true) : true;
         }
-        return false;
+        return _unb ? anyMemoPut(type, tagsPos, tagsNeg, false) : false;
     }
 
     public static boolean anyEntityAnyType(GameContext ctx, net.minecraft.util.math.Vec3d origin,
@@ -4646,39 +5078,74 @@ public final class KfcGen {
      *  Motion=NbtList&lt;Double&gt;[vx,vy,vz]. 모르는 경로는 null → 호출부가 폴백. */
     private static net.minecraft.nbt.NbtElement liveFieldNbt(net.minecraft.entity.Entity e, String pt) {
         switch (pt) {
-            case "Pos[0]": return net.minecraft.nbt.NbtDouble.of(e.getPos().x);
-            case "Pos[1]": return net.minecraft.nbt.NbtDouble.of(e.getPos().y);
-            case "Pos[2]": return net.minecraft.nbt.NbtDouble.of(e.getPos().z);
+            // Pos: 1.21.5 Entity.writeNbt 는 탑승 중이면 (vehicle.x, this.y, vehicle.z) 를 기록
+            // (바이트코드 확인). data get 고증 정합을 위해 동일 규칙 적용.
+            case "Pos[0]": return net.minecraft.nbt.NbtDouble.of(nbtPosX(e));
+            case "Pos[1]": return net.minecraft.nbt.NbtDouble.of(e.getY());
+            case "Pos[2]": return net.minecraft.nbt.NbtDouble.of(nbtPosZ(e));
             case "Rotation[0]": return net.minecraft.nbt.NbtFloat.of(e.getYaw());
             case "Rotation[1]": return net.minecraft.nbt.NbtFloat.of(e.getPitch());
             case "Motion[0]": return net.minecraft.nbt.NbtDouble.of(e.getVelocity().x);
             case "Motion[1]": return net.minecraft.nbt.NbtDouble.of(e.getVelocity().y);
             case "Motion[2]": return net.minecraft.nbt.NbtDouble.of(e.getVelocity().z);
-            default: break;
+            case "Pos": {
+                net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
+                l.add(net.minecraft.nbt.NbtDouble.of(nbtPosX(e)));
+                l.add(net.minecraft.nbt.NbtDouble.of(e.getY()));
+                l.add(net.minecraft.nbt.NbtDouble.of(nbtPosZ(e)));
+                return l;
+            }
+            case "Rotation": {
+                net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
+                l.add(net.minecraft.nbt.NbtFloat.of(e.getYaw()));
+                l.add(net.minecraft.nbt.NbtFloat.of(e.getPitch()));
+                return l;
+            }
+            case "Motion": {
+                net.minecraft.util.math.Vec3d v = e.getVelocity();
+                net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
+                l.add(net.minecraft.nbt.NbtDouble.of(v.x));
+                l.add(net.minecraft.nbt.NbtDouble.of(v.y));
+                l.add(net.minecraft.nbt.NbtDouble.of(v.z));
+                return l;
+            }
+            // ── #8 확장: writeNbt 가 '무조건' 기록하는 스칼라 — 게터 = 직렬화 원천(바이트코드 확인)
+            case "fall_distance": return net.minecraft.nbt.NbtDouble.of(e.fallDistance);
+            case "Fire": return net.minecraft.nbt.NbtShort.of((short) e.getFireTicks());
+            case "Air": return net.minecraft.nbt.NbtShort.of((short) e.getAir());
+            case "OnGround": return net.minecraft.nbt.NbtByte.of(e.isOnGround());
+            case "Invulnerable": return net.minecraft.nbt.NbtByte.of(e.isInvulnerable());
+            case "PortalCooldown": return net.minecraft.nbt.NbtInt.of(e.getPortalCooldown());
+            case "TicksFrozen": return net.minecraft.nbt.NbtInt.of(e.getFrozenTicks());
+            // Health: LivingEntity.writeCustomData 가 putFloat(getHealth()) — 비생물은 키 부재라
+            // fast-path 미적용(null 반환 → 스냅샷 폴백이 동일하게 '없음' 반환).
+            case "Health":
+                return (e instanceof net.minecraft.entity.LivingEntity le)
+                        ? net.minecraft.nbt.NbtFloat.of(le.getHealth()) : null;
+            // Tags: 비어 있으면 writeNbt 가 키 자체를 생략 — 그 경우 폴백(스냅샷도 '없음').
+            case "Tags": {
+                java.util.Set<String> tags = e.getCommandTags();
+                if (tags.isEmpty()) return null;
+                net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
+                for (String t : tags) l.add(net.minecraft.nbt.NbtString.of(t));
+                return l;
+            }
+            // Silent/NoGravity: true 일 때만 기록(조건부) — false 면 폴백(스냅샷도 '없음').
+            case "Silent": return e.isSilent() ? net.minecraft.nbt.NbtByte.of(true) : null;
+            case "NoGravity": return e.hasNoGravity() ? net.minecraft.nbt.NbtByte.of(true) : null;
+            default: return null;
         }
-        if (pt.equals("Pos")) {
-            net.minecraft.util.math.Vec3d p = e.getPos();
-            net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
-            l.add(net.minecraft.nbt.NbtDouble.of(p.x));
-            l.add(net.minecraft.nbt.NbtDouble.of(p.y));
-            l.add(net.minecraft.nbt.NbtDouble.of(p.z));
-            return l;
-        }
-        if (pt.equals("Rotation")) {
-            net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
-            l.add(net.minecraft.nbt.NbtFloat.of(e.getYaw()));
-            l.add(net.minecraft.nbt.NbtFloat.of(e.getPitch()));
-            return l;
-        }
-        if (pt.equals("Motion")) {
-            net.minecraft.util.math.Vec3d v = e.getVelocity();
-            net.minecraft.nbt.NbtList l = new net.minecraft.nbt.NbtList();
-            l.add(net.minecraft.nbt.NbtDouble.of(v.x));
-            l.add(net.minecraft.nbt.NbtDouble.of(v.y));
-            l.add(net.minecraft.nbt.NbtDouble.of(v.z));
-            return l;
-        }
-        return null;
+    }
+
+    /** writeNbt 의 Pos.x — 탑승 중이면 vehicle.getX() (1.21.5 바이트코드 동일). */
+    private static double nbtPosX(net.minecraft.entity.Entity e) {
+        net.minecraft.entity.Entity v = e.getVehicle();
+        return v != null ? v.getX() : e.getX();
+    }
+    /** writeNbt 의 Pos.z — 탑승 중이면 vehicle.getZ(). */
+    private static double nbtPosZ(net.minecraft.entity.Entity e) {
+        net.minecraft.entity.Entity v = e.getVehicle();
+        return v != null ? v.getZ() : e.getZ();
     }
 
     public static net.minecraft.nbt.NbtElement nbtGetStorage(net.minecraft.server.MinecraftServer server, String id, String path) {

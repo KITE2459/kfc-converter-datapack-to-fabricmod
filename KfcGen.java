@@ -1149,12 +1149,15 @@ public final class KfcGen {
         return !tmp.isEmpty();
     }
 
-    /** 두 좌표 거리의 [lo,hi] 범위 검사 (음수=무시). */
+    /** 두 좌표 거리의 [lo,hi] 범위 검사 (음수=무시).
+     *  거리 자체(sqrt) 대신 제곱거리로 비교한다. lo,hi>=0 이고 거리>=0 이므로
+     *  d<lo ⇔ d²<lo², d>hi ⇔ d²>hi² 로 정적 동등이며 sqrt 1회를 제거한다
+     *  (inRange(엔티티/Vec3d) 와 동일 패턴). */
     public static boolean posInRange(net.minecraft.util.math.Vec3d a, net.minecraft.util.math.Vec3d b,
                                      double lo, double hi) {
-        double d = a.distanceTo(b);
-        if (lo >= 0 && d < lo) return false;
-        if (hi >= 0 && d > hi) return false;
+        double d2 = a.squaredDistanceTo(b);
+        if (lo >= 0 && d2 < lo * lo) return false;
+        if (hi >= 0 && d2 > hi * hi) return false;
         return true;
     }
 

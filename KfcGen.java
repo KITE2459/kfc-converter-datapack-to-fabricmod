@@ -6163,6 +6163,147 @@ public static net.minecraft.entity.Entity firstEntity(
         } catch (Exception ignored) {}
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  [B] 매크로 SNBT 템플릿 패칭 (optimize-offer B-5)
+    //  동적 매크로 SNBT `"PRE" + <수치인자> + "POST"` 는 연속값에서 매 호출 SNBT_CACHE 미스 →
+    //  거대 SNBT 전체 재파싱이 든다. PRE/POST 가 상수이고 인자가 '완전한 수치 값 슬롯'을 차지하면,
+    //  골격(pre+SENT+post)을 1회 파싱해 두고 호출 시 deep copy + 슬롯 노드만 set 하면 된다.
+    //
+    //  안전(3중 fail-closed):
+    //   1) 클래스 로드 자기검증: 서로 다른 sentinel(111/222)을 실제 마크 파서로 파싱해 '정확히
+    //      한 개의 수치 leaf'만 다른지 확인. 구조가 어긋나거나 leaf 가 비수치/복수면 비활성(ok=false).
+    //   2) 클래스 로드 동치검증: 여러 probe 로 (skeleton+patch)==(전체 재파싱) 을 실제 파서로 assert.
+    //      하나라도 어긋나면 비활성 — 구현 버그까지 여기서 걸러 concat 폴백만 남긴다.
+    //   3) 매 호출: 인자가 엄격 수치 토큰(구조문자 불가 → 인젝션 불가)일 때만 fast-path, 아니면 concat.
+    //  compound 키 경로만 탐색(리스트 슬롯은 leaf 불일치로 자동 비활성) — NbtList API 미사용.
+    // ════════════════════════════════════════════════════════════════
+    private static final boolean SNBT_TEMPLATE =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.snbttemplate", "on"));
+    private static final java.util.regex.Pattern _NUM_TOKEN =
+            java.util.regex.Pattern.compile("[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[bBsSlLfFdD]?");
+
+    public static final class SnbtTmpl {
+        final String pre, post; final boolean wrap;   // wrap=true: storage 값({v:..}) / false: compound
+        final boolean ok;
+        final net.minecraft.nbt.NbtElement skeleton;   // pre+"0"+post 파싱 결과(unwrap 후)
+        final String[] path;                            // hole 까지의 compound 키 경로(마지막=슬롯 키)
+
+        SnbtTmpl(String pre, String post, boolean wrap) {
+            this.pre = pre; this.post = post; this.wrap = wrap;
+            boolean okv = false; net.minecraft.nbt.NbtElement sk = null; String[] pth = null;
+            try {
+                net.minecraft.nbt.NbtElement a = _parse(pre, "111", post, wrap);
+                net.minecraft.nbt.NbtElement b = _parse(pre, "222", post, wrap);
+                if (a != null && b != null) {
+                    java.util.List<java.util.List<String>> diffs = new java.util.ArrayList<>();
+                    _collectDiffs(a, b, new java.util.ArrayDeque<>(), diffs);
+                    if (diffs.size() == 1) {
+                        String[] p = diffs.get(0).toArray(new String[0]);
+                        net.minecraft.nbt.NbtElement la = _leafAt(a, p), lb = _leafAt(b, p);
+                        if (la instanceof net.minecraft.nbt.AbstractNbtNumber
+                                && lb instanceof net.minecraft.nbt.AbstractNbtNumber) {
+                            boolean good = true;
+                            for (String probe : new String[]{"333", "-7", "40000", "5", "12.5"}) {
+                                net.minecraft.nbt.NbtElement patched = _patchCopy(a, p, probe, wrap);
+                                net.minecraft.nbt.NbtElement truth = _parse(pre, probe, post, wrap);
+                                if (patched == null || truth == null || !patched.equals(truth)) { good = false; break; }
+                            }
+                            if (good) { okv = true; sk = a.copy(); pth = p; }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+            this.ok = okv; this.skeleton = sk; this.path = pth;
+        }
+
+        /** 인자를 슬롯에 꽂은 결과 element. 비수치/파싱실패/비활성이면 null(→ 호출측 concat 폴백). */
+        net.minecraft.nbt.NbtElement patch(String val) {
+            if (!ok || val == null || !_NUM_TOKEN.matcher(val).matches()) return null;
+            return _patchCopy(skeleton, path, val, wrap);
+        }
+
+        private static net.minecraft.nbt.NbtElement _parse(String pre, String mid, String post, boolean wrap) {
+            try {
+                String body = pre + mid + post;
+                net.minecraft.nbt.NbtCompound w =
+                        net.minecraft.nbt.StringNbtReader.readCompound(wrap ? ("{v:" + body + "}") : body);
+                return wrap ? w.get("v") : w;
+            } catch (Exception ex) { return null; }
+        }
+
+        // compound 키만 재귀. compound 형태가 서로 같을 때만 하위로, 그 외엔 leaf 로 equals 비교.
+        private static void _collectDiffs(net.minecraft.nbt.NbtElement a, net.minecraft.nbt.NbtElement b,
+                                          java.util.ArrayDeque<String> path,
+                                          java.util.List<java.util.List<String>> out) {
+            if (a instanceof net.minecraft.nbt.NbtCompound ca && b instanceof net.minecraft.nbt.NbtCompound cb) {
+                java.util.TreeSet<String> keys = new java.util.TreeSet<>();
+                keys.addAll(ca.getKeys()); keys.addAll(cb.getKeys());
+                for (String k : keys) {
+                    net.minecraft.nbt.NbtElement av = ca.get(k), bv = cb.get(k);
+                    if (av == null || bv == null) { out.add(new java.util.ArrayList<>(path)); continue; }
+                    path.addLast(k); _collectDiffs(av, bv, path, out); path.removeLast();
+                }
+            } else if (!a.equals(b)) {
+                out.add(new java.util.ArrayList<>(path));
+            }
+        }
+
+        private static net.minecraft.nbt.NbtElement _leafAt(net.minecraft.nbt.NbtElement root, String[] p) {
+            net.minecraft.nbt.NbtElement cur = root;
+            for (String k : p) {
+                if (!(cur instanceof net.minecraft.nbt.NbtCompound c)) return null;
+                cur = c.get(k);
+                if (cur == null) return null;
+            }
+            return cur;
+        }
+
+        // skeleton 을 deep copy 후 path 슬롯을 parse(val) 로 set. 수치 아니면 null.
+        private static net.minecraft.nbt.NbtElement _patchCopy(net.minecraft.nbt.NbtElement root, String[] p,
+                                                               String val, boolean wrap) {
+            try {
+                net.minecraft.nbt.NbtCompound w =
+                        net.minecraft.nbt.StringNbtReader.readCompound("{v:" + val + "}");
+                net.minecraft.nbt.NbtElement ve = w.get("v");
+                if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                net.minecraft.nbt.NbtElement copy = root.copy();
+                net.minecraft.nbt.NbtElement cur = copy;
+                for (int i = 0; i < p.length - 1; i++) {
+                    if (!(cur instanceof net.minecraft.nbt.NbtCompound c)) return null;
+                    cur = c.get(p[i]);
+                    if (cur == null) return null;
+                }
+                if (!(cur instanceof net.minecraft.nbt.NbtCompound parent)) return null;
+                parent.put(p[p.length - 1], ve);
+                return copy;
+            } catch (Exception ex) { return null; }
+        }
+    }
+
+    /** 골격 템플릿 팩토리(compound 판 — entityMergeSnbt 용). */
+    public static SnbtTmpl snbtTmplC(String pre, String post) { return new SnbtTmpl(pre, post, false); }
+    /** 골격 템플릿 팩토리(값 판 — storagePutSnbt 용). */
+    public static SnbtTmpl snbtTmplV(String pre, String post) { return new SnbtTmpl(pre, post, true); }
+
+    /** entityMergeSnbt 템플릿 오버로드. fast-path 실패 시 정확히 기존 concat+파싱 경로로 폴백. */
+    public static void entityMergeSnbtT(net.minecraft.entity.Entity e, SnbtTmpl t, String val) {
+        if (SNBT_TEMPLATE && t != null && t.ok) {
+            net.minecraft.nbt.NbtElement patched = t.patch(val);
+            if (patched instanceof net.minecraft.nbt.NbtCompound tc) { entityMergeSnbt(e, tc); return; }
+        }
+        entityMergeSnbt(e, (t == null ? val : t.pre + val + t.post));   // 폴백(원본 동작)
+    }
+
+    /** storagePutSnbt 템플릿 오버로드. fast-path 실패 시 기존 concat+파싱 경로로 폴백. */
+    public static void storagePutSnbtT(net.minecraft.server.MinecraftServer server, String id,
+                                       String path, SnbtTmpl t, String val, String mode) {
+        if (SNBT_TEMPLATE && t != null && t.ok) {
+            net.minecraft.nbt.NbtElement patched = t.patch(val);
+            if (patched != null) { storagePutSnbt(server, id, path, patched, mode); return; }
+        }
+        storagePutSnbt(server, id, path, (t == null ? val : t.pre + val + t.post), mode);   // 폴백
+    }
+
     public static void entityRemovePath(net.minecraft.entity.Entity e, String path) {
         invalidateSnapshot(e);
         // DisplayEntity 의 brightness 는 DataTracker 필드 — writeNbt/readNbt 폴백으로는

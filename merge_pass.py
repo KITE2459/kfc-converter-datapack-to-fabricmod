@@ -1110,6 +1110,64 @@ def _promote_tags(body: str, decls: list, fields: dict, start_seq: int) -> tuple
     return body, n, seq
 
 
+# ── [B] 매크로 SNBT 템플릿 승격: sink("PRE" + <단일인자> + "POST") → sinkT(..., KFC_TMPL_k, val) ──
+#   상수 PRE/POST + 단일 hole 인 동적 SNBT concat 만 대상. 런타임이 클래스 로드 시 자기검증하고
+#   수치 슬롯이 아니거나 애매하면 스스로 비활성 → concat 폴백. 폴백 문자열은 원본과 정확히 동일.
+def _split_top_plus(arg: str):
+    """arg 를 최상위(문자열/괄호/대괄호/중괄호 밖) '+' 로 분할. 조각 리스트 반환."""
+    parts=[]; depth=0; i=0; n=len(arg); start=0; in_str=False; esc=False
+    while i<n:
+        c=arg[i]
+        if in_str:
+            if esc: esc=False
+            elif c=='\\': esc=True
+            elif c=='"': in_str=False
+        else:
+            if c=='"': in_str=True
+            elif c in '([{': depth+=1
+            elif c in ')]}': depth-=1
+            elif c=='+' and depth==0:
+                parts.append(arg[start:i]); start=i+1
+        i+=1
+    parts.append(arg[start:])
+    return [p.strip() for p in parts]
+
+_FULLSTR = re.compile(r'^"(?:[^"\\]|\\.)*"$')
+
+def _promote_snbt_template(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
+    seq=start_seq; n=0
+    # (needle, argc, hole_idx, factory, sinkT)
+    specs=[
+        ("KfcGen.entityMergeSnbt(", 2, 1, "KfcGen.snbtTmplC", "KfcGen.entityMergeSnbtT"),
+        ("KfcGen.storagePutSnbt(",  5, 3, "KfcGen.snbtTmplV", "KfcGen.storagePutSnbtT"),
+    ]
+    edits=[]  # (call_start, call_end_excl, newtext)
+    for needle, argc, hi, factory, sinkT in specs:
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if len(args)!=argc: continue
+            a0,a1=args[hi]; argtext=body[a0:a1].strip()
+            parts=_split_top_plus(argtext)
+            if len(parts)!=3: continue                     # 단일 hole 만
+            pre,mid,post=parts
+            if not _FULLSTR.match(pre) or not _FULLSTR.match(post): continue  # 양끝 = 문자열 리터럴
+            if _FULLSTR.match(mid): continue               # 가운데가 리터럴이면 정적(별도 경로) — 스킵
+            key=("TMPL", factory, pre, post)
+            name=fields.get(key)
+            if name is None:
+                name=f"KFC_TMPL_{seq}"; seq+=1; fields[key]=name
+                decls.append(f"    private static final KfcGen.SnbtTmpl {name} = {factory}({pre}, {post});")
+            others=[body[x0:x1].strip() for (x0,x1) in args]
+            valexpr=f'("" + ({mid}))'
+            if needle.startswith("KfcGen.entityMergeSnbt"):
+                new=f'{sinkT}({others[0]}, {name}, {valexpr})'
+            else:  # storagePutSnbt(server,id,path,snbt,mode)
+                new=f'{sinkT}({others[0]}, {others[1]}, {others[2]}, {name}, {valexpr}, {others[4]})'
+            edits.append((nstart, close_idx+1, new)); n+=1
+    for a0,a1,new in sorted(edits, key=lambda r:r[0], reverse=True):
+        body=body[:a0]+new+body[a1:]
+    return body, n, seq
+
+
 def hoist_constants_text(text: str) -> tuple[str, int]:
     """단일 클래스 소스에서 상수 배열 리터럴을 static final 필드로 호이스팅.
        (변경된 텍스트, 치환 건수) 반환. 클래스 선언을 못 찾으면 무변경."""
@@ -1160,6 +1218,9 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     # firstEntity/nearestEntity 의 상수 tagsPos 배열 → static final Tags 핸들(맵 조회 제거).
     body, _tags_n, _ = _promote_tags(body, decls, fields, len(decls))
     n += _tags_n
+    # 동적 매크로 SNBT 단일 수치 hole → 골격 템플릿 승격(런타임 자기검증·fail-closed).
+    body, _tmpl_n, _ = _promote_snbt_template(body, decls, fields, len(decls))
+    n += _tmpl_n
     if n == 0:
         return text, 0
     return text[:insert_at] + "\n" + "\n".join(decls) + body, n

@@ -147,6 +147,7 @@ class Emitted:
     rejects_function: bool = False                    # True면 이 줄이 함수 전체를 무효화(mcfunction 파싱거부 재현)
     macro_params: list = field(default_factory=list)  # 이 줄이 쓰는 매크로 변수명(시그니처 결정용)
     side_effects: list = field(default_factory=list)  # 값 식 평가 전에 먼저 실행할 부수효과 문장
+    macro_guard: list = field(default_factory=list)   # store/return 값이 매크로함수 호출일 때, 빈 매크로변수면 줄 스킵용 가드식(들)
     terminal: bool = False                            # True면 이 줄이 무조건 함수를 종료(top-level return). 이후 줄은 도달불가(바닐라 동치) → 드롭.
 
     def bridge(self, reason: str) -> "Emitted":
@@ -1155,32 +1156,49 @@ def _external_fn_call(fid: str, args: dict, nn: list[str], em: Emitted) -> list[
     return [f'KfcGen.instantExecuteFunction(source, {idexpr});']
 
 
-def _macro_args_expr(args: dict, nn: list[str]) -> str | None:
-    """`function ... with <source>` 의 macroArgs(Map) 자바 식.
-       with 없음 -> 'null', storage/entity/block 소스 -> 해당 헬퍼, 해소불가 -> None."""
-    if "with" not in nn:
-        return "null"
-    wi = nn.index("with")
-    kind = nn[wi + 1] if wi + 1 < len(nn) else None
-    if kind == "storage":
-        sid = first_arg(args, "source"); path = first_arg(args, "path")
-        return (f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(path)})' if path
-                else f'KfcGen.storageMacroArgs(server, {jstr(sid)})')
-    if kind == "entity":
-        sel_raw = first_arg(args, "source"); path = first_arg(args, "path") or ""
-        ent = "executor" if sel_raw == "@s" else nearest_entity_java(parse_selector(sel_raw))
-        if ent is None:
-            return None
-        return f'KfcGen.entityMacroArgs({ent}, {jstr(path)})'
-    if kind == "block":
-        pos = (first_arg(args, "pos") or first_arg(args, "position")
-               or first_arg(args, "targetPos"))
-        path = first_arg(args, "path") or ""
-        bp = block_pos_java(pos) if pos else None
-        if bp is None:
-            return None
-        return f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(path)})'
-    return None  # with {compound} 리터럴 등 -> 해소불가
+def _macro_args_expr(args: dict, nn: list[str]) -> tuple[str, list[str]] | None:
+    """`function ... with <source>` / 인라인 `{compound}` 의 macroArgs(Map) 자바 식.
+       반환 (margs_식, guard_vars). guard_vars 는 매크로변수(MACROVAR) 유래 값들 —
+       빈 문자열이면 바닐라가 그 매크로 줄을 스킵하므로 호출측이 !macroEmpty 가드해야 한다.
+       해소 불가(비-@s 엔티티/블록 형식 등) 면 None. (기존엔 인라인 compound 를 'null' 로
+       반환해 매크로 함수에 null 을 넘겼고 → 본문 macroArgs.get NPE. store/return 경로 크래시.)"""
+    if "with" in nn:
+        wi = nn.index("with")
+        kind = nn[wi + 1] if wi + 1 < len(nn) else None
+        if kind == "storage":
+            sid = first_arg(args, "source"); path = first_arg(args, "path")
+            e = (f'KfcGen.storageMacroArgs(server, {jstr(sid)}, {jstr(path)})' if path
+                 else f'KfcGen.storageMacroArgs(server, {jstr(sid)})')
+            return (e, [])
+        if kind == "entity":
+            sel_raw = first_arg(args, "source"); path = first_arg(args, "path") or ""
+            ent = "executor" if sel_raw == "@s" else nearest_entity_java(parse_selector(sel_raw))
+            if ent is None:
+                return None
+            return (f'KfcGen.entityMacroArgs({ent}, {jstr(path)})', [])
+        if kind == "block":
+            pos = (first_arg(args, "pos") or first_arg(args, "position")
+                   or first_arg(args, "targetPos"))
+            path = first_arg(args, "path") or ""
+            bp = block_pos_java(pos) if pos else None
+            if bp is None:
+                return None
+            return (f'KfcGen.blockMacroArgs(ctx.world, {bp}, {jstr(path)})', [])
+        return None
+    # 인라인 {compound} — function_call_java 와 동일 규칙으로 macroArgs 를 구성한다.
+    comp = first_arg(args, "arguments")
+    if comp is not None:
+        pairs = parse_compound_args(comp)
+        kv = []; guards = []
+        for k, v in pairs:
+            kv.append(jstr(k))
+            mv = macro_value_expr(v)
+            kv.append(mv)
+            if re.fullmatch(r'MACROVAR_\d+', v.strip()):
+                guards.append(mv)
+        return (f'KfcGen.macroArgs({", ".join(kv)})', guards)
+    # 인자 없음 -> 빈 맵(무인자 매크로 호출; null 대신 빈 맵이라 NPE 없음).
+    return ('KfcGen.macroArgs()', [])
 
 
 def function_call_java(fid: str, args: dict, nn: list[str], em: Emitted) -> list[str] | None:
@@ -1791,12 +1809,20 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                     return False
                 # 매크로 함수: with 인자 소스를 해소해 executeReturn(source, macroArgs) 값 전파.
                 if fid in MACRO_FNS:
-                    margs = _macro_args_expr(args, nn)
-                    if margs is None:
+                    _mres = _macro_args_expr(args, nn)
+                    if _mres is None:
                         em.reason = "return run function(매크로) 인자 소스 미지원"
                         return False
-                    em.java.append(f"return {fqcn(fid)}.executeReturn(source, {margs});")
-                    em.terminal = True
+                    margs, _mguards = _mres
+                    _call = f"{fqcn(fid)}.executeReturn(source, {margs})"
+                    if _mguards:
+                        # 매크로변수가 비면 바닐라는 이 $줄을 스킵 → return 안 하고 다음 줄로 진행.
+                        _cond = " && ".join(f"!KfcGen.macroEmpty({g})" for g in _mguards)
+                        em.java.append(f"if ({_cond}) return {_call};")
+                        em.terminal = False
+                    else:
+                        em.java.append(f"return {_call};")
+                        em.terminal = True
                     return True
                 if ALL_FIDS and fid not in ALL_FIDS:
                     _ns, _p = fid.split(":", 1) if ":" in fid else ("minecraft", fid)
@@ -7266,7 +7292,11 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
             gi = "    "
         for s in src_em2.side_effects:
             em.java.append(gi + s)
-        em.java.append(gi + dst_writer(valexpr))
+        if src_em2.macro_guard:
+            _gc = " && ".join(f"!KfcGen.macroEmpty({g})" for g in src_em2.macro_guard)
+            em.java.append(gi + f"if ({_gc}) {dst_writer(valexpr)}")
+        else:
+            em.java.append(gi + dst_writer(valexpr))
         if nullable:
             em.java.append("  }")
         em.java.append("}")
@@ -7304,7 +7334,11 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
         em.java.append("    net.minecraft.entity.Entity _stSelf = _stSrc.getEntity();")
         for s in src_em.side_effects:
             em.java.append("    " + s)
-        em.java.append("    " + dst_writer(valexpr))
+        if src_em.macro_guard:
+            _gc = " && ".join(f"!KfcGen.macroEmpty({g})" for g in src_em.macro_guard)
+            em.java.append("    " + f"if ({_gc}) {dst_writer(valexpr)}")
+        else:
+            em.java.append("    " + dst_writer(valexpr))
         em.java.append("  } }")
         em.kind = "native"
         return True
@@ -7318,7 +7352,11 @@ def emit_store(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bo
     # 소스가 부수효과(scoreboard operation 등)를 동반하면 값 쓰기 전에 먼저 실행
     if src_em.side_effects:
         em.java.extend(src_em.side_effects)
-    em.java.append(dst_writer(valexpr))
+    if src_em.macro_guard:
+        _gc = " && ".join(f"!KfcGen.macroEmpty({g})" for g in src_em.macro_guard)
+        em.java.append(f"if ({_gc}) {dst_writer(valexpr)}")
+    else:
+        em.java.append(dst_writer(valexpr))
     em.kind = "native"   # NBT/함수 호출 동반 -> gated
     return True
 
@@ -7498,10 +7536,12 @@ def _source_value_expr_raw(tail: list[dict], em: Emitted) -> str | None:
         is_macro = fid_called in MACRO_FNS
         margs = "null"
         if is_macro:
-            margs = _macro_args_expr(args, nn)
-            if margs is None:
+            _mres = _macro_args_expr(args, nn)
+            if _mres is None:
                 em.reason = f"store←function(매크로 {fid_called[:20]}) with 소스 미해소"
                 return None
+            margs, _mguards = _mres
+            em.macro_guard = list(_mguards)   # 빈 매크로변수면 store 문장 전체를 스킵(호출측이 감쌈)
         # 함수의 executeReturn 결과(마지막 return 값)를 저장. 매크로면 macroArgs 동반.
         if ALL_FIDS and fid_called not in ALL_FIDS:
             _ns, _p = fid_called.split(":", 1)

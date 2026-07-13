@@ -77,6 +77,16 @@ public final class KfcGen {
             net.minecraft.text.Text.literal("\u0000kfc-interp-invalid");
     private static final java.util.Map<String, net.minecraft.text.Text>
             INTERP_CACHE = boundedMap(8192);
+    // 비문자열 interpret 요소용 캐시. 9차(프로파일 실측): kartactbar 게이지 조각은
+    // `append value [{...},{...}]` 산출물이라 요소가 전부 NbtList/NbtCompound — 8차의 문자열
+    // 캐시는 적중 0이었고 Decoder.parse 5.57%p(내부 selector 파싱 1.97%p + UUID IAE
+    // fillInStackTrace 1.64%p 포함)가 그대로 남았다. NbtElement equals/hashCode 는 값 기반
+    // (트리 재귀)이라 조회 비용은 코덱 디코드 대비 미미하다.
+    // 키는 삽입 시 el.copy()(깊은 복사, 불변 스냅샷) — storage 원본 요소가 이후 data 명령으로
+    // 제자리 변형되어도 캐시 키는 불변이므로 '변형된 키가 다른 조회와 오일치'하는 오염이 원천
+    // 차단된다(잘못된 값 반환 불가; 최악은 미스 후 재디코드 = 멱등).
+    private static final java.util.Map<net.minecraft.nbt.NbtElement, net.minecraft.text.Text>
+            INTERP_CACHE_NBT = boundedMap(8192);
     private static final java.util.Map<String, CachedText>
             TEXT_CACHE = boundedMap(8192);
 
@@ -104,8 +114,9 @@ public final class KfcGen {
      *    dataSource.get(source) → NbtPath.get(root, 실패=빈 스트림) → 요소별
      *    TextCodecs.CODEC.parse(registryOps).getOrThrow()(실패=요소 스킵) → Texts.parse →
      *    separator 로 reduce-join(첫 요소에 append), 빈 결과 = Text.empty().
-     *  차이(성능): 문자열 요소의 디코드 결과를 캐시(실패 포함 — 매 호출 getOrThrow 예외 생성이
-     *  실측 ~2%p 였다), 정적 요소는 Texts.parse 생략. 첫 사용 시 바닐라 경로와 equals 비교로
+     *  차이(성능): 요소의 디코드 결과를 캐시 — 문자열 요소는 문자열 키(INTERP_CACHE),
+     *  비문자열 요소는 el.copy() 스냅샷 키(INTERP_CACHE_NBT, 9차). 실패도 캐시(매 호출
+     *  getOrThrow 예외 생성이 실측 ~2%p). 정적 요소는 Texts.parse 생략. 첫 사용 시 바닐라 경로와 equals 비교로
      *  자기검증 — 불일치면 그 텍스트는 영구 바닐라 경로(fail-closed).
      *  로그 편차(문서화): 디코드 실패 warn 이 요소 문자열당 1회로 줄어든다(스팸 억제). */
     private static net.minecraft.text.Text resolveInterpretStorage(
@@ -167,8 +178,14 @@ public final class KfcGen {
                     }
                     if (base == INTERP_INVALID || base == null) continue;
                 } else {
-                    base = _itpDecode(source, el);   // 비문자열 요소(희소) — 미캐시
-                    if (base == null) continue;
+                    // 비문자열 요소(NbtList/NbtCompound) — 실측상 게이지 조각의 전부.
+                    base = INTERP_CACHE_NBT.get(el);
+                    if (base == null) {
+                        base = _itpDecode(source, el);
+                        INTERP_CACHE_NBT.put(el.copy(),
+                                base == null ? INTERP_INVALID : base);
+                    }
+                    if (base == INTERP_INVALID || base == null) continue;
                 }
                 net.minecraft.text.Text resolved =
                         isStaticText(base) ? base

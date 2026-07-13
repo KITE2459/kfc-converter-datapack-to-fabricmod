@@ -5240,6 +5240,42 @@ public static net.minecraft.entity.Entity firstEntity(
         }
     }
 
+    /** W1 쓰기 소스 컴파운드 — fresh writeNbt 동등 보장판.
+     *  스냅샷 재사용은 display/marker/interaction(순수 데이터 홀더)로 한정하고, 커맨드 페이즈
+     *  중 'invalidate 없이' 변할 수 있는 휘발 필드를 라이브 값으로 덮어쓴다:
+     *    · Pos/Motion/Rotation/OnGround/fall_distance — 차량 teleport 의 승객 드래그/dismount 가
+     *      스냅샷 무효화 없이 위치류를 바꾼다(정지 상태에선 동일값이라 무해 — 주행 중 변신 파츠
+     *      롤백 버그의 원인이었음).
+     *    · Tags — addTag/removeTag 는 버킷 증분 갱신만 하고 스냅샷을 invalidate 하지 않는다
+     *      (읽기는 liveFieldNbt(Tags) 가 라이브라 종전엔 무해했음).
+     *  덮어쓰기 인코딩은 writeNbt 원천 게터와 동일(liveFieldNbt 검증 결과 재사용 — 탑승 Pos 규칙 포함).
+     *  그 외 엔티티(생물/플레이어 등 휘발 표면이 넓은 부류)는 종전 fresh writeNbt 유지. */
+    private static net.minecraft.nbt.NbtCompound writeSourceCompound(net.minecraft.entity.Entity e) {
+        if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity
+                || e instanceof net.minecraft.entity.decoration.InteractionEntity
+                || e instanceof net.minecraft.entity.MarkerEntity)) {
+            net.minecraft.nbt.NbtCompound fresh = new net.minecraft.nbt.NbtCompound();
+            e.writeNbt(fresh);
+            _addSelectedItem(e, fresh);
+            return fresh;
+        }
+        net.minecraft.nbt.NbtCompound n = entitySnapshot(e).copy();
+        n.put("Pos", liveFieldNbt(e, "Pos"));
+        n.put("Motion", liveFieldNbt(e, "Motion"));
+        n.put("Rotation", liveFieldNbt(e, "Rotation"));
+        n.putBoolean("OnGround", e.isOnGround());
+        n.putDouble("fall_distance", e.fallDistance);
+        java.util.Set<String> tags = e.getCommandTags();
+        if (tags.isEmpty()) {
+            n.remove("Tags");                       // writeNbt: 비면 키 자체 생략
+        } else {
+            net.minecraft.nbt.NbtList tl = new net.minecraft.nbt.NbtList();
+            for (String t : tags) tl.add(net.minecraft.nbt.NbtString.of(t));
+            n.put("Tags", tl);
+        }
+        return n;
+    }
+
     /** 엔티티 NBT 를 바꾸는 쓰기 직후 스냅샷 무효화(write-through). */
     private static void invalidateSnapshot(net.minecraft.entity.Entity e) {
         if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.remove(e);
@@ -5285,10 +5321,15 @@ public static net.minecraft.entity.Entity firstEntity(
         Boolean known = NBT_DROP.get(k);
         if (known != null) {
             if (known) return;                       // 구조적 no-op — writeNbt 생략(엔티티 불변)
-            invalidateSnapshot(e);                   // effective — 기존과 동일 round-trip
-            net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(n);
-            if (putAtPath(n, path, v)) readNbtTagAware(e, n);
+            // effective — 작업 컴파운드를 읽기 스냅샷 캐시의 copy 로 조달(웜이면 직렬화 0회,
+            // 콜드면 스냅샷으로 1회 직렬화 후 같은 틱 읽기/쓰기가 재사용). 스냅샷 신선도 계약은
+            // 읽기와 동일(age/ENTITY_GEN/우리 쓰기 invalidate). 플레이어 스냅샷의 합성
+            // SelectedItem 키는 readNbt 가 무시하는 여분 키라 관측 불변.
+            net.minecraft.nbt.NbtCompound n = writeSourceCompound(e);
+            // 무변경(동일 값) 이면 바닐라 /data modify 는 'Nothing changed' 로 명령이 실패해
+            // setNbt(readNbt) 자체가 없다 — 종전 무조건 readNbt(부수효과 포함)보다 고증 정합.
+            // invalidate 도 실제 적용 시에만(무변경이면 스냅샷 웜 유지).
+            if (putAtPathCount(n, path, v) > 0) { invalidateSnapshot(e); readNbtTagAware(e, n); }
             return;
         }
         // 첫 관측: 자가검증(추가 writeNbt 1회 — (클래스,키)당 1회만, 이후 캐시 hit)
@@ -5480,6 +5521,26 @@ public static net.minecraft.entity.Entity firstEntity(
                                           net.minecraft.nbt.NbtElement v) {
         if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity d)) return false;
         switch (path) {
+            case "text": {
+                // TextDisplayEntity.readCustomDataFromNbt 의 text 적용부만 재현(바이트코드 확인):
+                //   TextCodecs.CODEC.parse(registryOps(NbtOps), el) → getCommandSource(sw).withLevel(2)
+                //   → Texts.parse(src, t, this, 0) → setText(resolved)
+                // 나머지 필드 재적용은 동일 값의 DataTracker set(no-op)이라 관측 동등.
+                // 파싱/해석 실패는 false 반환 → 원 roundtrip 폴백(바닐라의 warn+empty 동작 재현).
+                if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity.TextDisplayEntity td)) return false;
+                if (!(e.getWorld() instanceof net.minecraft.server.world.ServerWorld sw)) return false;
+                try {
+                    net.minecraft.text.Text t = net.minecraft.text.TextCodecs.CODEC
+                            .parse(td.getRegistryManager().getOps(net.minecraft.nbt.NbtOps.INSTANCE), v)
+                            .getOrThrow();
+                    net.minecraft.server.command.ServerCommandSource src =
+                            td.getCommandSource(sw).withLevel(2);
+                    td.setText(net.minecraft.text.Texts.parse(src, t, td, 0));
+                    return true;
+                } catch (Exception ex) {
+                    return false;   // 폴백: 원 경로가 바닐라와 동일하게 warn + empty 처리
+                }
+            }
             case "transformation": {
                 net.minecraft.util.math.AffineTransformation at = TRANSFORM_CACHE.get(v);
                 if (at == null) {
@@ -5682,10 +5743,8 @@ public static net.minecraft.entity.Entity firstEntity(
                                        net.minecraft.nbt.NbtElement elem, boolean prepend) {
         if (e == null || elem == null) return;
         if (nbtPathDroppable(e, path.replace(" ", ""))) return;   // 구조적 부재 최상위 키 → readNbt 가 버림(no-op)
-        invalidateSnapshot(e);
-        net.minecraft.nbt.NbtCompound root = new net.minecraft.nbt.NbtCompound();
-        e.writeNbt(root);
-        if (appendAtPath(root, path, elem, prepend)) readNbtTagAware(e, root);
+        net.minecraft.nbt.NbtCompound root = writeSourceCompound(e);     // W1(정정판): 휘발 필드 라이브 동등화
+        if (appendAtPath(root, path, elem, prepend)) { invalidateSnapshot(e); readNbtTagAware(e, root); }
     }
 
     private static net.minecraft.nbt.NbtElement numberNbt(String type, double v) {
@@ -6052,7 +6111,6 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityPutSnbt(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return;
-        invalidateSnapshot(e);
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -6065,13 +6123,14 @@ public static net.minecraft.entity.Entity firstEntity(
             });
             if (tmpl == SNBT_INVALID) return;
             // fast 경로(displaySetFast)는 val 을 읽기 전용으로만 쓴다 → 캐시 템플릿 직접 전달(copy 제거).
-            if (displaySetFast(e, path.replace(" ", ""), tmpl)) return;
+            if (displaySetFast(e, path.replace(" ", ""), tmpl)) { invalidateSnapshot(e); return; }
             // 느린 경로만 copy — putAtPath 가 val 을 nbt 에 참조 삽입할 수 있고, readNbt 가 그 하위를
             // 엔티티에 보관할 수 있어 캐시 원본 보호가 필요하다.
             net.minecraft.nbt.NbtElement val = tmpl.copy();
-            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(nbt);
-            if (putAtPath(nbt, path, val)) readNbtTagAware(e, nbt);   // NbtPath: 인덱스/필터 경로 정확
+            // W1: 스냅샷 캐시 copy(웜 시 직렬화 0회) — invalidate 는 copy 이후(단일 스레드라 동등).
+            net.minecraft.nbt.NbtCompound nbt = writeSourceCompound(e);
+            // W2: 무변경이면 바닐라 'Nothing changed'(명령 실패=미적용) — readNbt 부수효과도 없음.
+            if (putAtPathCount(nbt, path, val) > 0) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
         } catch (Exception ignored) {}
     }
 
@@ -6092,8 +6151,7 @@ public static net.minecraft.entity.Entity firstEntity(
             });
             if (tmpl == SNBT_INVALID) return false;
             net.minecraft.nbt.NbtElement val = tmpl.copy();
-            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(nbt);
+            net.minecraft.nbt.NbtCompound nbt = writeSourceCompound(e);     // W1(정정판): 휘발 필드 라이브 동등화
             int cnt = putAtPathCount(nbt, path, val);
             if (cnt > 0) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
             return cnt > 0;
@@ -6198,7 +6256,6 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {
         if (e == null) return;
-        invalidateSnapshot(e);
         try {
             // SNBT 리터럴은 변환 시점 상수 — 캐시된 템플릿을 copy (storagePutSnbt 와 동일 패턴).
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -6206,6 +6263,7 @@ public static net.minecraft.entity.Entity firstEntity(
                 catch (Exception ex) { return SNBT_INVALID; }
             });
             if (tmpl == SNBT_INVALID || !(tmpl instanceof net.minecraft.nbt.NbtCompound tc)) return;
+            // (invalidate 는 각 분기에서 실제 변형 직전/직후에 수행 — W1 스냅샷 copy 가 먼저)
             // fast 경로(이 팩 머지의 ~99%)는 patch 를 읽기 전용으로만 쓴다:
             // displayMergeFast/displaySetFast 는 getKeys/get 으로 읽기만 하고, transformation 은
             // v.copy() 로 캐시 저장, 부분경로는 새 root 객체에만 기록, applyItemDisplayNbt 는
@@ -6215,10 +6273,11 @@ public static net.minecraft.entity.Entity firstEntity(
             // 느린 경로(non-display/혼합키, 드묾)만 방어적 copy — writeNbt/readNbt 가 nbt 하위를
             // 엔티티에 참조 보관할 수 있어 캐시 원본 보호가 필요하다.
             net.minecraft.nbt.NbtCompound patch = tc.copy();
-            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(nbt);
+            net.minecraft.nbt.NbtCompound before = writeSourceCompound(e);   // W1(정정판): fresh 동등 기준
+            net.minecraft.nbt.NbtCompound nbt = before.copy();
             nbt.copyFrom(patch);
-            readNbtTagAware(e, nbt);
+            // W2: 바닐라 /data merge 는 병합 결과가 원본과 같으면 'Nothing changed' 로 미적용.
+            if (!nbt.equals(before)) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
         } catch (Exception ignored) {}
     }
 
@@ -6249,16 +6308,15 @@ public static net.minecraft.entity.Entity firstEntity(
      *  invalidateSnapshot/fast·slow 경로는 String 판과 완전 동일). tc==null(원본 SNBT_INVALID
      *  대응)이면 invalidateSnapshot 후 무동작 — String 판과 동일 순서. */
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound tc) {
-        if (e == null) return;
-        invalidateSnapshot(e);
-        if (tc == null) return;
+        if (e == null || tc == null) return;
         try {
-            if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) return;
+            if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) { invalidateSnapshot(e); return; }
             net.minecraft.nbt.NbtCompound patch = tc.copy();
-            net.minecraft.nbt.NbtCompound nbt = new net.minecraft.nbt.NbtCompound();
-            e.writeNbt(nbt);
+            net.minecraft.nbt.NbtCompound before = writeSourceCompound(e);   // W1(정정판): fresh 동등 기준
+            net.minecraft.nbt.NbtCompound nbt = before.copy();
             nbt.copyFrom(patch);
-            readNbtTagAware(e, nbt);
+            // W2: 바닐라 /data merge 는 병합 결과가 원본과 같으면 'Nothing changed' 로 미적용.
+            if (!nbt.equals(before)) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
         } catch (Exception ignored) {}
     }
 

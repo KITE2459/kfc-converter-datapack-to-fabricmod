@@ -1428,7 +1428,7 @@ SIMPLE_RULES: dict[tuple, SimpleRule] = {
     # ride <@s> dismount
     ("ride", "target", "dismount"): SimpleRule(
         args={"target": "self"},
-        java="executor.stopRiding();",
+        java="KfcGen.dismount(executor);",   # stopRiding + 탑승 정렬 캐시(RIDE_MUT) 무효화
         kind="native",
     ),
     # xp set @s <n> levels / points
@@ -6893,7 +6893,8 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             # 바닐라 as @e 는 '선택 시점에 고정된 집합' 을 순회(루프 중 스폰/킬 무관)하므로,
             # 공유 스냅샷을 '복사' 해서 돈다 → 고증 정확 + ConcurrentModificationException 방지.
             # (복사는 얕은 참조 복사라 저렴; 필터/태그/위치는 참조에서 라이브로 읽어 영향 없음.)
-            out.append("for (Entity e : KfcGen.passengerFirst(KfcGen.entitiesSnapshot(ctx))) {")
+            # 정렬 복사(passengerFirst)의 틱 캐시판 — 순서·집합 동일, 루프마다의 복사/정렬 제거.
+            out.append("for (Entity e : KfcGen.passengerFirstSnap(ctx)) {")
             # 바닐라 @e/@n 기본 술어 Entity::isAlive (kill 직후 시체 20틱 제외 — 바이트코드 확인)
             out.append(f"    Entity en = e; if (!(en.isAlive() && ({filt}))) continue;")
             if src_line: out.append("    " + src_line)

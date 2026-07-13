@@ -302,6 +302,36 @@ public final class KfcGen {
         return list;
     }
 
+    // ── passengerFirst(entitiesSnapshot) 틱 캐시 ──
+    // as @e(untyped) 루프마다 스냅샷 복사 + 탑승자 정렬을 반복하던 것을
+    // (tick, ENTITY_GEN, RIDE_MUT) 불변 시 재사용한다. 순서 = 멤버십(gen 축) × 탑승 깊이
+    // (RIDE_MUT 축)만의 함수이고, 태그/점수 필터는 호출측이 라이브 재검사하므로 관측 동일.
+    // RIDE_MUT: gen 을 올리지 않는 탑승 관계 변화 — ride dismount(KfcGen.dismount)·kill/damage
+    // (사망 하차)·브릿지(gen++로 이미 커버)에서 증가. 리스트는 호출측이 읽기 전용 순회만 한다
+    // (본문 스폰/킬은 버킷·스냅샷을 바꾸지 gen++로 다음 호출을 재계산시키며, 이 복사본은 격리).
+    static long RIDE_MUT = 0;
+    private static java.util.List<net.minecraft.entity.Entity> PF_CACHE;
+    private static net.minecraft.server.MinecraftServer PF_SERVER;
+    private static int  PF_TICK = Integer.MIN_VALUE;
+    private static long PF_GEN = -1, PF_MUT = -1;
+
+    public static java.util.List<net.minecraft.entity.Entity> passengerFirstSnap(GameContext ctx) {
+        int tk = ctx.server.getTicks();
+        if (PF_CACHE == null || PF_SERVER != ctx.server || PF_TICK != tk
+                || PF_GEN != ENTITY_GEN || PF_MUT != RIDE_MUT) {
+            PF_CACHE = passengerFirst(entitiesSnapshot(ctx));
+            PF_SERVER = ctx.server; PF_TICK = tk; PF_GEN = ENTITY_GEN; PF_MUT = RIDE_MUT;
+        }
+        return PF_CACHE;
+    }
+
+    /** ride <target> dismount — stopRiding + 탑승 순서 캐시 무효화(emit 이 직접 필드 접근 대신 사용). */
+    public static void dismount(net.minecraft.entity.Entity e) {
+        if (e == null) return;
+        RIDE_MUT++;
+        e.stopRiding();
+    }
+
     static void snapRemove(net.minecraft.entity.Entity e) {
         long _prevGen = ENTITY_GEN;
         ENTITY_GEN++;
@@ -1377,6 +1407,7 @@ public final class KfcGen {
                        net.minecraft.registry.RegistryKeys.DAMAGE_TYPE, id));
         }
         QUERY_MUT++;   // 피해로 즉사 가능(isAlive 변화) → 존재검사 메모 무효화
+        RIDE_MUT++;    // 즉사 시 하차 동반 가능 → 탑승 정렬 캐시 무효화
         e.damage(w, ds, amount);
     }
 
@@ -1389,6 +1420,7 @@ public final class KfcGen {
                 : w.getDamageSources().create(net.minecraft.registry.RegistryKey.of(
                         net.minecraft.registry.RegistryKeys.DAMAGE_TYPE, id), attacker);
         QUERY_MUT++;   // 피해로 즉사 가능 → 존재검사 메모 무효화
+        RIDE_MUT++;    // 즉사 시 하차 동반 가능 → 탑승 정렬 캐시 무효화
         e.damage(w, ds, amount);
     }
 
@@ -1625,6 +1657,7 @@ public final class KfcGen {
         // 바닐라와 시맨틱이 달랐다.
         if (!(e.getWorld() instanceof net.minecraft.server.world.ServerWorld sw)) return;
         QUERY_MUT++;   // 생사 변화(생물은 제거 지연이라 ENTITY_GEN 이 안 오름) → 메모 무효화
+        RIDE_MUT++;    // 사망은 하차를 동반할 수 있음 → 탑승 정렬 캐시 무효화
         e.kill(sw);
         // 생물은 death 처리(실제 제거는 이후) → death 프레임 동안 셀렉터에 잡히는 바닐라 동작을
         // 위해 스냅샷을 건드리지 않고 틱 경계 재수집(entitiesSnapshot)에 맡긴다.
@@ -3545,7 +3578,7 @@ public final class KfcGen {
     private static long SCORE_EPOCH = 0;
 
     private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
-        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
+        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
         java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(o);
         if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(o, m); }
         net.minecraft.scoreboard.ScoreAccess a = m.get(holderKey);
@@ -3560,7 +3593,34 @@ public final class KfcGen {
         return a;
     }
 
-    private static void invalidateScoreHandles() { SCORE_HANDLES.clear(); SCORE_EPOCH++; }
+    private static void invalidateScoreHandles() {
+        SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++;
+    }
+
+    // ── 읽기 엔트리 핸들 캐시 ──
+    // scoreMatchesEntity/readScoreEnt/readScore/getScore(ObjRef 판)가 매 호출 하던
+    // 'holder 이름 해소 + 스코어보드 이중 맵 조회'를 (ObjRef, 홀더키)→엔트리 캐시로 대체.
+    // 값은 항상 라이브 엔트리에서 읽으므로(getScore()) 캐시는 '엔트리 신원'만 보관 — 값 갱신과
+    // 무관하게 정확하다. 존재하는 엔트리만 캐시(null 미캐시)라 관측 부수효과가 전혀 없다.
+    private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, ReadableScoreboardScore>>
+            READ_HANDLES = new java.util.HashMap<>();
+
+    private static ReadableScoreboardScore readHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
+        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
+        java.util.HashMap<Object, ReadableScoreboardScore> m = READ_HANDLES.get(o);
+        if (m == null) { m = new java.util.HashMap<>(); READ_HANDLES.put(o, m); }
+        ReadableScoreboardScore sc = m.get(holderKey);
+        if (sc == null) {
+            ScoreboardObjective ob = obj(sb, o);
+            if (ob == null) return null;
+            ScoreHolder h = (holderKey instanceof net.minecraft.entity.Entity e)
+                    ? holderOf(nameOf(e))          // vanilla 경로의 매 호출 UUID 문자열 할당 회피
+                    : holderOf((String) holderKey);
+            sc = sb.getScore(h, ob);
+            if (sc != null) m.put(holderKey, sc);  // 존재 엔트리만 캐시(null 미캐시 — 부수효과 0)
+        }
+        return sc;
+    }
 
     // ──────────────── Sch: (상수 홀더, 상수 objective) 쓰기 핸들의 정적 승격 ────────────────
     // pass-4 가 setScore/addScore(sb, "리터럴홀더", KFC_OBJ_n, v) 를 static final Sch 필드로
@@ -3604,9 +3664,7 @@ public final class KfcGen {
         return true;
     }
     public static boolean scoreMatches(ServerScoreboard sb, String holder, ObjRef o, int min, int max) {
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return false;
-        ReadableScoreboardScore sc = sb.getScore(holderOf(holder), ob);
+        ReadableScoreboardScore sc = readHandle(sb, holder, o);
         if (sc == null) return false;
         int v = sc.getScore();
         return v >= min && v <= max;
@@ -3614,38 +3672,28 @@ public final class KfcGen {
     public static boolean scoreMatchesEntity(ServerScoreboard sb, net.minecraft.entity.Entity e,
                                              ObjRef o, int min, int max) {
         if (e == null) return false;
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return false;
-        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        ReadableScoreboardScore sc = readHandle(sb, e, o);
         if (sc == null) return false;
         int v = sc.getScore();
         return v >= min && v <= max;
     }
     public static Integer readScoreEnt(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
         if (e == null) return null;
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return null;
-        ReadableScoreboardScore sc = sb.getScore(e, ob);
+        ReadableScoreboardScore sc = readHandle(sb, e, o);
         if (sc == null) return null;
         return sc.getScore();
     }
     public static Integer readScore(ServerScoreboard sb, String holder, ObjRef o) {
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return null;
-        ReadableScoreboardScore s = sb.getScore(holderOf(holder), ob);
+        ReadableScoreboardScore s = readHandle(sb, holder, o);
         return s == null ? null : s.getScore();
     }
     public static int getScore(ServerScoreboard sb, String holder, ObjRef o) {
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return 0;
-        ReadableScoreboardScore s = sb.getScore(holderOf(holder), ob);
+        ReadableScoreboardScore s = readHandle(sb, holder, o);
         return s == null ? 0 : s.getScore();
     }
     public static int getScoreOfEntity(ServerScoreboard sb, net.minecraft.entity.Entity e, ObjRef o) {
         if (e == null) return 0;
-        ScoreboardObjective ob = obj(sb, o);
-        if (ob == null) return 0;
-        ReadableScoreboardScore s = sb.getScore(e, ob);
+        ReadableScoreboardScore s = readHandle(sb, e, o);
         return s == null ? 0 : s.getScore();
     }
     public static void setScore(ServerScoreboard sb, String holder, ObjRef o, int v) {
@@ -3779,34 +3827,90 @@ public final class KfcGen {
     public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                    String op, String hb, String ob) {
         if (ea == null) return false;
-        return scoreCmp(sb, ea.getNameForScoreboard(), oa, op, hb, ob);
+        return scoreCmp(sb, nameOf(ea), oa, op, hb, ob);
     }
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, net.minecraft.entity.Entity eb, String ob) {
         if (eb == null) return false;
-        return scoreCmp(sb, ha, oa, op, eb.getNameForScoreboard(), ob);
+        return scoreCmp(sb, ha, oa, op, nameOf(eb), ob);
     }
     public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                    String op, net.minecraft.entity.Entity eb, String ob) {
         if (ea == null || eb == null) return false;
-        return scoreCmp(sb, ea.getNameForScoreboard(), oa, op, eb.getNameForScoreboard(), ob);
+        return scoreCmp(sb, nameOf(ea), oa, op, nameOf(eb), ob);
     }
 
     // neg(=unless) 인자판: 셀렉터 홀더가 비면 false(미실행), neg 는 비교 결과에만 적용.
     public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                    String op, String hb, String ob, boolean neg) {
         if (ea == null) return false;
-        return neg ^ scoreCmp(sb, ea.getNameForScoreboard(), oa, op, hb, ob);
+        return neg ^ scoreCmp(sb, nameOf(ea), oa, op, hb, ob);
     }
     public static boolean scoreCmp(ServerScoreboard sb, String ha, String oa,
                                    String op, net.minecraft.entity.Entity eb, String ob, boolean neg) {
         if (eb == null) return false;
-        return neg ^ scoreCmp(sb, ha, oa, op, eb.getNameForScoreboard(), ob);
+        return neg ^ scoreCmp(sb, ha, oa, op, nameOf(eb), ob);
     }
     public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                    String op, net.minecraft.entity.Entity eb, String ob, boolean neg) {
         if (ea == null || eb == null) return false;
-        return neg ^ scoreCmp(sb, ea.getNameForScoreboard(), oa, op, eb.getNameForScoreboard(), ob);
+        return neg ^ scoreCmp(sb, nameOf(ea), oa, op, nameOf(eb), ob);
+    }
+
+    // ──────────────── scoreCmp ObjRef 오버로드 ────────────────
+    // pass-4 가 상수 objective 를 ObjRef 로 승격 — String 판과 시맨틱 동일하되 읽기가
+    // readHandle(엔트리 핸들 캐시) 경유. '어느 한쪽 미설정 → false' 규칙 유지(null 미캐시).
+    private static Integer readVal(ServerScoreboard sb, Object holderKey, ObjRef o) {
+        ReadableScoreboardScore sc = readHandle(sb, holderKey, o);
+        return sc == null ? null : sc.getScore();
+    }
+    private static boolean cmpOp(int a, String op, int b) {
+        switch (op) {
+            case "<":  return a < b;
+            case "<=": return a <= b;
+            case "=":  return a == b;
+            case ">=": return a >= b;
+            case ">":  return a > b;
+            default:   return false;
+        }
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, String ha, ObjRef oa,
+                                   String op, String hb, ObjRef ob) {
+        Integer a = readVal(sb, ha, oa), b = readVal(sb, hb, ob);
+        return a != null && b != null && cmpOp(a, op, b);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, ObjRef oa,
+                                   String op, String hb, ObjRef ob) {
+        if (ea == null) return false;
+        Integer a = readVal(sb, ea, oa), b = readVal(sb, hb, ob);
+        return a != null && b != null && cmpOp(a, op, b);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, String ha, ObjRef oa,
+                                   String op, net.minecraft.entity.Entity eb, ObjRef ob) {
+        if (eb == null) return false;
+        Integer a = readVal(sb, ha, oa), b = readVal(sb, eb, ob);
+        return a != null && b != null && cmpOp(a, op, b);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, ObjRef oa,
+                                   String op, net.minecraft.entity.Entity eb, ObjRef ob) {
+        if (ea == null || eb == null) return false;
+        Integer a = readVal(sb, ea, oa), b = readVal(sb, eb, ob);
+        return a != null && b != null && cmpOp(a, op, b);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, ObjRef oa,
+                                   String op, String hb, ObjRef ob, boolean neg) {
+        if (ea == null) return false;
+        return neg ^ scoreCmp(sb, ea, oa, op, hb, ob);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, String ha, ObjRef oa,
+                                   String op, net.minecraft.entity.Entity eb, ObjRef ob, boolean neg) {
+        if (eb == null) return false;
+        return neg ^ scoreCmp(sb, ha, oa, op, eb, ob);
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, net.minecraft.entity.Entity ea, ObjRef oa,
+                                   String op, net.minecraft.entity.Entity eb, ObjRef ob, boolean neg) {
+        if (ea == null || eb == null) return false;
+        return neg ^ scoreCmp(sb, ea, oa, op, eb, ob);
     }
 
     // ──────────────── 상수 소스 opScore (const_fold 확장) ────────────────
@@ -3872,12 +3976,12 @@ public final class KfcGen {
     public static boolean scoreCmpL(ServerScoreboard sb, int a, String op,
                                     net.minecraft.entity.Entity eb, String ob) {
         if (eb == null) return false;
-        return scoreCmpL(sb, a, op, eb.getNameForScoreboard(), ob);
+        return scoreCmpL(sb, a, op, nameOf(eb), ob);
     }
     public static boolean scoreCmpL(ServerScoreboard sb, int a, String op,
                                     net.minecraft.entity.Entity eb, String ob, boolean neg) {
         if (eb == null) return false;
-        return neg ^ scoreCmpL(sb, a, op, eb.getNameForScoreboard(), ob);
+        return neg ^ scoreCmpL(sb, a, op, nameOf(eb), ob);
     }
     public static boolean scoreCmpR(ServerScoreboard sb, String ha, String oa, String op, int b) {
         Integer a = read(sb, ha, oa);
@@ -3886,12 +3990,12 @@ public final class KfcGen {
     public static boolean scoreCmpR(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                     String op, int b) {
         if (ea == null) return false;
-        return scoreCmpR(sb, ea.getNameForScoreboard(), oa, op, b);
+        return scoreCmpR(sb, nameOf(ea), oa, op, b);
     }
     public static boolean scoreCmpR(ServerScoreboard sb, net.minecraft.entity.Entity ea, String oa,
                                     String op, int b, boolean neg) {
         if (ea == null) return false;
-        return neg ^ scoreCmpR(sb, ea.getNameForScoreboard(), oa, op, b);
+        return neg ^ scoreCmpR(sb, nameOf(ea), oa, op, b);
     }
 
     // ──────────────── if entity <selector> 존재 검사 ────────────────
@@ -4932,7 +5036,22 @@ public static net.minecraft.entity.Entity firstEntity(
     public static boolean entityScoreMatches(ServerScoreboard sb, net.minecraft.entity.Entity e,
                                              String o, Integer min, Integer max) {
         if (e == null) return false;
-        return scoreMatches(sb, e.getNameForScoreboard(), o, min, max);
+        return scoreMatches(sb, nameOf(e), o, min, max);   // nameOf: 비-플레이어 UUID 문자열 캐시
+    }
+    // ObjRef 판(pass-4 승격) — 읽기 엔트리 핸들 캐시 경유, 시맨틱 동일.
+    public static boolean entityScoreMatches(ServerScoreboard sb, net.minecraft.entity.Entity e,
+                                             ObjRef o, Integer min, Integer max) {
+        if (e == null) return false;
+        Integer v = readVal(sb, e, o);
+        if (v == null) return false;
+        if (min != null && v < min) return false;
+        if (max != null && v > max) return false;
+        return true;
+    }
+    public static boolean entityScoreMatches(ServerScoreboard sb, net.minecraft.entity.Entity e,
+                                             ObjRef o, Integer min, Integer max, boolean neg) {
+        if (e == null) return false;
+        return neg ^ entityScoreMatches(sb, e, o, min, max);
     }
 
     /** 셀렉터 홀더 score 조건(if/unless). 셀렉터가 비면(e==null) 바닐라에선 "No entity" 에러로
@@ -4940,7 +5059,7 @@ public static net.minecraft.entity.Entity firstEntity(
     public static boolean entityScoreMatches(ServerScoreboard sb, net.minecraft.entity.Entity e,
                                              String o, Integer min, Integer max, boolean neg) {
         if (e == null) return false;
-        boolean m = scoreMatches(sb, e.getNameForScoreboard(), o, min, max);
+        boolean m = scoreMatches(sb, nameOf(e), o, min, max);
         return neg ? !m : m;
     }
 

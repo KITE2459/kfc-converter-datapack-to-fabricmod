@@ -998,6 +998,11 @@ def _promote_snbt_text(body: str, decls: list, fields: dict, start_seq: int) -> 
         ("KfcGen.addScore(",           {4}, [(2, *_OBJR)]),
         ("KfcGen.opScore(",            {6}, [(2, *_OBJR), (5, *_OBJR)]),
         ("KfcGen.opScoreN(",           {5}, [(2, *_OBJR)]),
+        # scoreCmp: (sb,ha,oa,op,hb,ob[,neg]) — objective 두 자리를 원자 승격(부분 승격 시
+        # 매칭 오버로드 없음). 6-인자 판은 neg 없는 4개 홀더 조합, 7-인자 판은 neg 동반.
+        ("KfcGen.scoreCmp(",           {6}, [(2, *_OBJR), (5, *_OBJR)]),
+        ("KfcGen.scoreCmp(",           {7}, [(2, *_OBJR), (5, *_OBJR)]),
+        ("KfcGen.entityScoreMatches(", {5, 6}, [(2, *_OBJR)]),
     ]
 
     def _field_for(ftype, pfn, prefix, lit_s):

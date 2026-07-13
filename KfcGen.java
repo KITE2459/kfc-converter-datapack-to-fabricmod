@@ -323,7 +323,17 @@ public final class KfcGen {
         net.minecraft.server.MinecraftServer s = src.getServer();
         if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
         int t = s.getTicks();
-        if (t != OBJ_TICK) { OBJ_TICK = t; OBJ_GEN++; }   // 외부(콘솔/바닐라) objective 변경 재해소
+        if (t != OBJ_TICK) {
+            OBJ_TICK = t; OBJ_GEN++;   // 외부(콘솔/바닐라) objective 변경 재해소(ObjRef 전용 — 저렴)
+            // 13차: 점수 핸들 캐시는 매 틱 클리어하지 않는다. 우리 코드의 모든 엔트리 제거
+            // 경로(reset/objective remove/브릿지·runCommand)는 즉시 무효화를 거치므로,
+            // 남는 구멍은 '외부 콘솔/OP 의 scoreboard 개입'뿐 — 100틱(5초) 주기 화해로 수렴.
+            // (문서화된 편차: 종전 1틱 → 최대 100틱. 정상 플레이 경로에는 영향 없음.)
+            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
+                HANDLE_RECON_TICK = t;
+                invalidateScoreHandles();
+            }
+        }
         return c;
     }
 
@@ -2197,21 +2207,32 @@ public final class KfcGen {
         } else {
             java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
                     new java.util.ArrayList<>(ps.size());
-            for (net.minecraft.entity.Entity p : ps) tmp.add(withEntitySrc(src, p));
+            // 12차: src 상속 필드 11개는 승객과 무관 — 루프 밖에서 1회만 읽는다
+            // (스파크: 승객당 Field.get 이 1.86%p). 실패/비활성이면 null → vanilla 경로.
+            Object[] t = wefTemplate(src, ps.get(0));
+            for (net.minecraft.entity.Entity p : ps)
+                tmp.add(t == null ? src.withEntity(p) : withEntitySrc(src, p, t));
             out = tmp;
         }
         ONP_MAP.put(src, out);
         return out;
     }
 
-    // ── withEntity 특수화(10차) ──
-    // [실측] onPassengers 미스마다 승객 수만큼 vanilla withEntity 가 돌고, 그 내부의
-    // entity.getName().getString()(번역 렌더 1.36%p) + entity.getDisplayName()(팀 장식 렌더
-    // 0.92%p) 가 (승객 × src) 조합마다 반복된다 — 수백 파츠 카트에서 지배 비용.
-    // 이름/표시명은 엔티티 함수이지 src 함수가 아니므로 '같은 틱 + 같은 세대' 에서 엔티티당
-    // 1회 렌더로 수렴시킨다. 무효화: (틱, ENTITY_GEN, NAME_GEN) 스탬프 — 이름/표시명에 영향
-    // 줄 수 있는 네이티브 쓰기(팀 4종, CustomName 을 만지는 entityPut/MergeSnbt)는 전부
-    // NAME_GEN++ 훅을 거치고, 브릿지/디스패처 실행은 ENTITY_GEN++ 로 이미 무효화된다.
+    // ── withEntity 특수화(10차 도입, 11차 개정) ──
+    // [실측 10차] vanilla withEntity 는 (승객 × src) 조합마다 entity.getName().getString()
+    // (번역 렌더) + entity.getDisplayName()(팀 장식 렌더)을 반복한다 — 수백 파츠 카트의 지배 비용.
+    // 이름/표시명은 엔티티 함수이지 src 함수가 아니므로 (틱, ENTITY_GEN, NAME_GEN) 스탬프의
+    // 엔티티당 1회 렌더로 수렴시킨다. 무효화 훅은 팀 4종 + CustomName 을 만지는
+    // entityPut/MergeSnbt(NAME_GEN++), 브릿지/디스패처 실행(ENTITY_GEN++).
+    // [11차 개정] 10차의 '필드 14개 + 타입 유일성' 매칭은 프로덕션에서 비활성이었다(스파크:
+    // withEntitySrc 하위 100% vanilla — 믹스인 필드 주입으로 전제 붕괴 추정). 개정판 전제 최소화:
+    //   · 생성자: 바닐라 14-타입 시그니처를 getDeclaredConstructor 로 직접 조회(모호성 0,
+    //     시그니처 자체가 위 바이트코드 재현의 검증 기준).
+    //   · 필드 식별: 이름/타입/개수 무의존 — 공개 with* API 로 만든 센티널 변형과 원본의
+    //     '달라진 필드' 관찰(프로브)로 역할별 필드를 찾는다. 믹스인 주입 필드는 프로브에서
+    //     변하지 않으므로 자동 배제. 기대치(변화 개수/값) 위반 시 즉시 중단.
+    //   · 어떤 실패든 [KFC-WEF] disabled: <사유> 1회 로그 후 영구 vanilla 폴백(fail-closed).
+    //     최초 실사용 1회는 vanilla 결과와 식별 14필드 전수 비교 자기검증을 통과해야 활성화.
     private static long NAME_GEN = 0;
     private static final java.util.IdentityHashMap<net.minecraft.entity.Entity, Object[]> ND_MAP =
             new java.util.IdentityHashMap<>();
@@ -2219,56 +2240,164 @@ public final class KfcGen {
     private static int  ND_TICK = Integer.MIN_VALUE;
     private static long ND_GEN = -1, ND_NGEN = -1;
 
-    /** withEntity 바이트코드 재현용 리플렉션 셋업 — 필드/생성자 매칭을 '타입 유일성' 으로만
-     *  수행해 매핑(개발 named / 프로덕션 intermediary)과 무관하게 동작한다.
-     *  ServerCommandSource 의 인스턴스 필드 14개는 전부 타입이 서로 다르고(1.21.5 바이트코드
-     *  확인), withEntity 가 호출하는 14-인자 protected 생성자도 유일하다. 믹스인이 필드를
-     *  주입해 타입이 중복되거나 형상이 다르면 OK=false — 영구 vanilla 경로(fail-closed). */
     private static final class Wef {
-        static final java.lang.reflect.Field[] FIELDS;
-        static final java.lang.reflect.Constructor<?> CTOR;
-        static final java.util.HashMap<Class<?>, java.lang.reflect.Field> BY_TYPE = new java.util.HashMap<>();
-        static final Class<?>[] PTYPES;
-        static final boolean OK;
-        static {
-            java.lang.reflect.Field[] fs = null;
-            java.lang.reflect.Constructor<?> ct = null;
-            Class<?>[] pt = null;
-            boolean ok = false;
+        static byte state = 0;   // 0=미프로브 1=활성(자기검증 통과) 2=영구 vanilla 폴백
+        static java.lang.reflect.Constructor<net.minecraft.server.command.ServerCommandSource> ctor;
+        static java.lang.invoke.MethodHandle ctorMh;   // 12차: invokeExact 용(boxing/배열 없는 직접 호출)
+        static java.lang.reflect.Field[] all;   // 전체 인스턴스 필드(프로브 관찰용)
+        static java.lang.reflect.Field fOut, fPos, fRot, fWorld, fLevel, fName, fDisp, fServer,
+                fEntity, fSilent, fRvc, fAnchor, fSigned, fQueue;
+
+        static void disable(String why) {
+            state = 2;
+            System.err.println("[KFC-WEF] disabled: " + why);
+        }
+
+        /** a/b 의 인스턴스 필드 중 값이 다른 것들. 원시형은 박싱 equals — 관찰 목적상 충분. */
+        private static java.util.ArrayList<java.lang.reflect.Field> diff(Object a, Object b) throws Exception {
+            java.util.ArrayList<java.lang.reflect.Field> out = new java.util.ArrayList<>();
+            for (java.lang.reflect.Field f : all)
+                if (!java.util.Objects.equals(f.get(a), f.get(b))) out.add(f);
+            return out;
+        }
+        private static java.lang.reflect.Field one(java.util.ArrayList<java.lang.reflect.Field> d,
+                                                   String probe) {
+            if (d.size() != 1) throw new IllegalStateException("probe " + probe + ": diff=" + d.size());
+            return d.get(0);
+        }
+
+        /** 센티널 프로브로 역할별 필드 식별. 실패 시 false(사유 로그). */
+        static boolean probe(net.minecraft.server.command.ServerCommandSource src,
+                             net.minecraft.entity.Entity p) {
             try {
-                Class<?> cls = net.minecraft.server.command.ServerCommandSource.class;
-                java.util.ArrayList<java.lang.reflect.Field> inst = new java.util.ArrayList<>();
-                boolean dup = false;
-                for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
-                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
-                    f.setAccessible(true);
-                    inst.add(f);
-                    if (BY_TYPE.put(f.getType(), f) != null) dup = true;   // 타입 중복 — 매칭 불가
+                Class<net.minecraft.server.command.ServerCommandSource> cls =
+                        net.minecraft.server.command.ServerCommandSource.class;
+                ctor = cls.getDeclaredConstructor(
+                        net.minecraft.server.command.CommandOutput.class,
+                        net.minecraft.util.math.Vec3d.class,
+                        net.minecraft.util.math.Vec2f.class,
+                        net.minecraft.server.world.ServerWorld.class,
+                        int.class, String.class, net.minecraft.text.Text.class,
+                        net.minecraft.server.MinecraftServer.class,
+                        net.minecraft.entity.Entity.class, boolean.class,
+                        net.minecraft.command.ReturnValueConsumer.class,
+                        net.minecraft.command.argument.EntityAnchorArgumentType.EntityAnchor.class,
+                        net.minecraft.network.message.SignedCommandArguments.class,
+                        net.minecraft.util.thread.FutureQueue.class);
+                ctor.setAccessible(true);
+                ctorMh = java.lang.invoke.MethodHandles.lookup().unreflectConstructor(ctor);
+                java.util.ArrayList<java.lang.reflect.Field> fs = new java.util.ArrayList<>();
+                for (java.lang.reflect.Field f : cls.getDeclaredFields())
+                    if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        f.setAccessible(true); fs.add(f);
+                    }
+                all = fs.toArray(new java.lang.reflect.Field[0]);
+
+                net.minecraft.server.world.ServerWorld w = src.getWorld();
+                net.minecraft.server.MinecraftServer sv = src.getServer();
+                net.minecraft.server.command.ServerCommandSource b0 =
+                        new net.minecraft.server.command.ServerCommandSource(
+                                net.minecraft.server.command.CommandOutput.DUMMY,
+                                net.minecraft.util.math.Vec3d.ZERO, net.minecraft.util.math.Vec2f.ZERO,
+                                w, 2, "kfc-wef-probe",
+                                net.minecraft.text.Text.literal("kfc-wef-probe"), sv, null);
+
+                fPos = one(diff(b0, b0.withPosition(
+                        new net.minecraft.util.math.Vec3d(3.5, 7.25, 11.125))), "pos");
+                fRot = one(diff(b0, b0.withRotation(
+                        new net.minecraft.util.math.Vec2f(12.5f, 33.25f))), "rot");
+                net.minecraft.server.command.CommandOutput sentOut =
+                        new net.minecraft.server.command.CommandOutput() {
+                            @Override public void sendMessage(net.minecraft.text.Text t) {}
+                            @Override public boolean shouldReceiveFeedback() { return false; }
+                            @Override public boolean shouldTrackOutput() { return false; }
+                            @Override public boolean shouldBroadcastConsoleToOps() { return false; }
+                        };
+                fOut = one(diff(b0, b0.withOutput(sentOut)), "out");
+                fLevel = one(diff(b0, b0.withLevel(3)), "level");
+                fSilent = one(diff(b0, b0.withSilent()), "silent");
+                net.minecraft.command.ReturnValueConsumer sentRvc = (ok, v) -> {};
+                fRvc = one(diff(b0, b0.withReturnValueConsumer(sentRvc)), "rvc");
+                fAnchor = one(diff(b0, b0.withEntityAnchor(
+                        net.minecraft.command.argument.EntityAnchorArgumentType.EntityAnchor.EYES)), "anchor");
+                net.minecraft.network.message.SignedCommandArguments sentSigned = (s) -> null;
+                net.minecraft.util.thread.FutureQueue sentQueue = new net.minecraft.util.thread.FutureQueue() {
+                    @Override public <T> void append(java.util.concurrent.CompletableFuture<T> f,
+                                                     java.util.function.Consumer<T> c) {}
+                };
+                net.minecraft.server.command.ServerCommandSource b8 =
+                        b0.withSignedArguments(sentSigned, sentQueue);
+                java.util.ArrayList<java.lang.reflect.Field> ds = diff(b0, b8);
+                if (ds.size() != 2) throw new IllegalStateException("probe signed: diff=" + ds.size());
+                for (java.lang.reflect.Field f : ds) {
+                    Object v = f.get(b8);
+                    if (v == sentSigned) fSigned = f;
+                    else if (v == sentQueue) fQueue = f;
                 }
-                java.lang.reflect.Constructor<?> c14 = null; int n14 = 0;
-                for (java.lang.reflect.Constructor<?> c : cls.getDeclaredConstructors()) {
-                    if (c.getParameterCount() == 14) { c14 = c; n14++; }
+                if (fSigned == null || fQueue == null) throw new IllegalStateException("probe signed: id");
+                // entity 프로브 1회로 entity/name/displayName 3역할 동시 식별(값의 타입으로 구분)
+                net.minecraft.server.command.ServerCommandSource b9 = b0.withEntity(p);
+                for (java.lang.reflect.Field f : diff(b0, b9)) {
+                    Object v = f.get(b9);
+                    if (v instanceof net.minecraft.entity.Entity) fEntity = f;
+                    else if (v instanceof String) fName = f;
+                    else if (v instanceof net.minecraft.text.Text) fDisp = f;
+                    else throw new IllegalStateException("probe entity: " + f.getType().getName());
                 }
-                if (!dup && inst.size() == 14 && n14 == 1) {
-                    c14.setAccessible(true);
-                    pt = c14.getParameterTypes();
-                    boolean cov = true;
-                    for (Class<?> t : pt) if (!BY_TYPE.containsKey(t)) cov = false;
-                    if (cov) { fs = inst.toArray(new java.lang.reflect.Field[0]); ct = c14; ok = true; }
+                if (fEntity == null || fName == null || fDisp == null)
+                    throw new IllegalStateException("probe entity: id");
+                // world/server — 남은 두 역할은 현재값 일치(유일)로 식별
+                java.util.HashSet<java.lang.reflect.Field> used = new java.util.HashSet<>(java.util.List.of(
+                        fPos, fRot, fOut, fLevel, fSilent, fRvc, fAnchor, fSigned, fQueue,
+                        fEntity, fName, fDisp));
+                for (java.lang.reflect.Field f : all) {
+                    if (used.contains(f)) continue;
+                    Object v = f.get(b0);
+                    if (v == w) {
+                        if (fWorld != null) throw new IllegalStateException("probe world: dup");
+                        fWorld = f;
+                    } else if (v == sv) {
+                        if (fServer != null) throw new IllegalStateException("probe server: dup");
+                        fServer = f;
+                    }
                 }
-            } catch (Throwable t) { ok = false; }
-            FIELDS = fs; CTOR = ct; PTYPES = pt; OK = ok;
+                if (fWorld == null || fServer == null) throw new IllegalStateException("probe world/server: id");
+                return true;
+            } catch (Throwable t) {
+                disable(String.valueOf(t));
+                return false;
+            }
         }
     }
-    private static byte WEF_STATE = 0;   // 0=미검증 1=적용(자기검증 통과) 2=영구 vanilla 폴백
 
-    /** src.withEntity(p) 와 관측 동등한 특수화: 이름/표시명만 틱-캐시에서 공급하고 나머지는
-     *  vanilla 바이트코드처럼 src 필드를 그대로 14-인자 생성자에 전달한다.
-     *  표시명은 소스마다 copy() 로 격리(vanilla 도 호출마다 새 Text 를 만들므로 별칭 양상 동일).
-     *  최초 사용 시 vanilla 결과와 14필드 전수 비교 자기검증 — 불일치/예외면 영구 폴백. */
+    /** onPassengers 미스당 1회: 프로브(최초) + src 상속 필드 11개 스냅샷.
+     *  비활성/실패면 null(호출측 vanilla 폴백). 슬롯 5,6,8 은 승객별(name/disp/entity). */
+    private static Object[] wefTemplate(net.minecraft.server.command.ServerCommandSource src,
+                                        net.minecraft.entity.Entity firstPassenger) {
+        if (Wef.state == 2) return null;
+        try {
+            if (Wef.state == 0 && !Wef.probe(src, firstPassenger)) return null;
+            Object[] t = new Object[14];
+            t[0] = Wef.fOut.get(src);    t[1] = Wef.fPos.get(src);    t[2] = Wef.fRot.get(src);
+            t[3] = Wef.fWorld.get(src);  t[4] = Wef.fLevel.get(src);  t[7] = Wef.fServer.get(src);
+            t[9] = Wef.fSilent.get(src); t[10] = Wef.fRvc.get(src);   t[11] = Wef.fAnchor.get(src);
+            t[12] = Wef.fSigned.get(src); t[13] = Wef.fQueue.get(src);
+            return t;
+        } catch (Throwable th) {
+            Wef.disable(String.valueOf(th));
+            return null;
+        }
+    }
+
+    /** src.withEntity(p) 와 관측 동등한 특수화 — 이름/표시명만 틱-캐시에서 공급하고 나머지는
+     *  vanilla 바이트코드처럼 src 의 해당 필드 값(템플릿 t, src당 1회 채취)을 14-인자 생성자에
+     *  전달한다. 생성은 MethodHandle.invokeExact(정확 시그니처) — Object[] boxing 경유하는
+     *  Constructor.newInstance 의 호출당 오버헤드(스파크 0.6%p+)를 제거한다.
+     *  표시명은 소스마다 copy() 로 격리(vanilla 도 호출마다 새 Text — 별칭 양상 동일).
+     *  최초 실사용 시 vanilla 결과와 식별 14필드 전수 비교 자기검증 — 불일치/예외면 영구 폴백. */
     private static net.minecraft.server.command.ServerCommandSource withEntitySrc(
-            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity p) {
-        if (WEF_STATE == 2 || !Wef.OK) return src.withEntity(p);
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity p,
+            Object[] t) {
         try {
             if (src.getEntity() == p) return src;   // vanilla 의 동일-엔티티 단락과 동일
             net.minecraft.server.MinecraftServer sv = src.getServer();
@@ -2281,29 +2410,38 @@ public final class KfcGen {
                 nd = new Object[] { p.getName().getString(), p.getDisplayName() };
                 ND_MAP.put(p, nd);
             }
-            Object[] args = new Object[14];
-            for (int i = 0; i < 14; i++) {
-                Class<?> t = Wef.PTYPES[i];
-                if (t == String.class) args[i] = nd[0];
-                else if (t == net.minecraft.text.Text.class) args[i] = ((net.minecraft.text.Text) nd[1]).copy();
-                else if (t == net.minecraft.entity.Entity.class) args[i] = p;
-                else args[i] = Wef.BY_TYPE.get(t).get(src);
-            }
             net.minecraft.server.command.ServerCommandSource fast =
-                    (net.minecraft.server.command.ServerCommandSource) Wef.CTOR.newInstance(args);
-            if (WEF_STATE == 0) {
+                    (net.minecraft.server.command.ServerCommandSource) Wef.ctorMh.invokeExact(
+                    (net.minecraft.server.command.CommandOutput) t[0],
+                    (net.minecraft.util.math.Vec3d) t[1],
+                    (net.minecraft.util.math.Vec2f) t[2],
+                    (net.minecraft.server.world.ServerWorld) t[3],
+                    (int) (Integer) t[4],
+                    (String) nd[0],
+                    (net.minecraft.text.Text) ((net.minecraft.text.Text) nd[1]).copy(),
+                    (net.minecraft.server.MinecraftServer) t[7],
+                    p,
+                    (boolean) (Boolean) t[9],
+                    (net.minecraft.command.ReturnValueConsumer) t[10],
+                    (net.minecraft.command.argument.EntityAnchorArgumentType.EntityAnchor) t[11],
+                    (net.minecraft.network.message.SignedCommandArguments) t[12],
+                    (net.minecraft.util.thread.FutureQueue) t[13]);
+            if (Wef.state == 0) {
                 net.minecraft.server.command.ServerCommandSource truth = src.withEntity(p);
-                for (java.lang.reflect.Field f : Wef.FIELDS) {
+                java.lang.reflect.Field[] idf = { Wef.fOut, Wef.fPos, Wef.fRot, Wef.fWorld,
+                        Wef.fLevel, Wef.fName, Wef.fDisp, Wef.fServer, Wef.fEntity, Wef.fSilent,
+                        Wef.fRvc, Wef.fAnchor, Wef.fSigned, Wef.fQueue };
+                for (java.lang.reflect.Field f : idf) {
                     Object a = f.get(fast), b = f.get(truth);
-                    boolean eq = (f.getType() == String.class || f.getType() == net.minecraft.text.Text.class)
+                    boolean eq = (f.getType().isPrimitive() || f == Wef.fName || f == Wef.fDisp)
                             ? java.util.Objects.equals(a, b) : a == b;
-                    if (!eq) { WEF_STATE = 2; return truth; }
+                    if (!eq) { Wef.disable("verify: " + f.getName()); return truth; }
                 }
-                WEF_STATE = 1;
+                Wef.state = 1;
             }
             return fast;
-        } catch (Throwable t) {
-            WEF_STATE = 2;
+        } catch (Throwable t2) {
+            Wef.disable(String.valueOf(t2));
             return src.withEntity(p);
         }
     }
@@ -2330,8 +2468,8 @@ public final class KfcGen {
 
     /** scoreboard players reset <holder> [<obj>] — obj null 이면 전 목표에서 제거. */
     public static void resetScore(ServerScoreboard sb, String holder, String o) {
-        invalidateScoreHandles();   // 엔트리 제거 — 캐시된 ScoreAccess 가 고아 엔트리를 참조하지 않도록
-        if ("*".equals(holder)) { resetScoreWildcard(sb, o); return; }
+        if ("*".equals(holder)) { resetScoreWildcard(sb, o); return; }   // 전체 클리어는 wildcard 내부에서
+        dropHandlesFor(holder);   // 13차: 해당 홀더만 선별 무효화(종전 전체 클리어 → 매 틱 재해소 churn)
         ScoreHolder sh = holderOf(holder);
         if (o == null) {
             sb.removeScores(sh);
@@ -2418,7 +2556,7 @@ public final class KfcGen {
 
     public static void removeObjective(ServerScoreboard sb, String name) {
         net.minecraft.scoreboard.ScoreboardObjective o = sb.getNullableObjective(name);
-        if (o != null) { sb.removeObjective(o); OBJ_GEN++; }
+        if (o != null) { sb.removeObjective(o); OBJ_GEN++; invalidateScoreHandles(); }   // 13차: 해당 objective 의 전 엔트리 고아화
     }
 
     /** scoreboard objectives add/modify 의 displayname(Text) 설정. */
@@ -3539,6 +3677,7 @@ public final class KfcGen {
             if ((cls & CMD_SAFE) == 0) {
                 ENTITY_GEN++;   // 디스패처 실행이 summon/kill/tag/ride 했을 수 있으므로 무효화
                 OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
+                invalidateScoreHandles();   // 13차: 바닐라가 scoreboard reset/remove 했을 수 있음
             }
             if ((cls & CMD_RELOADS) != 0) FN_CACHE.clear();   // reload/datapack — 함수 핸들 재해소
         } catch (Exception ex) {
@@ -3606,6 +3745,7 @@ public final class KfcGen {
             // (예: 브릿지로 소환된 모델의 임시태그 제거 실패 → 다음 소환이 이전 모델 간섭) 고증이 깨진다.
             // 따라서 브릿지 직후 스냅샷/타입버킷을 무효화해 다음 접근 때 live 월드에서 재빌드시킨다.
             ENTITY_GEN++;
+            invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
         } catch (Exception ex) {
             // 폴백 실행 실패는 조용히 삼키지 않는다 — 원본이라면 함수가 '실행'됐을 상황이므로
             // 실패는 변환기/환경 문제다. 진단 가능하도록 로그를 남긴다.
@@ -3647,6 +3787,7 @@ public final class KfcGen {
             });
             ENTITY_GEN++;   // 브릿지가 summon/kill 했을 수 있으므로 스냅샷/타입버킷 무효화(위 설명 참조)
             OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
+            invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
         } catch (Exception ex) {
             System.err.println("[KFC-BRIDGE-ERROR] " + functionId + ": " + ex);
         }
@@ -3844,11 +3985,21 @@ public final class KfcGen {
     // setScore/addScore/opScore 가 매 호출 getOrCreateScore(홀더 문자열 해시 조회 + ScoreAccess
     // 래퍼 할당)를 타던 것을 (ObjRef, 홀더)별 핸들 재사용으로 대체한다. 핸들은 스코어보드의
     // 라이브 엔트리에 바인딩되므로 '엔트리가 제거될 수 있는' 모든 지점에서 무효화해야 한다:
-    //   · OBJ_GEN 변화(틱 경계 재해소 / objective add·remove / 브릿지·runCommand) → 전체 클리어
+    //   · HANDLE_GEN 변화(objective remove / 브릿지·runCommand / 100틱 주기 화해) → 전체 클리어
+    //     (13차: 종전 'OBJ_GEN=매 틱' 결합을 해제 — 매 틱 전체 재해소 churn ~2%p 제거.
+    //      scoreboard players reset 은 dropHandlesFor 로 해당 홀더만 선별 무효화.)
     //   · 우리 resetScore/resetScoreWildcard(엔트리 제거) → 전체 클리어
     // 시맨틱: 캐시 미스 시 getOrCreateScore(엔트리 존재화 부수효과 포함) — 종전과 동일.
     // 히트 시에도 '이미 존재하는 엔트리'에 대한 재-getOrCreate 는 무변경이므로 관측 동일.
     private static long SH_GEN = Long.MIN_VALUE;
+    // 13차: 핸들 캐시 세대 — 종전에는 OBJ_GEN(매 틱 증가)에 묶여 매 틱 전체 클리어됐다.
+    // 이제 '엔트리가 고아가 될 수 있는' 경로에서만 증가한다. ScoreAccess/엔트리는 살아있는 한
+    // 라이브 객체이므로(값 갱신과 무관) 틱을 넘겨 재사용해도 관측 동일하다.
+    private static long HANDLE_GEN = 0;
+    private static int HANDLE_RECON_TICK = Integer.MIN_VALUE;
+    // 정적 승격 Sch/Rch 셀의 홀더별 레지스트리(선별 무효화용). 셀은 콜사이트당 1회 생성 — 유한.
+    private static final java.util.HashMap<String, java.util.ArrayList<Object>> CELLS_BY_HOLDER =
+            new java.util.HashMap<>();
     private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess>>
             SCORE_HANDLES = new java.util.HashMap<>();
     // SCORE_HANDLES 가 (어떤 이유로든) 비워질 때마다 증가하는 세대 카운터.
@@ -3858,7 +4009,7 @@ public final class KfcGen {
     private static long SCORE_EPOCH = 0;
 
     private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
-        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
+        if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
         java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(o);
         if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(o, m); }
         net.minecraft.scoreboard.ScoreAccess a = m.get(holderKey);
@@ -3875,6 +4026,36 @@ public final class KfcGen {
 
     private static void invalidateScoreHandles() {
         SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++;
+        HANDLE_GEN++; SH_GEN = HANDLE_GEN;   // 지연 검사(scoreHandle/readHandle)와 즉시 동기
+    }
+
+    /** 13차: scoreboard players reset <holder> 의 선별 무효화 — 전체 클리어 대신 해당 홀더의
+     *  핸들만 제거한다(매 틱 checkpoint 정렬의 reset 이 전체 클리어를 유발 → 상시 재해소 churn).
+     *  대상: (a) 정적 승격 Sch/Rch 셀(홀더별 레지스트리), (b) SCORE_HANDLES/READ_HANDLES 의
+     *  String 키, (c) Entity 키(nameOf 비교 스캔 — nameOf 는 identity 캐시라 저렴).
+     *  다른 홀더의 핸들은 그대로 유효(removeScore(s) 는 해당 홀더의 엔트리만 제거한다).
+     *  objective 구분 없이 홀더 전체를 지우는 과잉 무효화는 안전(재해소는 멱등). */
+    private static void dropHandlesFor(String holder) {
+        java.util.ArrayList<Object> cells = CELLS_BY_HOLDER.get(holder);
+        if (cells != null) {
+            for (Object c : cells) {
+                if (c instanceof Sch s) s.acc = null;
+                else if (c instanceof Rch r) r.sc = null;
+            }
+        }
+        for (java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m : SCORE_HANDLES.values())
+            dropHolderKey(m, holder);
+        for (java.util.HashMap<Object, ReadableScoreboardScore> m : READ_HANDLES.values())
+            dropHolderKey(m, holder);
+    }
+    private static <V> void dropHolderKey(java.util.HashMap<Object, V> m, String holder) {
+        m.remove(holder);
+        if (m.isEmpty()) return;
+        java.util.Iterator<java.util.Map.Entry<Object, V>> it = m.entrySet().iterator();
+        while (it.hasNext()) {
+            Object k = it.next().getKey();
+            if (k instanceof net.minecraft.entity.Entity en && holder.equals(nameOf(en))) it.remove();
+        }
     }
 
     // ── 읽기 엔트리 핸들 캐시 ──
@@ -3886,7 +4067,7 @@ public final class KfcGen {
             READ_HANDLES = new java.util.HashMap<>();
 
     private static ReadableScoreboardScore readHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
-        if (SH_GEN != OBJ_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = OBJ_GEN; }
+        if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
         java.util.HashMap<Object, ReadableScoreboardScore> m = READ_HANDLES.get(o);
         if (m == null) { m = new java.util.HashMap<>(); READ_HANDLES.put(o, m); }
         ReadableScoreboardScore sc = m.get(holderKey);
@@ -3914,7 +4095,11 @@ public final class KfcGen {
         long gen = Long.MIN_VALUE;
         Sch(String holder, ObjRef obj) { this.holder = holder; this.obj = obj; }
     }
-    public static Sch sch(String holder, ObjRef o) { return new Sch(holder, o); }
+    public static Sch sch(String holder, ObjRef o) {
+        Sch s = new Sch(holder, o);
+        CELLS_BY_HOLDER.computeIfAbsent(holder, k -> new java.util.ArrayList<>()).add(s);   // 13차
+        return s;
+    }
 
     private static net.minecraft.scoreboard.ScoreAccess resolve(ServerScoreboard sb, Sch h) {
         if (h.acc == null || h.gen != SCORE_EPOCH) {
@@ -3945,7 +4130,11 @@ public final class KfcGen {
         long gen = Long.MIN_VALUE;
         Rch(String holder, ObjRef obj) { this.holder = holder; this.obj = obj; }
     }
-    public static Rch rch(String holder, ObjRef o) { return new Rch(holder, o); }
+    public static Rch rch(String holder, ObjRef o) {
+        Rch r = new Rch(holder, o);
+        CELLS_BY_HOLDER.computeIfAbsent(holder, k -> new java.util.ArrayList<>()).add(r);   // 13차
+        return r;
+    }
 
     private static ReadableScoreboardScore resolveR(ServerScoreboard sb, Rch h) {
         ReadableScoreboardScore sc = h.sc;

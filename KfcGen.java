@@ -953,6 +953,7 @@ public final class KfcGen {
 
     // ── team ── (바닐라 TeamCommand 흐름: Scoreboard 팀 API 직접 호출)
     public static void teamAdd(GameContext ctx, String name, String displayJson) {
+        NAME_GEN++;   // 팀 생성/표시명 변화 — 표시명 틱-캐시 무효화(10차)
         net.minecraft.scoreboard.Team t = ctx.scoreboard.getTeam(name);
         if (t == null) t = ctx.scoreboard.addTeam(name);   // 멱등: 이미 있으면 재사용
         if (displayJson != null) t.setDisplayName(parseText(ctx.server, displayJson));
@@ -978,6 +979,7 @@ public final class KfcGen {
     }
 
     public static void teamModify(GameContext ctx, String name, String option, String value) {
+        NAME_GEN++;   // 팀 장식(색/prefix/suffix 등) 변화 — 표시명 틱-캐시 무효화(10차)
         net.minecraft.scoreboard.Team t = ctx.scoreboard.getTeam(name);
         if (t == null) return;
         switch (option) {
@@ -994,11 +996,13 @@ public final class KfcGen {
     }
 
     public static void teamLeave(ServerScoreboard sb, String holder) {
+        NAME_GEN++;   // 팀 소속 변화 — 표시명 틱-캐시 무효화(10차)
         if (holder != null) sb.clearTeam(holder);   // 현재 소속 팀에서 제거
     }
 
     /** team join <team> <members> — 멤버를 팀에 추가. */
     public static void teamJoin(ServerScoreboard sb, String teamName, String holder) {
+        NAME_GEN++;   // 팀 소속 변화 — 표시명 틱-캐시 무효화(10차)
         if (holder == null) return;
         net.minecraft.scoreboard.Team t = sb.getTeam(teamName);
         if (t != null) sb.addScoreHolderToTeam(holder, t);
@@ -2193,11 +2197,115 @@ public final class KfcGen {
         } else {
             java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
                     new java.util.ArrayList<>(ps.size());
-            for (net.minecraft.entity.Entity p : ps) tmp.add(src.withEntity(p));
+            for (net.minecraft.entity.Entity p : ps) tmp.add(withEntitySrc(src, p));
             out = tmp;
         }
         ONP_MAP.put(src, out);
         return out;
+    }
+
+    // ── withEntity 특수화(10차) ──
+    // [실측] onPassengers 미스마다 승객 수만큼 vanilla withEntity 가 돌고, 그 내부의
+    // entity.getName().getString()(번역 렌더 1.36%p) + entity.getDisplayName()(팀 장식 렌더
+    // 0.92%p) 가 (승객 × src) 조합마다 반복된다 — 수백 파츠 카트에서 지배 비용.
+    // 이름/표시명은 엔티티 함수이지 src 함수가 아니므로 '같은 틱 + 같은 세대' 에서 엔티티당
+    // 1회 렌더로 수렴시킨다. 무효화: (틱, ENTITY_GEN, NAME_GEN) 스탬프 — 이름/표시명에 영향
+    // 줄 수 있는 네이티브 쓰기(팀 4종, CustomName 을 만지는 entityPut/MergeSnbt)는 전부
+    // NAME_GEN++ 훅을 거치고, 브릿지/디스패처 실행은 ENTITY_GEN++ 로 이미 무효화된다.
+    private static long NAME_GEN = 0;
+    private static final java.util.IdentityHashMap<net.minecraft.entity.Entity, Object[]> ND_MAP =
+            new java.util.IdentityHashMap<>();
+    private static net.minecraft.server.MinecraftServer ND_SERVER;
+    private static int  ND_TICK = Integer.MIN_VALUE;
+    private static long ND_GEN = -1, ND_NGEN = -1;
+
+    /** withEntity 바이트코드 재현용 리플렉션 셋업 — 필드/생성자 매칭을 '타입 유일성' 으로만
+     *  수행해 매핑(개발 named / 프로덕션 intermediary)과 무관하게 동작한다.
+     *  ServerCommandSource 의 인스턴스 필드 14개는 전부 타입이 서로 다르고(1.21.5 바이트코드
+     *  확인), withEntity 가 호출하는 14-인자 protected 생성자도 유일하다. 믹스인이 필드를
+     *  주입해 타입이 중복되거나 형상이 다르면 OK=false — 영구 vanilla 경로(fail-closed). */
+    private static final class Wef {
+        static final java.lang.reflect.Field[] FIELDS;
+        static final java.lang.reflect.Constructor<?> CTOR;
+        static final java.util.HashMap<Class<?>, java.lang.reflect.Field> BY_TYPE = new java.util.HashMap<>();
+        static final Class<?>[] PTYPES;
+        static final boolean OK;
+        static {
+            java.lang.reflect.Field[] fs = null;
+            java.lang.reflect.Constructor<?> ct = null;
+            Class<?>[] pt = null;
+            boolean ok = false;
+            try {
+                Class<?> cls = net.minecraft.server.command.ServerCommandSource.class;
+                java.util.ArrayList<java.lang.reflect.Field> inst = new java.util.ArrayList<>();
+                boolean dup = false;
+                for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    f.setAccessible(true);
+                    inst.add(f);
+                    if (BY_TYPE.put(f.getType(), f) != null) dup = true;   // 타입 중복 — 매칭 불가
+                }
+                java.lang.reflect.Constructor<?> c14 = null; int n14 = 0;
+                for (java.lang.reflect.Constructor<?> c : cls.getDeclaredConstructors()) {
+                    if (c.getParameterCount() == 14) { c14 = c; n14++; }
+                }
+                if (!dup && inst.size() == 14 && n14 == 1) {
+                    c14.setAccessible(true);
+                    pt = c14.getParameterTypes();
+                    boolean cov = true;
+                    for (Class<?> t : pt) if (!BY_TYPE.containsKey(t)) cov = false;
+                    if (cov) { fs = inst.toArray(new java.lang.reflect.Field[0]); ct = c14; ok = true; }
+                }
+            } catch (Throwable t) { ok = false; }
+            FIELDS = fs; CTOR = ct; PTYPES = pt; OK = ok;
+        }
+    }
+    private static byte WEF_STATE = 0;   // 0=미검증 1=적용(자기검증 통과) 2=영구 vanilla 폴백
+
+    /** src.withEntity(p) 와 관측 동등한 특수화: 이름/표시명만 틱-캐시에서 공급하고 나머지는
+     *  vanilla 바이트코드처럼 src 필드를 그대로 14-인자 생성자에 전달한다.
+     *  표시명은 소스마다 copy() 로 격리(vanilla 도 호출마다 새 Text 를 만들므로 별칭 양상 동일).
+     *  최초 사용 시 vanilla 결과와 14필드 전수 비교 자기검증 — 불일치/예외면 영구 폴백. */
+    private static net.minecraft.server.command.ServerCommandSource withEntitySrc(
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity p) {
+        if (WEF_STATE == 2 || !Wef.OK) return src.withEntity(p);
+        try {
+            if (src.getEntity() == p) return src;   // vanilla 의 동일-엔티티 단락과 동일
+            net.minecraft.server.MinecraftServer sv = src.getServer();
+            int tk = sv.getTicks();
+            if (ND_SERVER != sv || ND_TICK != tk || ND_GEN != ENTITY_GEN || ND_NGEN != NAME_GEN) {
+                ND_MAP.clear(); ND_SERVER = sv; ND_TICK = tk; ND_GEN = ENTITY_GEN; ND_NGEN = NAME_GEN;
+            }
+            Object[] nd = ND_MAP.get(p);
+            if (nd == null) {
+                nd = new Object[] { p.getName().getString(), p.getDisplayName() };
+                ND_MAP.put(p, nd);
+            }
+            Object[] args = new Object[14];
+            for (int i = 0; i < 14; i++) {
+                Class<?> t = Wef.PTYPES[i];
+                if (t == String.class) args[i] = nd[0];
+                else if (t == net.minecraft.text.Text.class) args[i] = ((net.minecraft.text.Text) nd[1]).copy();
+                else if (t == net.minecraft.entity.Entity.class) args[i] = p;
+                else args[i] = Wef.BY_TYPE.get(t).get(src);
+            }
+            net.minecraft.server.command.ServerCommandSource fast =
+                    (net.minecraft.server.command.ServerCommandSource) Wef.CTOR.newInstance(args);
+            if (WEF_STATE == 0) {
+                net.minecraft.server.command.ServerCommandSource truth = src.withEntity(p);
+                for (java.lang.reflect.Field f : Wef.FIELDS) {
+                    Object a = f.get(fast), b = f.get(truth);
+                    boolean eq = (f.getType() == String.class || f.getType() == net.minecraft.text.Text.class)
+                            ? java.util.Objects.equals(a, b) : a == b;
+                    if (!eq) { WEF_STATE = 2; return truth; }
+                }
+                WEF_STATE = 1;
+            }
+            return fast;
+        } catch (Throwable t) {
+            WEF_STATE = 2;
+            return src.withEntity(p);
+        }
     }
 
     /** 술어를 만족하는 플레이어가 하나라도 있는지 — predicate 동반 @a/@p 존재검사용. */
@@ -6403,6 +6511,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityPutSnbt(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return;
+        if (path != null && path.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -6436,6 +6545,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  vanilla store success 는 readNbt 가 나중에 경로를 버려도 put 개수 기준이므로 이 판정이 관측 동등. */
     public static boolean entityPutSnbtChanged(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return false;
+        if (path != null && path.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
                 try {
@@ -6556,6 +6666,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {
         if (e == null) return;
+        if (snbt != null && snbt.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
         try {
             // SNBT 리터럴은 변환 시점 상수 — 캐시된 템플릿을 copy (storagePutSnbt 와 동일 패턴).
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -6615,6 +6726,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  대응)이면 invalidateSnapshot 후 무동작 — String 판과 동일 순서. */
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound tc) {
         if (e == null || tc == null) return;
+        if (tc.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
         try {
             if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) { invalidateSnapshot(e); return; }
             net.minecraft.nbt.NbtCompound patch = tc.copy();
@@ -7008,25 +7120,34 @@ public static net.minecraft.entity.Entity firstEntity(
     private static final class SnapMacroArgs extends java.util.AbstractMap<String, String> {
         private final java.util.HashMap<String, String> resolved = new java.util.HashMap<>();
         private final java.util.HashMap<String, net.minecraft.nbt.NbtElement> pending = new java.util.HashMap<>();
-        // 바인드 시점 원본 타입 NBT 스냅샷(깊은 복사). 브릿지 폴백은 이 원본을 바닐라 매크로 엔진
+        // 바인드 시점 원본 타입 NBT 스냅샷 — 키별 요소로 보관(10차: 종전 c.copy() 전체 깊은복사가
+        // 스파크 1.07%p — 비스칼라는 pending 에 이미 copy 가 있고 스칼라 NBT 는 불변이라 참조로
+        // 충분해 이중 복사였다). 브릿지 폴백은 rawArgsCopy() 재조립본을 바닐라 매크로 엔진
         // (Macro.withMacroReplaced)에 그대로 넘겨, 우리 문자열화(nbtToMacroString)에 의존하지 않고
         // 바닐라 자체 Macro.toString 으로 치환한다 → 폴백이 바닐라와 완전 동일(미래 MC 포맷 변화에도 자동 추종).
-        private final net.minecraft.nbt.NbtCompound bindSnapshot;
+        private final java.util.HashMap<String, net.minecraft.nbt.NbtElement> bindEls = new java.util.HashMap<>();
         SnapMacroArgs(net.minecraft.nbt.NbtCompound c) {
-            this.bindSnapshot = c.copy();
             for (String k : c.getKeys()) {
                 net.minecraft.nbt.NbtElement el = c.get(k);
                 if (el == null) continue;
                 if (el instanceof net.minecraft.nbt.NbtString
                         || el instanceof net.minecraft.nbt.AbstractNbtNumber) {
                     resolved.put(k, nbtToMacroString(el));     // 스칼라: 즉시 스냅샷(원본과 동일)
+                    bindEls.put(k, el);                        // NBT 스칼라는 불변 — 참조 스냅샷으로 충분
                 } else {
-                    pending.put(k, el.copy());                 // 비스칼라: 바인드 시점 깊은 복사 스냅샷, toString 지연
+                    net.minecraft.nbt.NbtElement snap = el.copy();   // 비스칼라: 바인드 시점 깊은 복사(종전 동일)
+                    pending.put(k, snap);
+                    bindEls.put(k, snap);                      // 동일 스냅샷 공유(양쪽 다 읽기 전용)
                 }
             }
         }
-        /** 브릿지용 — 바인드 시점 원본 타입 NBT 의 복사본. */
-        net.minecraft.nbt.NbtCompound rawArgsCopy() { return bindSnapshot.copy(); }
+        /** 브릿지용 — 바인드 시점 원본 타입 NBT 의 복사본(키별 스냅샷 재조립, 종전 bindSnapshot.copy() 와 값 동일). */
+        net.minecraft.nbt.NbtCompound rawArgsCopy() {
+            net.minecraft.nbt.NbtCompound out = new net.minecraft.nbt.NbtCompound();
+            for (java.util.Map.Entry<String, net.minecraft.nbt.NbtElement> e : bindEls.entrySet())
+                out.put(e.getKey(), e.getValue().copy());
+            return out;
+        }
         @Override public boolean containsKey(Object k) {
             return resolved.containsKey(k) || pending.containsKey(k);
         }

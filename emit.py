@@ -4855,6 +4855,11 @@ def cond_pos_expr(raw: str, src_var: str = "source"):
                 f'{v[0]}, {v[1]}, {v[2]})')
     if any(p.startswith('^') for p in parts):
         return None
+    # 순수 상대 `~ ~ ~` 는 소스 위치 그 자체 — new Vec3d(pos.x,pos.y,pos.z) 는 값이 동일한
+    # 중복 할당(+getPosition 3회)이다. Vec3d 불변이므로 getPosition() 을 그대로 반환한다
+    # (playSound 등 ~32만 사이트의 할당 제거). 오프셋/절대좌표가 하나라도 있으면 종전대로.
+    if all(p == '~' for p in parts):
+        return f'{src_var}.getPosition()'
     comps = []
     for i, p in enumerate(parts):
         base = f'{src_var}.getPosition().' + ('x', 'y', 'z')[i]

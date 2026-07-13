@@ -1003,6 +1003,16 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             print(f"[generate][warn] entity-holder rewrite skipped due to error: {_ee}")
         _tlog("pass-2.75 (entity-holder)")
 
+        # ── [pass-2.78] on passengers 소스 지연 생성 — 필터 선행, withEntity 는 통과분만.
+        try:
+            import opt_post as _op_mod78
+            pstats = _op_mod78.defer_passenger_sources(_records, verbose=True)
+            print(f"[generate] pass-2.78 onp-defer: {pstats}")
+        except Exception as _pe:
+            import traceback; traceback.print_exc()
+            print(f"[generate][warn] onp-defer skipped due to error: {_pe}")
+        _tlog("pass-2.78 (onp-defer)")
+
         # ── [pass-2.8] 상수 스코어 폴딩 — 전 팩 라인 분석으로 '항상 같은 리터럴'임이
         #    증명된 (#가짜플레이어, dummy objective) 읽기를 리터럴로 재작성.
         #    (증명 조건·시맨틱 논증은 const_fold.py 헤더. 실패는 fail-closed 로 원형 유지.)

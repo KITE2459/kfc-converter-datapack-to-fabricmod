@@ -1082,6 +1082,69 @@ def _collapse_score_handles(body: str, decls: list, fields: dict, start_seq: int
     return body, n, seq
 
 
+# ── Rch/Sch 확장 collapse: 상수 (홀더, objective) 의 읽기·비교·연산 호출 → 정적 셀 ──
+#   scoreMatches/getScore/readScore → KFC_RCH_k (읽기 엔트리 핸들 — epoch 스탬프로 이중 맵 조회 생략)
+#   opScoreN → KFC_SCH_k, opScore/scoreCmp 는 양측 모두 리터럴+KFC_OBJ 일 때만(원자성) 접는다.
+def _collapse_read_handles(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
+    seq = start_seq; n = 0
+    repls = []   # (start, end, replacement_text)
+
+    def _lit_obj(args, hi, oi):
+        h0, h1 = args[hi]; o0, o1 = args[oi]
+        holder = body[h0:h1]; objf = body[o0:o1]
+        if not _SNBT_STR_FULL.match(holder): return None
+        if not _SCH_OBJ_FIELD.match(objf): return None
+        return (h0, o1, holder.strip(), objf.strip())
+
+    def _field(kind, hlit, ofld, ctor):
+        nonlocal seq
+        key = (kind, hlit, ofld)
+        name = fields.get(key)
+        if name is None:
+            name = f"KFC_{kind}_{seq}"; seq += 1
+            fields[key] = name
+            decls.append(f"    private static final KfcGen.{ctor[0]} {name} = KfcGen.{ctor[1]}({hlit}, {ofld});")
+        return name
+
+    # 단일 (홀더,obj) 쌍 접기: scoreMatches(5)/getScore(3)/readScore(3) → Rch, opScoreN(5) → Sch
+    for needle, argc, kind, ctor in (
+            ("KfcGen.scoreMatches(", 5, "RCH", ("Rch", "rch")),
+            ("KfcGen.getScore(",     3, "RCH", ("Rch", "rch")),
+            ("KfcGen.readScore(",    3, "RCH", ("Rch", "rch")),
+            ("KfcGen.opScoreN(",     5, "SCH", ("Sch", "sch"))):
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if len(args) != argc:
+                continue
+            lit = _lit_obj(args, 1, 2)
+            if lit is None:
+                continue
+            a0, a1, hlit, ofld = lit
+            repls.append((a0, a1, _field(kind, hlit, ofld, ctor)))
+            n += 1
+
+    # 양측 접기: opScore(6) → (Sch, op, Sch), scoreCmp(6) → (Rch, op, Rch)
+    for needle, kind, ctor in (("KfcGen.opScore(", "SCH", ("Sch", "sch")),
+                               ("KfcGen.scoreCmp(", "RCH", ("Rch", "rch"))):
+        for (nstart, close_idx, args) in _scan_call_args(body, needle):
+            if len(args) != 6:
+                continue
+            L = _lit_obj(args, 1, 2)
+            R = _lit_obj(args, 4, 5)
+            if L is None or R is None:
+                continue   # 원자성 — 한쪽만 리터럴이면 원판 유지(매칭 오버로드 없음)
+            fa = _field(kind, L[2], L[3], ctor)
+            fb = _field(kind, R[2], R[3], ctor)
+            repls.append((L[0], L[1], fa))
+            repls.append((R[0], R[1], fb))
+            n += 1
+
+    for a0, a1, name in sorted(repls, key=lambda r: r[0], reverse=True):
+        lead = body[a0:a1]
+        pad = lead[:len(lead)-len(lead.lstrip())]
+        body = body[:a0] + pad + name + body[a1:]
+    return body, n, seq
+
+
 # ── Tags 승격: firstEntity/nearestEntity 의 상수 tagsPos(KFC_SA_n) → KFC_TAGS_k(정적 핸들) ──
 #   런타임 tagCandidates(ctx, KFC_SA)→TAG_BUCKETS.get(tag) 맵조회를, (서버,틱,gen,epoch)
 #   스탬프가 맞으면 조회를 건너뛰는 static final Tags 핸들로 대체한다. 7-인자 typed 오버로드의
@@ -1220,6 +1283,9 @@ def hoist_constants_text(text: str) -> tuple[str, int]:
     # 승격 이후 실행해야 objective 가 KFC_OBJ_ 필드로 이미 승격돼 있다.
     body, _sch_n, _ = _collapse_score_handles(body, decls, fields, len(decls))
     n += _sch_n
+    # 읽기/비교/연산 판 collapse (Sch 와 동일 전제: objective 는 KFC_OBJ_ 로 이미 승격된 상태)
+    body, _rch_n, _ = _collapse_read_handles(body, decls, fields, len(decls))
+    n += _rch_n
     # firstEntity/nearestEntity 의 상수 tagsPos 배열 → static final Tags 핸들(맵 조회 제거).
     body, _tags_n, _ = _promote_tags(body, decls, fields, len(decls))
     n += _tags_n

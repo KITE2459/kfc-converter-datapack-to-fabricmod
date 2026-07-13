@@ -177,6 +177,112 @@ def rewrite_entity_holders(records: list, verbose: bool = True) -> dict:
     return {"rewritten": total}
 
 
+# ═══════════════ [pass-2.78] on passengers 소스 지연 생성 ═══════════════
+#   for (ServerCommandSource NS : KfcGen.onPassengers(SRC)) {
+#       net.minecraft.entity.Entity NE = NS.getEntity();
+#       if (!(<NE 만 참조하는 가드>)) continue;   ← 1개 이상
+#       <rest — NS 자유 사용>
+#   →
+#   for (net.minecraft.entity.Entity NE : KfcGen.passengersOf(SRC)) {
+#       <가드들 그대로>
+#       ServerCommandSource NS = SRC.withEntity(NE);
+#       <rest>
+#   근거: withEntity 는 승객마다 이름/표시명(번역 렌더)을 즉시 계산한다(바이트코드 확인).
+#   가드가 엔티티만 보므로 탈락 승객의 소스 생성은 순수 낭비(관측 부수효과 없음 — 할당/렌더뿐).
+#   가드가 NS 를 참조하거나 패턴이 어긋나면 원형 유지(fail-closed). 가드 0개면 이득이 없고
+#   onPassengers 의 (src,틱,gen) 캐시 재사용을 잃으므로 변환하지 않는다.
+DEFER_PASSENGER_SOURCES = True
+
+_ONP_FOR = re.compile(
+    r'^(\s*)for \(ServerCommandSource (\w+) : KfcGen\.onPassengers\(([A-Za-z_][\w.]*)\)\) \{\s*$')
+_ONP_ENT = re.compile(
+    r'^\s*(?:net\.minecraft\.entity\.)?Entity (\w+) = (\w+)\.getEntity\(\);\s*$')
+_ONP_IF = re.compile(r'^(\s*)if \(\(.*\)\) \{\s*$')
+
+
+def _brace_delta(line: str) -> int:
+    st = _strip_strings_line(line)
+    if '//' in st:
+        st = st[:st.index('//')]
+    return st.count('{') - st.count('}')
+
+
+def defer_passenger_sources(records: list, verbose: bool = True) -> dict:
+    """R1: 루프 본문이 NS(자식 소스)를 전혀 안 쓰면 → passengersOf 로 스왑, withEntity 제거.
+       R2: 본문 전체가 'NS 미참조 단일 if 블록'에 싸여 있으면 → 가드 통과 후에만 withEntity.
+       두 규칙 모두 실패 시 원형 유지(fail-closed). 근거/실측은 모듈 상단 주석."""
+    if not DEFER_PASSENGER_SOURCES:
+        return {"rewritten": 0}
+    total = 0
+    for c in records:
+        if "KfcGen.onPassengers(" not in c.text:
+            continue
+        lines = c.text.split("\n")
+        out = []
+        i = 0
+        n = 0
+        L = len(lines)
+        while i < L:
+            m = _ONP_FOR.match(lines[i])
+            if not (m and i + 1 < L):
+                out.append(lines[i]); i += 1; continue
+            me = _ONP_ENT.match(lines[i + 1])
+            if not (me and me.group(2) == m.group(2)):
+                out.append(lines[i]); i += 1; continue
+            ind, ns, srcv = m.group(1), m.group(2), m.group(3)
+            ne = me.group(1)
+            # for 블록 범위 탐색(중괄호 균형) — 본문 = lines[i+2 .. close-1]
+            depth = 1
+            j = i + 2
+            while j < L and depth > 0:
+                depth += _brace_delta(lines[j])
+                j += 1
+            if depth != 0:
+                out.append(lines[i]); i += 1; continue
+            close = j - 1                     # for 의 닫는 '}' 줄
+            body = lines[i + 2:close]
+            ns_re = re.compile(rf'\b{ns}\b')
+            uses_ns = any(ns_re.search(b) for b in body)
+            if not uses_ns:
+                # R1 — 자식 소스 미사용(킬 루프 등): withEntity 자체를 제거
+                out.append(f'{ind}for (net.minecraft.entity.Entity {ne} : '
+                           f'KfcGen.passengersOf({srcv})) {{')
+                out.extend(body)
+                out.append(lines[close])
+                i = close + 1
+                n += 1
+                continue
+            # R2 — 본문이 '단일 if 블록'(조건은 NS 미참조)으로 시작하고 그 블록이 본문 끝까지 덮음
+            mg = _ONP_IF.match(body[0]) if body else None
+            if mg and not ns_re.search(body[0]):
+                depth2 = 1
+                k = 1
+                while k < len(body) and depth2 > 0:
+                    depth2 += _brace_delta(body[k])
+                    k += 1
+                # if 블록의 닫힘이 본문 마지막 줄이어야(가드가 전체를 덮어야) NS 스코프가 성립
+                if depth2 == 0 and k == len(body) and not any(
+                        ns_re.search(b) for b in body[k:]):
+                    out.append(f'{ind}for (net.minecraft.entity.Entity {ne} : '
+                               f'KfcGen.passengersOf({srcv})) {{')
+                    out.append(body[0])
+                    out.append(f'{mg.group(1)}    ServerCommandSource {ns} = '
+                               f'{srcv}.withEntity({ne});')
+                    out.extend(body[1:])
+                    out.append(lines[close])
+                    i = close + 1
+                    n += 1
+                    continue
+            out.append(lines[i]); i += 1
+        if n:
+            c.text = "\n".join(out)
+            c.size = len(c.text.encode("utf-8"))
+            total += n
+    if verbose:
+        print(f"  [onp-defer] {total} passenger loops rewritten (R1 소스 제거 / R2 필터 선행)")
+    return {"rewritten": total}
+
+
 # ═══════════════ [pass-2.9] 점수 체인 지역변수 강등 ═══════════════
 
 _H = r'#[\w.+-]+'
@@ -248,51 +354,6 @@ _PURE_PREFIX = re.compile(
 
 _INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
 
-# ── [EBB] 조건부 순수 점수쓰기: if (scoreMatches(단일,순수)) <단일 순수 쓰기>; ──
-#   조건식이 단일 scoreMatches(부수효과 없음)이고 then 이 단일 순수 점수쓰기(set/add/opScoreN
-#   상수)인 인라인 조건문만 인식한다. else/중괄호/함수호출/return then 은 매칭 실패 → 배리어.
-#   추적 키 읽기는 지역변수로 치환, 대상 키는 조건부로 지역변수 갱신(로드 후 조건 덮어쓰기)
-#   하여 강등 체인을 조건문 너머로 잇는다. 관측 시점(경계 flush)은 종전과 동일.
-_L_IF = re.compile(
-    r'^(\s*)if \(KfcGen\.scoreMatches\(sb, "(' + _H + r')", "(' + _O + r')", ('
-    + _INT + r'), (' + _INT + r')\)\) (.+);\s*$')
-_W_SET = re.compile(r'^KfcGen\.setScore\(sb, "(' + _H + r')", "(' + _O + r')", (.+)\)$')
-_W_ADD = re.compile(r'^KfcGen\.addScore\(sb, "(' + _H + r')", "(' + _O + r')", (.+)\)$')
-_W_OPN = re.compile(r'^KfcGen\.opScoreN\(sb, "(' + _H + r')", "(' + _O
-                    + r')", "(=|\+=|-=|\*=|/=|%=|<|>)", (-?\d+)\)$')
-
-def _match_then_write(then: str):
-    """then 문자열(마지막 ; 제외)이 단일 순수 쓰기면 (kind, h, o, payload) 반환, 아니면 None."""
-    m = _W_SET.match(then)
-    if m: return ("set", m.group(1), m.group(2), m.group(3))
-    m = _W_ADD.match(then)
-    if m: return ("add", m.group(1), m.group(2), m.group(3))
-    m = _W_OPN.match(then)
-    if m: return ("opn", m.group(1), m.group(2), (m.group(3), m.group(4)))
-    return None
-
-
-def _ebb_update(var: str, kind: str, payload):
-    """조건부 then 쓰기를 지역변수 갱신문으로 (기존 op 강등과 동일 규칙)."""
-    if kind == "set":
-        return f'{var} = {payload}'
-    if kind == "add":
-        return f'{var} += ({payload})'
-    op, nlit = payload
-    if op == "=":
-        return f'{var} = {nlit}'
-    if op in ("+=", "-=", "*="):
-        return f'{var} {op} {nlit}'
-    if op == "/=":
-        return f'{var} = KfcGen.sdiv({var}, {nlit})'
-    if op == "%=":
-        return f'{var} = KfcGen.smod({var}, {nlit})'
-    if op == "<":
-        return f'{var} = Math.min({var}, {nlit})'
-    return f'{var} = Math.max({var}, {nlit})'
-
-
-
 
 def _read_pats(h: str, o: str):
     hq, oq = re.escape(f'"{h}"'), re.escape(f'"{o}"')
@@ -333,13 +394,6 @@ def _demote_segment(seg: list[str], safe_objs: set, var_seq: list) -> tuple[list
             write_count[(m.group(2), m.group(3))] = write_count.get((m.group(2), m.group(3)), 0) + 1
         elif kind in ("op", "opn"):
             write_count[(m.group(2), m.group(3))] = write_count.get((m.group(2), m.group(3)), 0) + 1
-        else:
-            mif = _L_IF.match(ln)
-            if mif:
-                tw = _match_then_write(mif.group(6))
-                if tw is not None and tw[2] in safe_objs:
-                    wk = (tw[1], tw[2])
-                    write_count[wk] = write_count.get(wk, 0) + 1
     hot = {k for k, n in write_count.items() if n >= 2}
     if not hot:
         return seg, 0
@@ -518,39 +572,6 @@ def _demote_segment(seg: list[str], safe_objs: set, var_seq: list) -> tuple[list
             else:
                 out.append(ln)
             continue
-        # [EBB] 조건부 순수 점수쓰기: if (scoreMatches(단일)) <단일 순수 쓰기>;
-        mif = _L_IF.match(ln)
-        if mif:
-            ind = mif.group(1)
-            ch, co, cmin, cmax = mif.group(2), mif.group(3), mif.group(4), mif.group(5)
-            tw = _match_then_write(mif.group(6))
-            if tw is not None and tw[2] in safe_objs:
-                wkind, th, to, payload = tw
-                wkey = (th, to)
-                cond = subst_reads(f'KfcGen.scoreMatches(sb, "{ch}", "{co}", {cmin}, {cmax})')
-                if wkind in ("set", "add"):
-                    payload = subst_reads(payload)
-                probe = ind + cond + (payload if isinstance(payload, str) else "")
-                leftover_guard(probe, wkey)
-                # 존재/부재 시맨틱 보존: 대상 키가 '이미 active'(= 이 구간에서 무조건 쓰기로
-                # 존재가 보장됨)일 때만 조건부 지역변수 갱신으로 강등한다. active 가 아니면
-                # (첫 등장이 조건부이거나 reset 이후) 원본처럼 조건부 '라이브' 쓰기를 유지해야
-                # 조건 미발동 시 엔트리 부재가 그대로 보존된다(spurious flush 0-엔트리 방지).
-                if wkey in active:
-                    var = active[wkey][0]
-                    out.append(f'{ind}if ({cond}) {_ebb_update(var, wkind, payload)};')
-                    demoted += 1
-                else:
-                    if wkind == "set":
-                        out.append(f'{ind}if ({cond}) KfcGen.setScore(sb, "{th}", "{to}", {payload});')
-                    elif wkind == "add":
-                        out.append(f'{ind}if ({cond}) KfcGen.addScore(sb, "{th}", "{to}", {payload});')
-                    else:
-                        op, nlit = payload
-                        out.append(f'{ind}if ({cond}) KfcGen.opScoreN(sb, "{th}", "{to}", "{op}", {nlit});')
-                continue
-            # 인식 실패(방어적): 아래 일반 처리로 낙하 — 실제로는 _is_pure_line 이 걸러 도달 안 함
-
         # 순수 run 안의 기타 줄(다른 홀더 resetScore/opScore, CSE 선언 등):
         # 추적 키 읽기 치환 + 잔여 리터럴 가드 후 통과
         ln2 = subst_reads(ln)
@@ -582,11 +603,6 @@ def _is_pure_line(line: str, safe_objs: set) -> bool:
     s = line.strip()
     if not s or s.startswith("//"):
         return False        # 중립 줄은 별도 처리(_is_neutral_line)
-    # [EBB] 안전한 조건부 점수쓰기(단일 scoreMatches + 단일 순수 쓰기)만 구간에 포함.
-    mif = _L_IF.match(line)
-    if mif:
-        tw = _match_then_write(mif.group(6))
-        return tw is not None and tw[2] in safe_objs
     if not _PURE_PREFIX.match(line):
         return False
     kind, _ = _line_kind(line, safe_objs)

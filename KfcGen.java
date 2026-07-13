@@ -14,6 +14,14 @@ import net.minecraft.scoreboard.ServerScoreboard;
  */
 public final class KfcGen {
 
+    static {
+        // 명령 구문 예외(CommandSyntaxException)의 스택 캡처 비활성 — brigadier 공식 플래그.
+        // 오류 '메시지'는 그대로 전달되고, 스택은 표준 명령 흐름에서 출력되지 않는다.
+        // [실측] 동적(매크로 산출) 텍스트 리터럴이 packrat 1차 파서에 거부될 때 매 호출
+        // fillInStackTrace 가 틱의 ~1.8%p 를 차지했다(파싱 폴백 자체는 정상 경로).
+        com.mojang.brigadier.exceptions.CommandSyntaxException.ENABLE_COMMAND_STACK_TRACES = false;
+    }
+
     // ── 핫패스 캐시 ──────────────────────────────────────────────
     // [스레드 노트] 커맨드 실행은 서버 메인 스레드 전용이라 이 캐시들은 단일 스레드에서만
     // 접근된다 → ConcurrentHashMap 의 CAS/volatile 비용 없이 일반 HashMap 을 쓴다.
@@ -467,14 +475,24 @@ public final class KfcGen {
         if (TB_SERVER != ctx.server || TB_TICK != tk || TB_GEN != ENTITY_GEN) {
             TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_TICK = tk; TB_GEN = ENTITY_GEN;
         }
-        java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
-        if (b == null) {
-            b = new java.util.ArrayList<>();
-            for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx))
-                if (e.getCommandTags().contains(tag)) b.add(e);
-            TAG_BUCKETS.put(tag, b);
+        if (TAG_BUCKETS.isEmpty()) {
+            // [실측 ~4.5%p] 종전 '태그별 지연 구축'은 질의 태그마다 스냅샷 전 엔티티 ×
+            // getCommandTags().contains(해시 조회) 재스캔이었다. 스냅샷 1회 순회로 모든 태그
+            // 버킷을 일괄 구축한다 — 비용이 (질의태그수×엔티티수)에서 Σ(엔티티 태그수)로 감소.
+            // 시맨틱 동일: 버킷 = '스냅샷 순서의 태그 보유 엔티티 부분수열'(종전과 동일 정의),
+            // 구축 후 부재 키 = 그 태그 보유 엔티티 없음 → 빈 버킷(EMPTY_BUCKET) — 종전의
+            // '스캔 결과 0건' 과 동일. 증분 훅(snapAdd/tagBucketsOnAdd)은 computeIfAbsent 로
+            // 부재 태그 버킷을 생성하므로 이후 스폰/태그 부여도 정확히 반영된다.
+            for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+                for (String tg : e.getCommandTags()) {
+                    TAG_BUCKETS.computeIfAbsent(tg, k2 -> new java.util.ArrayList<>()).add(e);
+                }
+            }
         }
-        return b;
+        // 부재 태그도 '빈 버킷'을 맵에 삽입해 반환 — 종전 lazy-cache 와 동일 계약.
+        // (Tags 정적 핸들 등이 버킷 '참조'를 스탬프 기간 동안 보관하므로, 같은 틱 내 addTag 가
+        //  '같은 리스트 객체'에 append 되어야 캐시된 참조가 최신 상태를 본다.)
+        return TAG_BUCKETS.computeIfAbsent(tag, k2 -> new java.util.ArrayList<>());
     }
 
     /** 거리상한(박스) 스캔용 후보: 양성 태그 버킷이 충분히 작을 때만 반환(그 외 null → 섹션 스캔 유지).
@@ -561,8 +579,11 @@ public final class KfcGen {
         if (e == null) return;
         if (e.addCommandTag(tag)) {   // false(이미 있음/1024 초과) = 변화 없음 → 버킷 불변
             QUERY_MUT++;               // 태그 변화 → 존재검사 메모 무효화
-            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
-            if (b != null && !b.contains(e)) b.add(e);
+            if (!TAG_BUCKETS.isEmpty()) {   // 전체-구축 모델: 부재 키 = 빈 버킷 → 생성해 반영
+                java.util.ArrayList<net.minecraft.entity.Entity> b =
+                        TAG_BUCKETS.computeIfAbsent(tag, k -> new java.util.ArrayList<>());
+                if (!b.contains(e)) b.add(e);
+            }
         }
     }
 
@@ -579,8 +600,10 @@ public final class KfcGen {
     private static void tagBucketsOnAdd(net.minecraft.entity.Entity e) {
         if (TAG_BUCKETS.isEmpty() || e == null) return;
         for (String tg : e.getCommandTags()) {
-            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tg);
-            if (b != null && !b.contains(e)) b.add(e);
+            // 전체-구축 모델: 부재 키 = '빈 버킷' 의미이므로 새 태그는 버킷을 생성해 반영.
+            java.util.ArrayList<net.minecraft.entity.Entity> b =
+                    TAG_BUCKETS.computeIfAbsent(tg, k -> new java.util.ArrayList<>());
+            if (!b.contains(e)) b.add(e);
         }
     }
 
@@ -2012,6 +2035,18 @@ public final class KfcGen {
     private static int  ONP_MAP_TICK = Integer.MIN_VALUE;
     private static long ONP_MAP_GEN  = -1;
 
+    /** on passengers 의 '엔티티 선(先)열거' 판 — opt_post pass-2.78 이 필터 가드가 전부
+     *  엔티티만 보는 루프를 이 판으로 재작성한다(가드 통과분만 withEntity 생성).
+     *  vanilla getPassengerList 는 불변 복사 리스트라 본문 스폰/킬과 무관하게 안전 순회.
+     *  [실측] withEntity 는 승객마다 getName().getString()+getDisplayName()(번역 렌더)을
+     *  즉시 수행 — 수백 파츠 카트에서 매 미스마다 전 파츠 이름 렌더가 ~1.2%p 였다. */
+    public static java.util.List<net.minecraft.entity.Entity> passengersOf(
+            net.minecraft.server.command.ServerCommandSource src) {
+        net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
+        if (e == null) return java.util.List.of();
+        return e.getPassengerList();
+    }
+
     public static java.util.List<net.minecraft.server.command.ServerCommandSource> onPassengers(
             net.minecraft.server.command.ServerCommandSource src) {
         net.minecraft.entity.Entity e = (src == null ? null : src.getEntity());
@@ -2182,27 +2217,30 @@ public final class KfcGen {
         try {
             CachedText cached = TEXT_CACHE.get(json);
             if (cached == null) {
-                net.minecraft.command.CommandRegistryAccess cra =
-                        net.minecraft.command.CommandRegistryAccess.of(
-                                source.getRegistryManager(), source.getEnabledFeatures());
-                net.minecraft.text.Text parsed = net.minecraft.command.argument.TextArgumentType.text(cra)
-                        .parse(new com.mojang.brigadier.StringReader(json));
-                // 컴포넌트 리터럴은 상수 — 파싱 1회면 충분. 정적 여부도 1회 판정해 함께 캐시.
-                cached = new CachedText(parsed, isStaticText(parsed));
+                net.minecraft.text.Text parsed;
+                try {
+                    net.minecraft.command.CommandRegistryAccess cra =
+                            net.minecraft.command.CommandRegistryAccess.of(
+                                    source.getRegistryManager(), source.getEnabledFeatures());
+                    parsed = net.minecraft.command.argument.TextArgumentType.text(cra)
+                            .parse(new com.mojang.brigadier.StringReader(json));
+                } catch (Exception primaryFail) {
+                    // 폴백: 구 JSON 경로. [실측] packrat 이 거부하는 리터럴은 '매 호출' 예외 생성
+                    // (fillInStackTrace) + 이중 파싱을 반복했다(성공만 캐시했기 때문 — 틱당 1.7%p).
+                    // 폴백 성공/최종 실패 결과도 동일 키로 캐시해 문자열당 1회로 만든다.
+                    parsed = net.minecraft.text.Text.Serialization.fromJson(
+                            json, source.getRegistryManager());
+                }
+                // 컴포넌트 리터럴은 상수 — 파싱 1회면 충분(실패=null 도 캐시). 정적 여부 동봉.
+                cached = new CachedText(parsed, parsed != null && isStaticText(parsed));
                 TEXT_CACHE.put(json, cached);
             }
+            if (cached.text == null) return null;   // 캐시된 파싱 실패 — 종전 null 반환과 동일
             // 정적 트리는 Texts.parse 가 항등(동등 복제)이므로 생략 — 파싱 인스턴스 재사용(불변).
             if (cached.isStatic) return cached.text;
             return net.minecraft.text.Texts.parse(source, cached.text, sender, 0);
         } catch (Exception ex) {
-            try {  // 폴백: 구 JSON 경로
-                net.minecraft.text.Text raw = net.minecraft.text.Text.Serialization.fromJson(
-                        json, source.getRegistryManager());
-                if (raw == null) return null;
-                return net.minecraft.text.Texts.parse(source, raw, sender, 0);
-            } catch (Exception e2) {
-                return null;
-            }
+            return null;   // resolve 실패(선택자 해석 등 런타임 예외) — 종전 최종 실패와 동일
         }
     }
 
@@ -3653,6 +3691,86 @@ public final class KfcGen {
         if (a != null) a.setScore(a.getScore() + n);
     }
 
+    // ──────────────── Rch: (상수 홀더, 상수 objective) '읽기' 핸들의 정적 승격 ────────────────
+    // Sch(쓰기)와 대칭 — pass-4 가 scoreMatches/getScore/readScore/scoreCmp 의 리터럴 홀더 +
+    // KFC_OBJ 인자쌍을 static final Rch 로 접는다. resolveR 은 SCORE_EPOCH 스탬프가 맞고 엔트리가
+    // 캐시돼 있으면 READ_HANDLES 이중 조회를 통째로 건너뛴다. null(엔트리 부재)은 스탬프해도
+    // 같은 epoch 안에서 '쓰기'(getOrCreateScore)가 엔트리를 만들 수 있으므로 캐시하지 않고
+    // 매 호출 재해소(readHandle 의 null-미캐시 계약과 동일 — 관측 동등).
+    public static final class Rch {
+        final String holder; final ObjRef obj;
+        ReadableScoreboardScore sc;
+        long gen = Long.MIN_VALUE;
+        Rch(String holder, ObjRef obj) { this.holder = holder; this.obj = obj; }
+    }
+    public static Rch rch(String holder, ObjRef o) { return new Rch(holder, o); }
+
+    private static ReadableScoreboardScore resolveR(ServerScoreboard sb, Rch h) {
+        ReadableScoreboardScore sc = h.sc;
+        if (sc != null && h.gen == SCORE_EPOCH) return sc;
+        sc = readHandle(sb, h.holder, h.obj);
+        h.sc = sc;
+        h.gen = SCORE_EPOCH;
+        return sc;
+    }
+
+    public static boolean scoreMatches(ServerScoreboard sb, Rch h, int min, int max) {
+        ReadableScoreboardScore sc = resolveR(sb, h);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        return v >= min && v <= max;
+    }
+    public static boolean scoreMatches(ServerScoreboard sb, Rch h, Integer min, Integer max) {
+        ReadableScoreboardScore sc = resolveR(sb, h);
+        if (sc == null) return false;
+        int v = sc.getScore();
+        if (min != null && v < min) return false;
+        if (max != null && v > max) return false;
+        return true;
+    }
+    public static int getScore(ServerScoreboard sb, Rch h) {
+        ReadableScoreboardScore sc = resolveR(sb, h);
+        return sc == null ? 0 : sc.getScore();
+    }
+    public static Integer readScore(ServerScoreboard sb, Rch h) {
+        ReadableScoreboardScore sc = resolveR(sb, h);
+        return sc == null ? null : sc.getScore();
+    }
+    public static boolean scoreCmp(ServerScoreboard sb, Rch a, String op, Rch b) {
+        ReadableScoreboardScore sa = resolveR(sb, a), sbb = resolveR(sb, b);
+        return sa != null && sbb != null && cmpOp(sa.getScore(), op, sbb.getScore());
+    }
+
+    // ── Sch 확장: 상수 (홀더, objective) 의 opScoreN/opScore 도 정적 셀 경유 ──
+    public static void opScoreN(ServerScoreboard sb, Sch h, String op, int n) {
+        if (obj(sb, h.obj) == null) return;   // String 판과 동일: objective 부재 = 부수효과 없음
+        net.minecraft.scoreboard.ScoreAccess a = resolve(sb, h);
+        if (a != null) _opN(a, op, n);
+    }
+    public static void opScore(ServerScoreboard sb, Sch d, String op, Sch s) {
+        // opScoreH 와 동일: 두 objective 해소 선검사(부재 시 어느 엔트리도 존재화하지 않음)
+        if (obj(sb, d.obj) == null || obj(sb, s.obj) == null) return;
+        net.minecraft.scoreboard.ScoreAccess da = resolve(sb, d);
+        if (da == null) return;
+        net.minecraft.scoreboard.ScoreAccess sa = resolve(sb, s);
+        if (sa == null) return;
+        int b = sa.getScore();
+        int r;
+        switch (op) {
+            case "=":  r = b; break;
+            case "+=": r = da.getScore() + b; break;
+            case "-=": r = da.getScore() - b; break;
+            case "*=": r = da.getScore() * b; break;
+            case "/=": if (b == 0) return; r = Math.floorDiv(da.getScore(), b); break;
+            case "%=": if (b == 0) return; r = Math.floorMod(da.getScore(), b); break;
+            case "<":  { int a = da.getScore(); r = Math.min(a, b); break; }
+            case ">":  { int a = da.getScore(); r = Math.max(a, b); break; }
+            case "><": { int a = da.getScore(); da.setScore(b); sa.setScore(a); return; }
+            default: return;
+        }
+        da.setScore(r);
+    }
+
     // ──────────────── ObjRef 오버로드 (merge_pass pass-4 가 상수 objective 를 승격) ────────────────
     // String 판과 시맨틱 완전 동일 — objective 해소만 캐시(obj(sb, ref)) 경유.
     public static boolean scoreMatches(ServerScoreboard sb, String holder, ObjRef o,
@@ -4820,9 +4938,15 @@ public static net.minecraft.entity.Entity firstEntity(
                     stack.get(net.minecraft.component.DataComponentTypes.CUSTOM_DATA);
             if (nc == null) return false;
             try {
-                net.minecraft.nbt.NbtCompound expected =
-                        net.minecraft.nbt.StringNbtReader.readCompound(customDataSnbt);
-                if (!net.minecraft.nbt.NbtHelper.matches(expected, nc.copyNbt(), true)) return false;
+                // 기대 SNBT 는 변환 시점 상수 — 매 호출 packrat 재파싱(rkey/multiplay 핫패스 실측)
+                // 대신 SNBT_CACHE 재사용(entityMergeSnbt 의 readCompound 캐시 규약과 동일 키).
+                net.minecraft.nbt.NbtElement exp = SNBT_CACHE.computeIfAbsent(customDataSnbt, s -> {
+                    try { return net.minecraft.nbt.StringNbtReader.readCompound(s); }
+                    catch (Exception ex) { return SNBT_INVALID; }
+                });
+                if (!(exp instanceof net.minecraft.nbt.NbtCompound expected)) return false;
+                // matches 는 읽기 전용 — copyNbt(전체 딥카피) 대신 내부 컴파운드 직접 참조.
+                if (!net.minecraft.nbt.NbtHelper.matches(expected, nc.getNbt(), true)) return false;
             } catch (Exception ex) { return false; }
         }
         return true;
@@ -5276,6 +5400,32 @@ public static net.minecraft.entity.Entity firstEntity(
         return n;
     }
 
+    /** data-홀더(display/marker/interaction) 판별 — 재시드/W1 스냅샷 재사용 대상. */
+    private static boolean isDataHolder(net.minecraft.entity.Entity e) {
+        return e instanceof net.minecraft.entity.decoration.DisplayEntity
+                || e instanceof net.minecraft.entity.decoration.InteractionEntity
+                || e instanceof net.minecraft.entity.MarkerEntity;
+    }
+
+    /** data.* 쓰기 성공 직후 스냅샷 '재시드' — 무효화 대신 방금 적용한 컴파운드를 새 스냅샷으로.
+     *  근거: 카트 루트처럼 승객 트리를 거느린 엔티티는 스냅샷 재구축(writeNbt)이 모델 전체
+     *  직렬화(saveSelfNbt 재귀)라, data.pos 류 쓰기마다 무효화하면 틱당 수회 전량 재직렬화가
+     *  발생한다(프로파일 실측 ~5%p). 재시드 정당성(fail-closed 조건):
+     *    · 대상이 data-홀더 클래스이고 수정 경로 최상위가 "data" 뿐일 때만.
+     *    · customData 는 readNbt 가 컴파운드를 '그대로' 보관·writeNbt 가 그대로 재방출(코덱
+     *      정규화 없음 — 1.21.5 NbtComponent 필드 확인) → n 이 곧 다음 writeNbt 산출과 동일.
+     *    · n 의 나머지 필드는 writeSourceCompound 가 라이브 동등화한 값 = fresh writeNbt 동일.
+     *    · readNbt(n) 의 디스플레이 재적용은 동일 값 트래커 set(no-op) — 직렬화 결과 불변.
+     *  별칭 안전: 스냅샷은 읽기 전용 계약이고 쓰기측은 항상 copy 후 변형(기존 계약 동일). */
+    private static void reseedOrInvalidate(net.minecraft.entity.Entity e, String pt,
+                                           net.minecraft.nbt.NbtCompound applied) {
+        if (isDataHolder(e) && topSeg(pt).equals("data")) {
+            ENTITY_NBT_SNAP.put(e, new NbtSnap(applied, e.age, ENTITY_GEN));
+        } else {
+            invalidateSnapshot(e);
+        }
+    }
+
     /** 엔티티 NBT 를 바꾸는 쓰기 직후 스냅샷 무효화(write-through). */
     private static void invalidateSnapshot(net.minecraft.entity.Entity e) {
         if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.remove(e);
@@ -5329,7 +5479,11 @@ public static net.minecraft.entity.Entity firstEntity(
             // 무변경(동일 값) 이면 바닐라 /data modify 는 'Nothing changed' 로 명령이 실패해
             // setNbt(readNbt) 자체가 없다 — 종전 무조건 readNbt(부수효과 포함)보다 고증 정합.
             // invalidate 도 실제 적용 시에만(무변경이면 스냅샷 웜 유지).
-            if (putAtPathCount(n, path, v) > 0) { invalidateSnapshot(e); readNbtTagAware(e, n); }
+            if (putAtPathCount(n, path, v) > 0) {
+                invalidateSnapshot(e);
+                readNbtTagAware(e, n);
+                reseedOrInvalidate(e, top, n);   // data.* — 승객 트리 재직렬화 없이 스냅샷 갱신
+            }
             return;
         }
         // 첫 관측: 자가검증(추가 writeNbt 1회 — (클래스,키)당 1회만, 이후 캐시 hit)
@@ -5744,7 +5898,11 @@ public static net.minecraft.entity.Entity firstEntity(
         if (e == null || elem == null) return;
         if (nbtPathDroppable(e, path.replace(" ", ""))) return;   // 구조적 부재 최상위 키 → readNbt 가 버림(no-op)
         net.minecraft.nbt.NbtCompound root = writeSourceCompound(e);     // W1(정정판): 휘발 필드 라이브 동등화
-        if (appendAtPath(root, path, elem, prepend)) { invalidateSnapshot(e); readNbtTagAware(e, root); }
+        if (appendAtPath(root, path, elem, prepend)) {
+            invalidateSnapshot(e);
+            readNbtTagAware(e, root);
+            reseedOrInvalidate(e, path.replace(" ", ""), root);
+        }
     }
 
     private static net.minecraft.nbt.NbtElement numberNbt(String type, double v) {
@@ -6130,7 +6288,11 @@ public static net.minecraft.entity.Entity firstEntity(
             // W1: 스냅샷 캐시 copy(웜 시 직렬화 0회) — invalidate 는 copy 이후(단일 스레드라 동등).
             net.minecraft.nbt.NbtCompound nbt = writeSourceCompound(e);
             // W2: 무변경이면 바닐라 'Nothing changed'(명령 실패=미적용) — readNbt 부수효과도 없음.
-            if (putAtPathCount(nbt, path, val) > 0) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
+            if (putAtPathCount(nbt, path, val) > 0) {
+                invalidateSnapshot(e);
+                readNbtTagAware(e, nbt);
+                reseedOrInvalidate(e, path.replace(" ", ""), nbt);
+            }
         } catch (Exception ignored) {}
     }
 
@@ -6153,7 +6315,11 @@ public static net.minecraft.entity.Entity firstEntity(
             net.minecraft.nbt.NbtElement val = tmpl.copy();
             net.minecraft.nbt.NbtCompound nbt = writeSourceCompound(e);     // W1(정정판): 휘발 필드 라이브 동등화
             int cnt = putAtPathCount(nbt, path, val);
-            if (cnt > 0) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
+            if (cnt > 0) {
+                invalidateSnapshot(e);
+                readNbtTagAware(e, nbt);
+                reseedOrInvalidate(e, path.replace(" ", ""), nbt);
+            }
             return cnt > 0;
         } catch (Exception ignored) { return false; }
     }
@@ -6277,7 +6443,13 @@ public static net.minecraft.entity.Entity firstEntity(
             net.minecraft.nbt.NbtCompound nbt = before.copy();
             nbt.copyFrom(patch);
             // W2: 바닐라 /data merge 는 병합 결과가 원본과 같으면 'Nothing changed' 로 미적용.
-            if (!nbt.equals(before)) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
+            if (!nbt.equals(before)) {
+                invalidateSnapshot(e);
+                readNbtTagAware(e, nbt);
+                boolean dataOnly = true;
+                for (String k : patch.getKeys()) if (!"data".equals(k)) { dataOnly = false; break; }
+                if (dataOnly) reseedOrInvalidate(e, "data", nbt);
+            }
         } catch (Exception ignored) {}
     }
 
@@ -6316,7 +6488,13 @@ public static net.minecraft.entity.Entity firstEntity(
             net.minecraft.nbt.NbtCompound nbt = before.copy();
             nbt.copyFrom(patch);
             // W2: 바닐라 /data merge 는 병합 결과가 원본과 같으면 'Nothing changed' 로 미적용.
-            if (!nbt.equals(before)) { invalidateSnapshot(e); readNbtTagAware(e, nbt); }
+            if (!nbt.equals(before)) {
+                invalidateSnapshot(e);
+                readNbtTagAware(e, nbt);
+                boolean dataOnly = true;
+                for (String k : patch.getKeys()) if (!"data".equals(k)) { dataOnly = false; break; }
+                if (dataOnly) reseedOrInvalidate(e, "data", nbt);
+            }
         } catch (Exception ignored) {}
     }
 

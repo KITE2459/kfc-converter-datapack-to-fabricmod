@@ -1215,21 +1215,38 @@ def _promote_snbt_template(body: str, decls: list, fields: dict, start_seq: int)
             if len(args)!=argc: continue
             a0,a1=args[hi]; argtext=body[a0:a1].strip()
             parts=_split_top_plus(argtext)
-            if len(parts)!=3: continue                     # 단일 hole 만
-            pre,mid,post=parts
-            if not _FULLSTR.match(pre) or not _FULLSTR.match(post): continue  # 양끝 = 문자열 리터럴
-            if _FULLSTR.match(mid): continue               # 가운데가 리터럴이면 정적(별도 경로) — 스킵
-            key=("TMPL", factory, pre, post)
-            name=fields.get(key)
-            if name is None:
-                name=f"KFC_TMPL_{seq}"; seq+=1; fields[key]=name
-                decls.append(f"    private static final KfcGen.SnbtTmpl {name} = {factory}({pre}, {post});")
+            if len(parts)<3 or len(parts)%2==0: continue   # lit(+expr+lit)*k 꼴만
+            lits=parts[0::2]; holes=parts[1::2]
+            if any(not _FULLSTR.match(p) for p in lits): continue   # 짝수 위치 = 전부 문자열 리터럴
+            if any(_FULLSTR.match(h) for h in holes): continue      # hole 이 리터럴이면 정적 — 스킵
             others=[body[x0:x1].strip() for (x0,x1) in args]
-            valexpr=f'("" + ({mid}))'
-            if needle.startswith("KfcGen.entityMergeSnbt"):
-                new=f'{sinkT}({others[0]}, {name}, {valexpr})'
-            else:  # storagePutSnbt(server,id,path,snbt,mode)
-                new=f'{sinkT}({others[0]}, {others[1]}, {others[2]}, {name}, {valexpr}, {others[4]})'
+            if len(holes)==1:
+                pre,mid,post=lits[0],holes[0],lits[1]
+                key=("TMPL", factory, pre, post)
+                name=fields.get(key)
+                if name is None:
+                    name=f"KFC_TMPL_{seq}"; seq+=1; fields[key]=name
+                    decls.append(f"    private static final KfcGen.SnbtTmpl {name} = {factory}({pre}, {post});")
+                valexpr=f'("" + ({mid}))'
+                if needle.startswith("KfcGen.entityMergeSnbt"):
+                    new=f'{sinkT}({others[0]}, {name}, {valexpr})'
+                else:  # storagePutSnbt(server,id,path,snbt,mode)
+                    new=f'{sinkT}({others[0]}, {others[1]}, {others[2]}, {name}, {valexpr}, {others[4]})'
+            else:
+                # 다중 hole(≤6): SnbtTmplN — 수치 hole 만 런타임 자기검증 통과, 그 외 concat 폴백.
+                if len(holes)>6: continue
+                factoryN = "KfcGen.snbtTmplNC" if needle.startswith("KfcGen.entityMergeSnbt") else "KfcGen.snbtTmplNV"
+                sinkN = "KfcGen.entityMergeSnbtTN" if needle.startswith("KfcGen.entityMergeSnbt") else "KfcGen.storagePutSnbtTN"
+                key=("TMPLN", factoryN, tuple(lits))
+                name=fields.get(key)
+                if name is None:
+                    name=f"KFC_TMPLN_{seq}"; seq+=1; fields[key]=name
+                    decls.append(f"    private static final KfcGen.SnbtTmplN {name} = {factoryN}({', '.join(lits)});")
+                vexprs=", ".join(f'("" + ({h}))' for h in holes)
+                if needle.startswith("KfcGen.entityMergeSnbt"):
+                    new=f'{sinkN}({others[0]}, {name}, {vexprs})'
+                else:
+                    new=f'{sinkN}({others[0]}, {others[1]}, {others[2]}, {name}, {others[4]}, {vexprs})'
             edits.append((nstart, close_idx+1, new)); n+=1
     for a0,a1,new in sorted(edits, key=lambda r:r[0], reverse=True):
         body=body[:a0]+new+body[a1:]

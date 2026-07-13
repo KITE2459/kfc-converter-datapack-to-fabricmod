@@ -64,8 +64,19 @@ public final class KfcGen {
      *  Texts.parse 가 항등(불변 Text 복제)이므로 파싱된 인스턴스를 그대로 재사용해도 관측 동일. */
     private static final class CachedText {
         final net.minecraft.text.Text text; final boolean isStatic;
+        // nbt+interpret(storage) 단일 컴포넌트 특수화 상태: 0=미분류 1=적용(자기검증 통과) 2=바닐라
+        byte itpState = 0;
+        net.minecraft.text.NbtTextContent itpNc;
+        net.minecraft.text.Text itpSepStatic;     // 정적 separator 의 1회 해석본(없으면 기본)
         CachedText(net.minecraft.text.Text t, boolean s) { text = t; isStatic = s; }
     }
+
+    // interpret 요소(문자열) → 디코드된 Text 캐시. 게이지처럼 같은 조각 문자열이 플레이어/틱에
+    // 걸쳐 반복 등장하므로 문자열당 1회 디코드로 수렴한다. 실패도 캐시(반복 예외 생성 차단).
+    private static final net.minecraft.text.Text INTERP_INVALID =
+            net.minecraft.text.Text.literal("\u0000kfc-interp-invalid");
+    private static final java.util.Map<String, net.minecraft.text.Text>
+            INTERP_CACHE = boundedMap(8192);
     private static final java.util.Map<String, CachedText>
             TEXT_CACHE = boundedMap(8192);
 
@@ -86,6 +97,104 @@ public final class KfcGen {
         }
         for (net.minecraft.text.Text s : t.getSiblings()) if (!isStaticText(s)) return false;
         return true;
+    }
+
+    /** nbt+interpret(storage) 단일 컴포넌트의 resolve 특수화.
+     *  바닐라 NbtTextContent.parse 파이프라인(바이트코드 확인)을 요소-캐시로 재현:
+     *    dataSource.get(source) → NbtPath.get(root, 실패=빈 스트림) → 요소별
+     *    TextCodecs.CODEC.parse(registryOps).getOrThrow()(실패=요소 스킵) → Texts.parse →
+     *    separator 로 reduce-join(첫 요소에 append), 빈 결과 = Text.empty().
+     *  차이(성능): 문자열 요소의 디코드 결과를 캐시(실패 포함 — 매 호출 getOrThrow 예외 생성이
+     *  실측 ~2%p 였다), 정적 요소는 Texts.parse 생략. 첫 사용 시 바닐라 경로와 equals 비교로
+     *  자기검증 — 불일치면 그 텍스트는 영구 바닐라 경로(fail-closed).
+     *  로그 편차(문서화): 디코드 실패 warn 이 요소 문자열당 1회로 줄어든다(스팸 억제). */
+    private static net.minecraft.text.Text resolveInterpretStorage(
+            net.minecraft.server.command.ServerCommandSource source,
+            net.minecraft.entity.Entity sender, CachedText ct) {
+        try {
+            if (ct.itpState == 0) {   // 1회 분류
+                ct.itpState = 2;
+                net.minecraft.text.Text t = ct.text;
+                if (!t.getSiblings().isEmpty() || !t.getStyle().isEmpty()) return null;
+                if (!(t.getContent() instanceof net.minecraft.text.NbtTextContent nc)) return null;
+                if (!nc.shouldInterpret()) return null;
+                if (!(nc.getDataSource() instanceof net.minecraft.text.StorageNbtDataSource)) return null;
+                java.util.Optional<net.minecraft.text.Text> sep = nc.getSeparator();
+                if (sep.isPresent() && !isStaticText(sep.get())) return null;   // 동적 separator — 회피
+                ct.itpNc = nc;
+                ct.itpSepStatic = sep.isPresent() ? sep.get()
+                        : net.minecraft.text.Texts.DEFAULT_SEPARATOR_TEXT;
+                ct.itpState = 1;
+                // 자기검증: fast 결과 == 바닐라 결과(같은 틱·같은 storage 상태 — 결정적)
+                net.minecraft.text.Text fast = _itpResolve(source, sender, ct);
+                net.minecraft.text.Text truth = net.minecraft.text.Texts.parse(source, ct.text, sender, 0);
+                if (fast == null || !fast.equals(truth)) {
+                    ct.itpState = 2;
+                    return truth;   // 이번 호출 결과는 바닐라 값으로
+                }
+                return fast;
+            }
+            return _itpResolve(source, sender, ct);
+        } catch (Exception ex) {
+            ct.itpState = 2;   // 어떤 예외든 영구 바닐라 폴백
+            return null;
+        }
+    }
+
+    private static net.minecraft.text.Text _itpResolve(
+            net.minecraft.server.command.ServerCommandSource source,
+            net.minecraft.entity.Entity sender, CachedText ct) throws Exception {
+        net.minecraft.text.NbtTextContent nc = ct.itpNc;
+        net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(nc.getPath());
+        if (p == null) return null;
+        net.minecraft.text.MutableText out = null;
+        java.util.Iterator<net.minecraft.nbt.NbtCompound> roots =
+                nc.getDataSource().get(source).iterator();
+        while (roots.hasNext()) {
+            net.minecraft.nbt.NbtCompound root = roots.next();
+            java.util.List<net.minecraft.nbt.NbtElement> els;
+            try { els = p.get(root); }
+            catch (Exception missing) { continue; }   // 바닐라: 경로 미매치 = 빈 스트림
+            for (net.minecraft.nbt.NbtElement el : els) {
+                net.minecraft.text.Text base;
+                if (el instanceof net.minecraft.nbt.NbtString nstr) {
+                    String key = nstr.asString().orElse(null);
+                    if (key == null) continue;
+                    base = INTERP_CACHE.get(key);
+                    if (base == null) {
+                        base = _itpDecode(source, el);
+                        INTERP_CACHE.put(key, base == null ? INTERP_INVALID : base);
+                    }
+                    if (base == INTERP_INVALID || base == null) continue;
+                } else {
+                    base = _itpDecode(source, el);   // 비문자열 요소(희소) — 미캐시
+                    if (base == null) continue;
+                }
+                net.minecraft.text.Text resolved =
+                        isStaticText(base) ? base
+                                : net.minecraft.text.Texts.parse(source, base, sender, 0);
+                if (out == null) {
+                    out = resolved.copy();   // 바닐라 reduce 의 첫 요소(변형 대상) — 캐시 보호 copy
+                } else {
+                    out.append(ct.itpSepStatic).append(resolved);
+                }
+            }
+        }
+        return out != null ? out : net.minecraft.text.Text.empty();
+    }
+
+    /** 바닐라 interpret 요소 디코드와 동일: TextCodecs.CODEC.parse(registryOps).getOrThrow().
+     *  실패 = null(호출측이 요소 스킵 — 바닐라의 warn+스킵과 동작 동일, warn 은 최초 1회). */
+    private static net.minecraft.text.Text _itpDecode(
+            net.minecraft.server.command.ServerCommandSource source, net.minecraft.nbt.NbtElement el) {
+        try {
+            return net.minecraft.text.TextCodecs.CODEC
+                    .parse(source.getRegistryManager().getOps(net.minecraft.nbt.NbtOps.INSTANCE), el)
+                    .getOrThrow();
+        } catch (Exception ex) {
+            System.err.println("[KFC-TEXT] interpret decode failed (cached): " + el);
+            return null;
+        }
     }
 
     private static final net.minecraft.nbt.NbtElement SNBT_INVALID = new net.minecraft.nbt.NbtCompound();
@@ -484,7 +593,9 @@ public final class KfcGen {
             // '스캔 결과 0건' 과 동일. 증분 훅(snapAdd/tagBucketsOnAdd)은 computeIfAbsent 로
             // 부재 태그 버킷을 생성하므로 이후 스폰/태그 부여도 정확히 반영된다.
             for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
-                for (String tg : e.getCommandTags()) {
+                java.util.Set<String> tg0 = e.getCommandTags();
+                if (tg0.isEmpty()) continue;   // 무태그(플레이어/바닐라 몹) — 이터레이터 할당 생략
+                for (String tg : tg0) {
                     TAG_BUCKETS.computeIfAbsent(tg, k2 -> new java.util.ArrayList<>()).add(e);
                 }
             }
@@ -2238,6 +2349,12 @@ public final class KfcGen {
             if (cached.text == null) return null;   // 캐시된 파싱 실패 — 종전 null 반환과 동일
             // 정적 트리는 Texts.parse 가 항등(동등 복제)이므로 생략 — 파싱 인스턴스 재사용(불변).
             if (cached.isStatic) return cached.text;
+            // nbt+interpret(storage) 단일 컴포넌트 — 요소 디코드 캐시판(최초 1회 바닐라와
+            // 결과 equals 자기검증, 불일치 시 영구 바닐라 폴백). [실측 7.2%p: 게이지 액션바]
+            if (cached.itpState != 2) {
+                net.minecraft.text.Text fast = resolveInterpretStorage(source, sender, cached);
+                if (fast != null) return fast;
+            }
             return net.minecraft.text.Texts.parse(source, cached.text, sender, 0);
         } catch (Exception ex) {
             return null;   // resolve 실패(선택자 해석 등 런타임 예외) — 종전 최종 실패와 동일
@@ -6639,6 +6756,129 @@ public static net.minecraft.entity.Entity firstEntity(
     public static SnbtTmpl snbtTmplC(String pre, String post) { return new SnbtTmpl(pre, post, false); }
     /** 골격 템플릿 팩토리(값 판 — storagePutSnbt 용). */
     public static SnbtTmpl snbtTmplV(String pre, String post) { return new SnbtTmpl(pre, post, true); }
+
+    /** 다중 수치 hole 골격 템플릿 — SnbtTmpl 의 k-hole 일반화(동일한 자기검증·fail-closed 원칙).
+     *  [실측] kartvector 류 다인자 매크로 SNBT 가 매 호출 SNBT_CACHE 미스 → 전체 재파싱(~1%p).
+     *  구성: 센티널 2조로 파싱해 diff 경로 k개를 얻고, 잎 값(=센티널)으로 hole↔경로를 대응시킨 뒤
+     *  프로브 벡터로 patchN == 진짜 파싱 을 검증한다. 실패 시 ok=false → 호출측 concat 폴백. */
+    public static final class SnbtTmplN {
+        final String[] lits;                 // k+1 개 리터럴 조각(폴백 concat 용)
+        final boolean wrap;
+        final boolean ok;
+        final net.minecraft.nbt.NbtElement skeleton;
+        final String[][] paths;              // hole i → compound 키 경로
+
+        SnbtTmplN(boolean wrap, String[] lits) {
+            this.lits = lits; this.wrap = wrap;
+            boolean okv = false; net.minecraft.nbt.NbtElement sk = null; String[][] pth = null;
+            try {
+                int k = lits.length - 1;
+                String[] s1 = new String[k], s2 = new String[k];
+                for (int i = 0; i < k; i++) { s1[i] = Integer.toString(101 + i); s2[i] = Integer.toString(201 + i); }
+                net.minecraft.nbt.NbtElement a = _parseN(lits, s1, wrap);
+                net.minecraft.nbt.NbtElement b = _parseN(lits, s2, wrap);
+                if (a != null && b != null) {
+                    java.util.List<java.util.List<String>> diffs = new java.util.ArrayList<>();
+                    SnbtTmpl._collectDiffs(a, b, new java.util.ArrayDeque<>(), diffs);
+                    if (diffs.size() == k) {
+                        String[][] byHole = new String[k][];
+                        boolean map = true;
+                        for (java.util.List<String> dp : diffs) {
+                            String[] p = dp.toArray(new String[0]);
+                            net.minecraft.nbt.NbtElement la = SnbtTmpl._leafAt(a, p);
+                            if (!(la instanceof net.minecraft.nbt.AbstractNbtNumber num)) { map = false; break; }
+                            int hole = (int) Math.round(num.doubleValue()) - 101;   // 센티널 → hole 번호
+                            if (hole < 0 || hole >= k || byHole[hole] != null) { map = false; break; }
+                            byHole[hole] = p;
+                        }
+                        if (map) {
+                            boolean good = true;
+                            String[][] probes = {
+                                new String[]{"7", "-3", "40000", "12.5"},
+                                new String[]{"-12.5", "0", "3", "999999"},
+                                new String[]{"1", "2.25", "-40000", "8"}};
+                            for (String[] pv : probes) {
+                                String[] vals = new String[k];
+                                for (int i = 0; i < k; i++) vals[i] = pv[i % pv.length];
+                                net.minecraft.nbt.NbtElement patched = _patchN(a, byHole, vals);
+                                net.minecraft.nbt.NbtElement truth = _parseN(lits, vals, wrap);
+                                if (patched == null || truth == null || !patched.equals(truth)) { good = false; break; }
+                            }
+                            if (good) { okv = true; sk = a.copy(); pth = byHole; }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+            this.ok = okv; this.skeleton = sk; this.paths = pth;
+        }
+
+        private static net.minecraft.nbt.NbtElement _parseN(String[] lits, String[] vals, boolean wrap) {
+            StringBuilder sb = new StringBuilder(lits[0]);
+            for (int i = 0; i < vals.length; i++) sb.append(vals[i]).append(lits[i + 1]);
+            try {
+                net.minecraft.nbt.NbtCompound w = net.minecraft.nbt.StringNbtReader
+                        .readCompound(wrap ? ("{v:" + sb + "}") : sb.toString());
+                return wrap ? w.get("v") : w;
+            } catch (Exception ex) { return null; }
+        }
+
+        /** skeleton 1회 copy 후 각 hole 잎을 제자리 set. 비수치/실패 = null. */
+        private static net.minecraft.nbt.NbtElement _patchN(net.minecraft.nbt.NbtElement root,
+                                                            String[][] paths, String[] vals) {
+            try {
+                net.minecraft.nbt.NbtElement copy = root.copy();
+                for (int h = 0; h < paths.length; h++) {
+                    net.minecraft.nbt.NbtCompound w =
+                            net.minecraft.nbt.StringNbtReader.readCompound("{v:" + vals[h] + "}");
+                    net.minecraft.nbt.NbtElement ve = w.get("v");
+                    if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                    net.minecraft.nbt.NbtElement cur = copy;
+                    String[] p = paths[h];
+                    for (int i = 0; i < p.length - 1; i++) {
+                        if (!(cur instanceof net.minecraft.nbt.NbtCompound c)) return null;
+                        cur = c.get(p[i]);
+                        if (cur == null) return null;
+                    }
+                    if (!(cur instanceof net.minecraft.nbt.NbtCompound parent)) return null;
+                    parent.put(p[p.length - 1], ve);
+                }
+                return copy;
+            } catch (Exception ex) { return null; }
+        }
+
+        net.minecraft.nbt.NbtElement patchN(String[] vals) {
+            if (!ok || vals == null || vals.length != paths.length) return null;
+            for (String v : vals) if (v == null || !_NUM_TOKEN.matcher(v).matches()) return null;
+            return _patchN(skeleton, paths, vals);
+        }
+
+        String concat(String[] vals) {
+            StringBuilder sb = new StringBuilder(lits[0]);
+            for (int i = 0; i < vals.length; i++) sb.append(vals[i]).append(lits[i + 1]);
+            return sb.toString();
+        }
+    }
+    public static SnbtTmplN snbtTmplNC(String... lits) { return new SnbtTmplN(false, lits); }
+    public static SnbtTmplN snbtTmplNV(String... lits) { return new SnbtTmplN(true, lits); }
+
+    /** 다중 hole 판 entityMergeSnbt. fast 실패 시 기존 concat+파싱 경로로 폴백(동작 동일). */
+    public static void entityMergeSnbtTN(net.minecraft.entity.Entity e, SnbtTmplN t, String... vals) {
+        if (SNBT_TEMPLATE && t != null && t.ok) {
+            net.minecraft.nbt.NbtElement patched = t.patchN(vals);
+            if (patched instanceof net.minecraft.nbt.NbtCompound tc) { entityMergeSnbt(e, tc); return; }
+        }
+        entityMergeSnbt(e, t == null ? "" : t.concat(vals));
+    }
+
+    /** 다중 hole 판 storagePutSnbt. fast 실패 시 기존 concat+파싱 경로로 폴백(동작 동일). */
+    public static void storagePutSnbtTN(net.minecraft.server.MinecraftServer server, String id,
+                                        String path, SnbtTmplN t, String mode, String... vals) {
+        if (SNBT_TEMPLATE && t != null && t.ok) {
+            net.minecraft.nbt.NbtElement patched = t.patchN(vals);
+            if (patched != null) { storagePutSnbt(server, id, path, patched, mode); return; }
+        }
+        storagePutSnbt(server, id, path, t == null ? "" : t.concat(vals), mode);
+    }
 
     /** entityMergeSnbt 템플릿 오버로드. fast-path 실패 시 정확히 기존 concat+파싱 경로로 폴백. */
     public static void entityMergeSnbtT(net.minecraft.entity.Entity e, SnbtTmpl t, String val) {

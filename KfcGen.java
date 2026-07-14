@@ -824,6 +824,19 @@ public final class KfcGen {
     public static java.util.List<net.minecraft.entity.Entity> entitiesByTypeBox(
             GameContext ctx, net.minecraft.entity.EntityType<?> t, net.minecraft.util.math.Box box,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        // 21차(바닐라 초월): 섹션 스캔 대신 타입버킷 + 동일 판정식.
+        // vanilla getOtherEntities 의 포함 조건 = 박스∩바운딩박스 + 술어 — 그대로 재현.
+        // 타입 검사는 버킷 키가 보장(종전 람다의 getType()==t 와 동일). Sepals 의 Catheter
+        // 캐스팅 이슈도 원천 회피(버킷 순회는 캐스팅이 없다).
+        if (QUERY_IDX) {
+            java.util.List<net.minecraft.entity.Entity> b = typeBucket(ctx, t);
+            java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+            for (int i = 0, n = b.size(); i < n; i++) {
+                net.minecraft.entity.Entity e = b.get(i);
+                if (e.isAlive() && box.intersects(e.getBoundingBox()) && pred.test(e)) out.add(e);
+            }
+            return out;
+        }
         return ctx.world.getOtherEntities(null, box, e -> e.isAlive() && e.getType() == t && pred.test(e));
     }
 
@@ -1960,6 +1973,18 @@ public final class KfcGen {
         double y1 = Math.min(o.y, o.y + dy), y2 = Math.max(o.y, o.y + dy) + 1;
         double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
         net.minecraft.util.math.Box box = new net.minecraft.util.math.Box(x1, y1, z1, x2, y2, z2);
+        // 21차(바닐라 초월): 후보 = 양성 태그 버킷(있으면) 아니면 틱 스냅샷 — 섹션 스캔 제거.
+        // 판정식은 종전과 동일(박스∩바운딩박스 = getOtherEntities 포함 조건 + 동일 술어).
+        if (QUERY_IDX) {
+            java.util.List<net.minecraft.entity.Entity> cand = tagOrSnap(ctx, tagsPos);
+            java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+            for (int i = 0, n = cand.size(); i < n; i++) {
+                net.minecraft.entity.Entity en = cand.get(i);
+                if (box.intersects(en.getBoundingBox())
+                        && matchTagsAlive(en, tagsPos, tagsNeg) && kfcTypeIn(en, types)) out.add(en);
+            }
+            return out;
+        }
         return ctx.world.getOtherEntities(null, box,
                 en -> matchTagsAlive(en, tagsPos, tagsNeg) && kfcTypeIn(en, types));
     }
@@ -1986,6 +2011,20 @@ public final class KfcGen {
     public static boolean anyEntityInBox(GameContext ctx, net.minecraft.util.math.Vec3d o,
             net.minecraft.entity.EntityType<?>[] types,
             String[] tagsPos, String[] tagsNeg, double dx, double dy, double dz) {
+        // 21차: 존재검사는 첫 매치에서 단락 — 결과 리스트 할당/전체 수집 제거(집합 판정 동일).
+        if (QUERY_IDX) {
+            double x1 = Math.min(o.x, o.x + dx), x2 = Math.max(o.x, o.x + dx) + 1;
+            double y1 = Math.min(o.y, o.y + dy), y2 = Math.max(o.y, o.y + dy) + 1;
+            double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
+            net.minecraft.util.math.Box box = new net.minecraft.util.math.Box(x1, y1, z1, x2, y2, z2);
+            java.util.List<net.minecraft.entity.Entity> cand = tagOrSnap(ctx, tagsPos);
+            for (int i = 0, n = cand.size(); i < n; i++) {
+                net.minecraft.entity.Entity en = cand.get(i);
+                if (box.intersects(en.getBoundingBox())
+                        && matchTagsAlive(en, tagsPos, tagsNeg) && kfcTypeIn(en, types)) return true;
+            }
+            return false;
+        }
         return !allEntitiesInBox(ctx, o, types, tagsPos, tagsNeg, dx, dy, dz).isEmpty();
     }
 
@@ -4894,6 +4933,18 @@ public static net.minecraft.entity.Entity nearestEntity(
     public static java.util.List<net.minecraft.entity.Entity> entitiesByType(
             GameContext ctx, net.minecraft.entity.EntityType<?> t,
             java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        // 21차(바닐라 초월): vanilla getEntitiesByType(EntityLookup 전체 + TypeFilter downcast
+        // + 콜백 체인, 스파크 1.57%p) 대신 타입버킷 직행. 결과 집합 동등 — 버킷 = 이 틱 로드
+        // 개체군의 타입 부분집합, 호출측 술어(alive 포함)가 라이브 재검사(전 호출부 확인).
+        if (QUERY_IDX) {
+            java.util.List<net.minecraft.entity.Entity> b = typeBucket(ctx, t);
+            java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+            for (int i = 0, n = b.size(); i < n; i++) {
+                net.minecraft.entity.Entity e = b.get(i);
+                if (pred.test(e)) out.add(e);
+            }
+            return out;
+        }
         net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, net.minecraft.entity.Entity> tf =
                 (net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, net.minecraft.entity.Entity>)
                         (net.minecraft.util.TypeFilter<net.minecraft.entity.Entity, ?>) t;
@@ -5796,6 +5847,9 @@ public static net.minecraft.entity.Entity firstEntity(
     // box 한정 섹션 스캔은 순회량은 줄지만 매 호출 List 할당 + predicate lambda 비용이 더 컸다.
     // (워크로드가 크게 바뀌면 true 로 재측정 가능하도록 토글은 남겨둔다.)
     private static final boolean QUERY_BOX = false;
+    // 21차: 박스/타입 질의를 자체 인덱스(타입버킷/스냅샷/태그버킷)로 순회. off = 종전 섹션 스캔.
+    private static final boolean QUERY_IDX =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.queryidx", "on"));
     // @e[limit=N] sort 미지정은 바닐라에서 arbitrary(정렬 안 함)이다. 현재 변환은 거리 정렬
     // (nearestN)으로 처리하는데, 이는 (1) 고증 편차(arbitrary↔nearest)이고 (2) 불필요한 정렬
     // 비용이다. emit 이 sort=nearest 여부를 wantNearest 로 넘기므로, 이 토글이 false 면 명시적

@@ -4053,7 +4053,8 @@ public final class KfcGen {
     // 정적 승격 Sch/Rch 셀의 홀더별 레지스트리(선별 무효화용). 셀은 콜사이트당 1회 생성 — 유한.
     private static final java.util.HashMap<String, java.util.ArrayList<Object>> CELLS_BY_HOLDER =
             new java.util.HashMap<>();
-    private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess>>
+    // 19차: 홀더-우선 키잉 — reset <holder> 선별 무효화가 외부 remove 1회(O(1))가 된다.
+    private static final java.util.HashMap<String, java.util.HashMap<ObjRef, net.minecraft.scoreboard.ScoreAccess>>
             SCORE_HANDLES = new java.util.HashMap<>();
     // SCORE_HANDLES 가 (어떤 이유로든) 비워질 때마다 증가하는 세대 카운터.
     // 정적 승격된 Sch 셀(pass-4)이 이 값을 스탬프로 삼아, 값이 그대로면 이중 맵 조회를
@@ -4063,16 +4064,18 @@ public final class KfcGen {
 
     private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
         if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
-        java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(o);
-        if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(o, m); }
-        net.minecraft.scoreboard.ScoreAccess a = m.get(holderKey);
+        String hn = (holderKey instanceof net.minecraft.entity.Entity e0)
+                ? nameOf(e0) : (String) holderKey;
+        java.util.HashMap<ObjRef, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(hn);
+        if (m == null) { m = new java.util.HashMap<>(); SCORE_HANDLES.put(hn, m); }
+        net.minecraft.scoreboard.ScoreAccess a = m.get(o);
         if (a == null) {
             ScoreboardObjective ob = obj(sb, o);
             if (ob == null) return null;
             ScoreHolder h = (holderKey instanceof net.minecraft.entity.Entity e)
-                    ? e : holderOf((String) holderKey);
+                    ? e : holderOf(hn);
             a = sb.getOrCreateScore(h, ob);
-            m.put(holderKey, a);
+            m.put(o, a);
         }
         return a;
     }
@@ -4082,10 +4085,10 @@ public final class KfcGen {
         HANDLE_GEN++; SH_GEN = HANDLE_GEN;   // 지연 검사(scoreHandle/readHandle)와 즉시 동기
     }
 
-    /** 13차: scoreboard players reset <holder> 의 선별 무효화 — 전체 클리어 대신 해당 홀더의
-     *  핸들만 제거한다(매 틱 checkpoint 정렬의 reset 이 전체 클리어를 유발 → 상시 재해소 churn).
-     *  대상: (a) 정적 승격 Sch/Rch 셀(홀더별 레지스트리), (b) SCORE_HANDLES/READ_HANDLES 의
-     *  String 키, (c) Entity 키(nameOf 비교 스캔 — nameOf 는 identity 캐시라 저렴).
+    /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.
+     *  [실측 19차] 종전 (ObjRef→홀더) 키잉에선 리셋마다 전 맵 Entity-키 스캔(dropHolderKey)이
+     *  필요해 그 자체가 2.6%p 핫스팟이 됐다. 홀더-우선 키잉으로 외부 remove 1회 = O(1).
+     *  대상: (a) 정적 승격 Sch/Rch 셀(홀더별 레지스트리), (b) 두 핸들 맵의 홀더 서브트리.
      *  다른 홀더의 핸들은 그대로 유효(removeScore(s) 는 해당 홀더의 엔트리만 제거한다).
      *  objective 구분 없이 홀더 전체를 지우는 과잉 무효화는 안전(재해소는 멱등). */
     private static void dropHandlesFor(String holder) {
@@ -4096,19 +4099,8 @@ public final class KfcGen {
                 else if (c instanceof Rch r) r.sc = null;
             }
         }
-        for (java.util.HashMap<Object, net.minecraft.scoreboard.ScoreAccess> m : SCORE_HANDLES.values())
-            dropHolderKey(m, holder);
-        for (java.util.HashMap<Object, ReadableScoreboardScore> m : READ_HANDLES.values())
-            dropHolderKey(m, holder);
-    }
-    private static <V> void dropHolderKey(java.util.HashMap<Object, V> m, String holder) {
-        m.remove(holder);
-        if (m.isEmpty()) return;
-        java.util.Iterator<java.util.Map.Entry<Object, V>> it = m.entrySet().iterator();
-        while (it.hasNext()) {
-            Object k = it.next().getKey();
-            if (k instanceof net.minecraft.entity.Entity en && holder.equals(nameOf(en))) it.remove();
-        }
+        SCORE_HANDLES.remove(holder);
+        READ_HANDLES.remove(holder);
     }
 
     // ── 읽기 엔트리 핸들 캐시 ──
@@ -4116,22 +4108,21 @@ public final class KfcGen {
     // 'holder 이름 해소 + 스코어보드 이중 맵 조회'를 (ObjRef, 홀더키)→엔트리 캐시로 대체.
     // 값은 항상 라이브 엔트리에서 읽으므로(getScore()) 캐시는 '엔트리 신원'만 보관 — 값 갱신과
     // 무관하게 정확하다. 존재하는 엔트리만 캐시(null 미캐시)라 관측 부수효과가 전혀 없다.
-    private static final java.util.HashMap<ObjRef, java.util.HashMap<Object, ReadableScoreboardScore>>
+    private static final java.util.HashMap<String, java.util.HashMap<ObjRef, ReadableScoreboardScore>>
             READ_HANDLES = new java.util.HashMap<>();
 
     private static ReadableScoreboardScore readHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
         if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
-        java.util.HashMap<Object, ReadableScoreboardScore> m = READ_HANDLES.get(o);
-        if (m == null) { m = new java.util.HashMap<>(); READ_HANDLES.put(o, m); }
-        ReadableScoreboardScore sc = m.get(holderKey);
+        String hn = (holderKey instanceof net.minecraft.entity.Entity e0)
+                ? nameOf(e0) : (String) holderKey;
+        java.util.HashMap<ObjRef, ReadableScoreboardScore> m = READ_HANDLES.get(hn);
+        if (m == null) { m = new java.util.HashMap<>(); READ_HANDLES.put(hn, m); }
+        ReadableScoreboardScore sc = m.get(o);
         if (sc == null) {
             ScoreboardObjective ob = obj(sb, o);
             if (ob == null) return null;
-            ScoreHolder h = (holderKey instanceof net.minecraft.entity.Entity e)
-                    ? holderOf(nameOf(e))          // vanilla 경로의 매 호출 UUID 문자열 할당 회피
-                    : holderOf((String) holderKey);
-            sc = sb.getScore(h, ob);
-            if (sc != null) m.put(holderKey, sc);  // 존재 엔트리만 캐시(null 미캐시 — 부수효과 0)
+            sc = sb.getScore(holderOf(hn), ob);
+            if (sc != null) m.put(o, sc);          // 존재 엔트리만 캐시(null 미캐시 — 부수효과 0)
         }
         return sc;
     }

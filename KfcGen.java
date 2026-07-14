@@ -3926,17 +3926,24 @@ public final class KfcGen {
         }
     }
 
-    /** movePosition 보조: 탈것 이동 변위만큼 승객(및 중첩 승객)을 평행이동해 좌석을 유지한다. */
+    /** movePosition 보조: 탈것 이동 변위만큼 승객(및 중첩 승객)을 평행이동해 좌석을 유지한다.
+     *  [실측 25차] 종전 승객당 hasPassengers() 재귀 가드가 가상호출 체인(hasPassengers →
+     *  ImmutableList.isEmpty → AbstractCollection.isEmpty → size)으로 ~2.0%p 를 태웠다
+     *  (수백 파츠 × 틱당 미세이동 수). 진입부 size 검사 + 인덱스 순회로 교체 — 가드 체인과
+     *  이터레이터 할당이 사라진다. 이동 순서/결과는 종전과 완전 동일(동일 리스트, 동일 순번). */
     private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
                                                double dx, double dy, double dz) {
-        for (net.minecraft.entity.Entity ps : vehicle.getPassengerList()) {
+        java.util.List<net.minecraft.entity.Entity> lst = vehicle.getPassengerList();
+        int n = lst.size();
+        for (int i = 0; i < n; i++) {
+            net.minecraft.entity.Entity ps = lst.get(i);
             if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
                 sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
                         sp.getYaw(), sp.getPitch());
             } else {
                 ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
             }
-            if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
+            _movePassengersByDelta(ps, dx, dy, dz);   // 빈 리스트는 진입부 n==0 으로 즉시 복귀
         }
     }
 

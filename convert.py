@@ -939,6 +939,19 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     else:
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
 
+    # KfcPerfMixin.java 자동 포함 (20차 — 바닐라 초월 최적화: 대형 승객 리스트 O(n^2) -> O(n)).
+    # KfcGen 과 동일 방식: convert.py 옆의 템플릿을 group 패키지로 치환해 배치.
+    mixin_src = Path(__file__).parent / "KfcPerfMixin.java"
+    if mixin_src.exists():
+        mx = mixin_src.read_text(encoding="utf-8")
+        mx = re.sub(r'^package\s+[\w.]+;', f'package {group}.mixin;', mx, count=1, flags=re.M)
+        mixin_dir = src_root / Path(*f"{group}.mixin".split("."))
+        mixin_dir.mkdir(parents=True, exist_ok=True)
+        write_if_changed(mixin_dir / "KfcPerfMixin.java", mx)
+        print(f"[generate] KfcPerfMixin.java -> {group}.mixin")
+    else:
+        print("[!]  KfcPerfMixin.java is not next to convert.py - perf mixin skipped")
+
     write_report(out_root, fn_meta, stats, group)
     _tlog("stubs+KfcGen+report")
 
@@ -1448,6 +1461,7 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
         "entrypoints": {
             "main": [f"{group}.ModEntry"]
         },
+        "mixins": [f"{mod_id}.mixins.json"],
         "depends": {
             "fabricloader": "*",
             "minecraft": "~1.21.5",
@@ -1458,6 +1472,20 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
     (res / "fabric.mod.json").write_text(
         json.dumps(fabric_mod, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[generate] resources/fabric.mod.json (id={mod_id}, entry={group}.ModEntry)")
+
+    # 20차: 성능 믹스인 설정. required=false + defaultRequire=0 — 미래 MC 에서 주입이
+    # 실패해도 크래시 없이 바닐라 경로 유지(fail-closed: 최적화만 소실).
+    mixins_json = {
+        "required": False,
+        "package": f"{group}.mixin",
+        "compatibilityLevel": "JAVA_21",
+        "minVersion": "0.8",
+        "mixins": ["KfcPerfMixin"],
+        "injectors": {"defaultRequire": 0}
+    }
+    (res / f"{mod_id}.mixins.json").write_text(
+        json.dumps(mixins_json, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"[generate] resources/{mod_id}.mixins.json (package={group}.mixin)")
 
     # ── 데이터팩 리소스 복사 ──
     # tags / predicate / loot_table / advancement 등 비-function 리소스는 그대로 데이터팩으로 남겨야

@@ -1072,16 +1072,20 @@ public final class KfcGen {
     }
 
     public static void teamLeave(ServerScoreboard sb, String holder) {
-        NAME_GEN++;   // 팀 소속 변화 — 표시명 틱-캐시 무효화(10차)
-        if (holder != null) sb.clearTeam(holder);   // 현재 소속 팀에서 제거
+        // 22차: 실제로 팀에서 빠진 경우에만 무효화(무소속 leave 는 표시명 무변화).
+        if (holder != null && sb.clearTeam(holder)) NAME_GEN++;
     }
 
     /** team join <team> <members> — 멤버를 팀에 추가. */
     public static void teamJoin(ServerScoreboard sb, String teamName, String holder) {
-        NAME_GEN++;   // 팀 소속 변화 — 표시명 틱-캐시 무효화(10차)
         if (holder == null) return;
         net.minecraft.scoreboard.Team t = sb.getTeam(teamName);
-        if (t != null) sb.addScoreHolderToTeam(holder, t);
+        if (t == null) return;
+        // 22차: 이미 같은 팀이면 멤버십/표시명 무변화 — 바닐라 재조인(제거 후 재추가)과 결과
+        // 동등하므로 스킵(NAME_GEN 보존 + 팀 패킷 재전송 생략). 실변화시에만 무효화.
+        if (sb.getScoreHolderTeam(holder) == t) return;
+        NAME_GEN++;
+        sb.addScoreHolderToTeam(holder, t);
     }
 
     // ── fill ── (바닐라 FillCommand 흐름: 박스 순회 + 모드/필터 판정 후 setBlockState)
@@ -2268,6 +2272,9 @@ public final class KfcGen {
     private static net.minecraft.server.MinecraftServer ONP_MAP_SERVER;
     private static int  ONP_MAP_TICK = Integer.MIN_VALUE;
     private static long ONP_MAP_GEN  = -1;
+    // 22차: vehicle → {템플릿 11필드, 결과 리스트} — 동등 템플릿 src 간 공유(스탬프는 ONP_MAP 와 공용).
+    private static final java.util.IdentityHashMap<net.minecraft.entity.Entity, Object[]> ONP_VEH =
+            new java.util.IdentityHashMap<>();
 
     /** on passengers 의 '엔티티 선(先)열거' 판 — opt_post pass-2.78 이 필터 가드가 전부
      *  엔티티만 보는 루프를 이 판으로 재작성한다(가드 통과분만 withEntity 생성).
@@ -2288,7 +2295,8 @@ public final class KfcGen {
         net.minecraft.server.MinecraftServer sv = src.getServer();
         int tk = sv.getTicks();
         if (ONP_MAP_SERVER != sv || ONP_MAP_TICK != tk || ONP_MAP_GEN != ENTITY_GEN) {
-            ONP_MAP.clear(); ONP_MAP_SERVER = sv; ONP_MAP_TICK = tk; ONP_MAP_GEN = ENTITY_GEN;
+            ONP_MAP.clear(); ONP_VEH.clear();
+            ONP_MAP_SERVER = sv; ONP_MAP_TICK = tk; ONP_MAP_GEN = ENTITY_GEN;
         }
         java.util.List<net.minecraft.server.command.ServerCommandSource> hit = ONP_MAP.get(src);
         if (hit != null) return hit;   // 같은 src·같은 틱·같은 세대 — 재사용(할당 0)
@@ -2297,17 +2305,37 @@ public final class KfcGen {
         if (ps.isEmpty()) {
             out = java.util.List.of();   // 승객 없는 엔티티(마커 등) — 할당 0
         } else {
-            java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
-                    new java.util.ArrayList<>(ps.size());
-            // 12차: src 상속 필드 11개는 승객과 무관 — 루프 밖에서 1회만 읽는다
-            // (스파크: 승객당 Field.get 이 1.86%p). 실패/비활성이면 null → vanilla 경로.
+            // 12차: src 상속 필드 11개는 승객과 무관 — 루프 밖에서 1회만 읽는다.
             Object[] t = wefTemplate(src, ps.get(0));
-            for (net.minecraft.entity.Entity p : ps)
-                tmp.add(t == null ? src.withEntity(p) : withEntitySrc(src, p, t));
-            out = tmp;
+            // 22차: 같은 vehicle 을 다른 src(다른 함수 컨텍스트)가 처리해도, 상속 11필드가
+            // 값-동일하면 결과 소스 리스트는 값-동일 — (vehicle, 틱) 캐시로 공유한다.
+            // 소스는 불변 객체라 공유 안전(객체 identity 는 어떤 경로도 관측하지 않음).
+            // 위치/회전(Vec3d/Vec2f)은 값 equals, 나머지는 참조 동일성으로 비교 — 카트가
+            // 함수 사이에 움직였으면 위치가 달라 자동 미스(정확성은 구조적으로 보존).
+            Object[] veh = (t != null) ? ONP_VEH.get(e) : null;
+            if (veh != null && _tplEq((Object[]) veh[0], t)) {
+                out = (java.util.List<net.minecraft.server.command.ServerCommandSource>) veh[1];
+            } else {
+                java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
+                        new java.util.ArrayList<>(ps.size());
+                for (net.minecraft.entity.Entity p : ps)
+                    tmp.add(t == null ? src.withEntity(p) : withEntitySrc(src, p, t));
+                out = tmp;
+                if (t != null) ONP_VEH.put(e, new Object[]{t, out});
+            }
         }
         ONP_MAP.put(src, out);
         return out;
+    }
+
+    /** 22차: wefTemplate 11필드 동등성 — 위치/회전/레벨/silent 는 값, 그 외는 참조. */
+    private static boolean _tplEq(Object[] a, Object[] b) {
+        return a[0] == b[0]
+                && java.util.Objects.equals(a[1], b[1])    // Vec3d position (값)
+                && java.util.Objects.equals(a[2], b[2])    // Vec2f rotation (값)
+                && a[3] == b[3] && java.util.Objects.equals(a[4], b[4]) && a[7] == b[7]
+                && java.util.Objects.equals(a[9], b[9])
+                && a[10] == b[10] && a[11] == b[11] && a[12] == b[12] && a[13] == b[13];
     }
 
     // ── withEntity 특수화(10차 도입, 11차 개정) ──
@@ -2329,8 +2357,9 @@ public final class KfcGen {
     private static final java.util.IdentityHashMap<net.minecraft.entity.Entity, Object[]> ND_MAP =
             new java.util.IdentityHashMap<>();
     private static net.minecraft.server.MinecraftServer ND_SERVER;
-    private static int  ND_TICK = Integer.MIN_VALUE;
-    private static long ND_GEN = -1, ND_NGEN = -1;
+    private static int  ND_TICK = Integer.MIN_VALUE;          // 22차: 화해 주기 판정용(무효화 축 아님)
+    private static long ND_NGEN = -1;
+    private static int  ND_RECON_TICK = Integer.MIN_VALUE;    // 22차: 100틱 주기 화해 스탬프
 
     private static final class Wef {
         static byte state = 0;   // 0=미프로브 1=활성(자기검증 통과) 2=영구 vanilla 폴백
@@ -2494,8 +2523,19 @@ public final class KfcGen {
             if (src.getEntity() == p) return src;   // vanilla 의 동일-엔티티 단락과 동일
             net.minecraft.server.MinecraftServer sv = src.getServer();
             int tk = sv.getTicks();
-            if (ND_SERVER != sv || ND_TICK != tk || ND_GEN != ENTITY_GEN || ND_NGEN != NAME_GEN) {
-                ND_MAP.clear(); ND_SERVER = sv; ND_TICK = tk; ND_GEN = ENTITY_GEN; ND_NGEN = NAME_GEN;
+            // 22차: ND 캐시를 틱-간 유지 — 이름/표시명은 엔티티 수명 동안 사실상 불변이고,
+            // 변경 경로는 전부 NAME_GEN 훅(팀 실변화/CustomName 쓰기/브릿지·디스패처)을 거친다.
+            // 종전 '매 틱 클리어'는 수백 파츠의 번역 렌더를 매 틱 반복시켰다(~1.2%p).
+            // 콘솔/OP 의 훅 밖 개입은 100틱(5초) 주기 화해로 수렴 — 13/14차와 동일한 편차 축.
+            if (ND_TICK != tk) {
+                ND_TICK = tk;
+                if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= 100) {
+                    ND_RECON_TICK = tk;
+                    ND_MAP.clear();
+                }
+            }
+            if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
+                ND_MAP.clear(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
             }
             Object[] nd = ND_MAP.get(p);
             if (nd == null) {
@@ -3770,6 +3810,7 @@ public final class KfcGen {
                 ENTITY_GEN++;   // 디스패처 실행이 summon/kill/tag/ride 했을 수 있으므로 무효화
                 OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
                 invalidateScoreHandles();   // 13차: 바닐라가 scoreboard reset/remove 했을 수 있음
+                NAME_GEN++;                 // 22차: 바닐라가 /team·CustomName 을 바꿨을 수 있음
             }
             if ((cls & CMD_RELOADS) != 0) FN_CACHE.clear();   // reload/datapack — 함수 핸들 재해소
         } catch (Exception ex) {
@@ -3838,6 +3879,7 @@ public final class KfcGen {
             // 따라서 브릿지 직후 스냅샷/타입버킷을 무효화해 다음 접근 때 live 월드에서 재빌드시킨다.
             ENTITY_GEN++;
             invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
+            NAME_GEN++;                 // 22차: 브릿지가 /team·CustomName 을 바꿨을 수 있음
         } catch (Exception ex) {
             // 폴백 실행 실패는 조용히 삼키지 않는다 — 원본이라면 함수가 '실행'됐을 상황이므로
             // 실패는 변환기/환경 문제다. 진단 가능하도록 로그를 남긴다.
@@ -3880,6 +3922,7 @@ public final class KfcGen {
             ENTITY_GEN++;   // 브릿지가 summon/kill 했을 수 있으므로 스냅샷/타입버킷 무효화(위 설명 참조)
             OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
             invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
+            NAME_GEN++;                 // 22차: 브릿지가 /team·CustomName 을 바꿨을 수 있음
         } catch (Exception ex) {
             System.err.println("[KFC-BRIDGE-ERROR] " + functionId + ": " + ex);
         }

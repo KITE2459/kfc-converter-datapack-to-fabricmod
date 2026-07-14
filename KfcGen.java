@@ -333,6 +333,7 @@ public final class KfcGen {
                 HANDLE_RECON_TICK = t;
                 invalidateScoreHandles();
             }
+            snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
         return c;
     }
@@ -3801,6 +3802,7 @@ public final class KfcGen {
      *  source 를 그대로 써서 같은 함수 내 다른 명령과 피드백/권한 동작을 일치시킨다. */
     public static void runCommand(net.minecraft.server.command.ServerCommandSource source, String command) {
         try {
+            snapBarrierAll();   // 23차: 바닐라 실행이 storage 를 변이할 수 있음 — 바인드 스냅샷 실체화
             source.getServer().getCommandManager().executeWithPrefix(source, command);
             // 선별적 무효화(#11): 명령 문자열은 변환 시점 상수 — 첫 토큰으로 분류해
             // 엔티티 집합/태그/탑승/objective 에 영향을 줄 수 없는 명령은 GEN 스래싱을 생략.
@@ -3868,6 +3870,7 @@ public final class KfcGen {
             net.minecraft.command.ReturnValueConsumer consumer = new net.minecraft.command.ReturnValueConsumer() {
                 public void onResult(boolean success, int value) { ret[0] = value; }
             };
+            snapBarrierAll();   // 23차: 브릿지가 storage 를 변이할 수 있음 — 바인드 스냅샷 실체화
             net.minecraft.server.command.CommandManager.callWithContext(source, (context) -> {
                 net.minecraft.command.CommandExecutionContext.enqueueProcedureCall(
                         context, procedure, source, consumer);
@@ -3913,6 +3916,7 @@ public final class KfcGen {
                 // 바닐라는 이 경우 함수를 실행하지 않으므로(인자 획득 실패) 조용히 스킵 — 에러 스팸 방지.
                 return;
             }
+            snapBarrierAll();   // 23차: 브릿지가 storage 를 변이할 수 있음 — 바인드 스냅샷 실체화
             net.minecraft.server.command.CommandManager.callWithContext(source, (context) -> {
                 net.minecraft.command.CommandExecutionContext.enqueueProcedureCall(
                         context, procedure, source,
@@ -6588,6 +6592,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void storagePutNumber(net.minecraft.server.MinecraftServer server, String id,
                                         String path, double value, String type) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
         if (root == null) root = new net.minecraft.nbt.NbtCompound();
         if (putAtPath(root, path, numberNbt(type, value))) storageSave(server, id, root);  // NbtPath
@@ -6597,6 +6602,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  값 파싱은 `{v:<snbt>}` 로 감싸 readCompound — 리스트/문자열/컴파운드/숫자 전부 합법. */
     public static void storagePutSnbt(net.minecraft.server.MinecraftServer server, String id,
                                       String path, String snbt, String mode) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -6628,6 +6634,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  범위 밖(index > size)은 바닐라와 동일하게 실패(no-op). 음수 인덱스는 emit 단계에서 폴백. */
     public static void storageInsertSnbt(net.minecraft.server.MinecraftServer server, String id,
                                          String path, int index, String snbt) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             net.minecraft.nbt.NbtCompound w0 =
                     net.minecraft.nbt.StringNbtReader.readCompound("{v:" + snbt + "}");
@@ -6655,6 +6662,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  append/prepend/merge 는 기존 changed 시맨틱과 동일. */
     public static boolean storagePutSnbtChanged(net.minecraft.server.MinecraftServer server, String id,
                                                 String path, String snbt, String mode) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
                 try {
@@ -6739,6 +6747,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  '병합 결과가 원본과 같으면 실패(0)'. */
     public static boolean storageMergeSnbtChanged(net.minecraft.server.MinecraftServer server,
                                                   String id, String snbt) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
                 try { return net.minecraft.nbt.StringNbtReader.readCompound(s); }
@@ -6787,6 +6796,7 @@ public static net.minecraft.entity.Entity firstEntity(
     }
 
     public static void storageMergeSnbt(net.minecraft.server.MinecraftServer server, String id, String snbt) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
                 try { return net.minecraft.nbt.StringNbtReader.readCompound(s); }
@@ -6800,6 +6810,7 @@ public static net.minecraft.entity.Entity firstEntity(
     }
 
     public static void storageRemovePath(net.minecraft.server.MinecraftServer server, String id, String path) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
         if (root == null) return;
         net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(path);  // 인덱스/필터 경로 정확
@@ -7087,6 +7098,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  파싱/조회만 생략). tmpl==null(원본 SNBT_INVALID 대응)이면 무동작 — String 판과 동일. */
     public static void storagePutSnbt(net.minecraft.server.MinecraftServer server, String id,
                                       String path, net.minecraft.nbt.NbtElement tmpl, String mode) {
+        snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         if (tmpl == null) return;
         try {
             net.minecraft.nbt.NbtElement val = tmpl.copy();
@@ -7602,7 +7614,11 @@ public static net.minecraft.entity.Entity firstEntity(
         // (Macro.withMacroReplaced)에 그대로 넘겨, 우리 문자열화(nbtToMacroString)에 의존하지 않고
         // 바닐라 자체 Macro.toString 으로 치환한다 → 폴백이 바닐라와 완전 동일(미래 MC 포맷 변화에도 자동 추종).
         private final java.util.HashMap<String, net.minecraft.nbt.NbtElement> bindEls = new java.util.HashMap<>();
-        SnapMacroArgs(net.minecraft.nbt.NbtCompound c) {
+        // 23차: copy-on-write — 비스칼라도 '참조'로 보관하고, 소스 storage 가 변이되기 직전에만
+        // snapBarrier 가 materialize()(그때 1회 복사)를 호출한다. 변이가 없으면 복사 0.
+        private boolean matz;   // true = 실체화 완료(또는 불필요) — 이후 참조가 안전
+        SnapMacroArgs(net.minecraft.nbt.NbtCompound c, String srcStorageId) {
+            boolean hasComposite = false;
             for (String k : c.getKeys()) {
                 net.minecraft.nbt.NbtElement el = c.get(k);
                 if (el == null) continue;
@@ -7611,10 +7627,28 @@ public static net.minecraft.entity.Entity firstEntity(
                     resolved.put(k, nbtToMacroString(el));     // 스칼라: 즉시 스냅샷(원본과 동일)
                     bindEls.put(k, el);                        // NBT 스칼라는 불변 — 참조 스냅샷으로 충분
                 } else {
-                    net.minecraft.nbt.NbtElement snap = el.copy();   // 비스칼라: 바인드 시점 깊은 복사(종전 동일)
-                    pending.put(k, snap);
-                    bindEls.put(k, snap);                      // 동일 스냅샷 공유(양쪽 다 읽기 전용)
+                    pending.put(k, el);                        // 비스칼라: 참조 보관(23차 — 복사는 장벽에서)
+                    bindEls.put(k, el);
+                    hasComposite = true;
                 }
+            }
+            // entity/block 소스(srcStorageId=null)는 원본이 제자리 변이되지 않아 실체화 불필요.
+            this.matz = !hasComposite || srcStorageId == null;
+            if (!this.matz) {
+                SNAP_PENDING.computeIfAbsent(srcStorageId, k2 -> new java.util.ArrayList<>()).add(this);
+            }
+        }
+        /** 소스 storage 변이 직전 1회 — 비스칼라 참조를 바인드 시점 값의 복사본으로 교체. */
+        void materialize() {
+            if (matz) return;
+            matz = true;
+            for (java.util.Map.Entry<String, net.minecraft.nbt.NbtElement> en : bindEls.entrySet()) {
+                net.minecraft.nbt.NbtElement v = en.getValue();
+                if (v instanceof net.minecraft.nbt.NbtString
+                        || v instanceof net.minecraft.nbt.AbstractNbtNumber) continue;
+                net.minecraft.nbt.NbtElement cp = v.copy();
+                en.setValue(cp);
+                if (pending.get(en.getKey()) == v) pending.put(en.getKey(), cp);
             }
         }
         /** 브릿지용 — 바인드 시점 원본 타입 NBT 의 복사본(키별 스냅샷 재조립, 종전 bindSnapshot.copy() 와 값 동일). */
@@ -7642,22 +7676,40 @@ public static net.minecraft.entity.Entity firstEntity(
         }
     }
 
-    private static java.util.Map<String, String> compoundToMacroArgs(net.minecraft.nbt.NbtCompound c) {
+    // ── 23차: 미실체화 바인드 스냅샷 레지스트리(소스 storage id 별) ──
+    // 변이 헬퍼가 해당 id 의 스냅샷만 실체화한다(타 storage 쓰기는 무관 — 낭비 복사 없음).
+    // 브릿지/디스패처(바닐라 /data 가능)와 틱 경계(콘솔 개입 수렴)는 전체 실체화.
+    private static final java.util.HashMap<String, java.util.ArrayList<SnapMacroArgs>> SNAP_PENDING =
+            new java.util.HashMap<>();
+    private static void snapBarrier(String id) {
+        if (SNAP_PENDING.isEmpty()) return;
+        java.util.ArrayList<SnapMacroArgs> l = SNAP_PENDING.remove(id);
+        if (l != null) for (int i = 0; i < l.size(); i++) l.get(i).materialize();
+    }
+    private static void snapBarrierAll() {
+        if (SNAP_PENDING.isEmpty()) return;
+        for (java.util.ArrayList<SnapMacroArgs> l : SNAP_PENDING.values())
+            for (int i = 0; i < l.size(); i++) l.get(i).materialize();
+        SNAP_PENDING.clear();
+    }
+
+    private static java.util.Map<String, String> compoundToMacroArgs(net.minecraft.nbt.NbtCompound c,
+                                                                     String srcStorageId) {
         if (c == null) return new java.util.HashMap<>();
-        return new SnapMacroArgs(c);
+        return new SnapMacroArgs(c, srcStorageId);
     }
 
     /** function X with storage <id> — 스토리지 루트 컴파운드의 각 필드 → 매크로 인자. */
     public static java.util.Map<String, String> storageMacroArgs(
             net.minecraft.server.MinecraftServer server, String id) {
-        return compoundToMacroArgs(storageRoot(server, id));
+        return compoundToMacroArgs(storageRoot(server, id), id);
     }
 
     /** function X with storage <id> <path> — 경로 하위 컴파운드 → 매크로 인자. */
     public static java.util.Map<String, String> storageMacroArgs(
             net.minecraft.server.MinecraftServer server, String id, String path) {
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
-        return compoundToMacroArgs(compoundAt(root, path));
+        return compoundToMacroArgs(compoundAt(root, path), id);
     }
 
     /** function X with entity @s <path> — 엔티티 NBT 경로 하위 컴파운드 → 매크로 인자. */
@@ -7665,8 +7717,8 @@ public static net.minecraft.entity.Entity firstEntity(
             net.minecraft.entity.Entity e, String path) {
         if (e == null) return new java.util.HashMap<>();
         net.minecraft.nbt.NbtCompound nbt = entitySnapshot(e);
-        if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt);
-        return compoundToMacroArgs(compoundAt(nbt, path));
+        if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt, null);
+        return compoundToMacroArgs(compoundAt(nbt, path), null);
     }
 
     /** function X with block <pos> [<path>] — 블록 엔티티 NBT → 매크로 인자. */
@@ -7676,8 +7728,8 @@ public static net.minecraft.entity.Entity firstEntity(
         net.minecraft.block.entity.BlockEntity be = world.getBlockEntity(pos);
         if (be == null) return new java.util.HashMap<>();
         net.minecraft.nbt.NbtCompound nbt = be.createNbt(world.getRegistryManager());
-        if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt);
-        return compoundToMacroArgs(compoundAt(nbt, path));
+        if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt, null);
+        return compoundToMacroArgs(compoundAt(nbt, path), null);
     }
 
     /** 점 표기 경로의 컴파운드를 반환(없으면 null). 마지막 키가 가리키는 값이 컴파운드여야 함. */

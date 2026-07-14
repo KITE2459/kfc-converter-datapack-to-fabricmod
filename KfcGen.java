@@ -348,12 +348,27 @@ public final class KfcGen {
     private static int  SNAP_TICK = Integer.MIN_VALUE;
     private static long SNAP_GEN  = -1;
     private static java.util.List<net.minecraft.entity.Entity> SNAP_ENTITIES;
+    // 17차: 로드된 개체군의 순서무관 지문(엔티티별 identityHash 혼합값의 합). 스냅샷 재구축
+    // 루프에서 공짜로 계산되고, snapAdd/snapRemove 가 ± 증분 유지한다. 훅 밖 유입/제거
+    // (청크 로드/언로드, 바닐라 스폰/사망)는 이 지문으로만 드러난다 — tagBucket 드리프트 감지용.
+    private static long SNAP_FP = 0;
+    private static long _entFp(net.minecraft.entity.Entity e) {
+        long h = System.identityHashCode(e);
+        h *= 0x9E3779B97F4A7C15L;                 // 혼합(합 충돌 완화) — 순서무관 합산용
+        return h ^ (h >>> 32) | 1L;               // 홀수화: 0 기여 방지(개수 변화도 반영)
+    }
     public static java.util.List<net.minecraft.entity.Entity> entitiesSnapshot(GameContext ctx) {
         int t = ctx.server.getTicks();
         if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
             java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>();
-            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) if (e != null) list.add(e);
-            SNAP_ENTITIES = list; SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
+            long fp = 0;
+            for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
+                if (e == null) continue;
+                list.add(e);
+                fp += _entFp(e);
+            }
+            SNAP_ENTITIES = list; SNAP_FP = fp;
+            SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
         }
         return SNAP_ENTITIES;
     }
@@ -397,7 +412,11 @@ public final class KfcGen {
         // snapAdd 가 SNAP_GEN = ENTITY_GEN 으로 스냅샷을 다시 '유효' 표시 → 모델(block_display +
         // N item_display)이 빠진 스냅샷이 그 틱 내내 굳어 loop-player-head 가 0개로 관측됐다.
         SNAP_ENTITIES.add(e);
-        for (net.minecraft.entity.Entity p : e.getPassengersDeep()) SNAP_ENTITIES.add(p);
+        SNAP_FP += _entFp(e);                                       // 17차: 지문 증분 동기
+        for (net.minecraft.entity.Entity p : e.getPassengersDeep()) {
+            SNAP_ENTITIES.add(p);
+            SNAP_FP += _entFp(p);
+        }
         SNAP_GEN = ENTITY_GEN;               // 엔티티+탑승자 전부 반영 → 현재 gen 으로 '유효' 표시
     }
     /** 탑승 깊이(= 위에 쌓인 차량 수). 차량 0, 그 위 탑승자 1, 또 위 2 … */
@@ -492,7 +511,7 @@ public final class KfcGen {
         // 단일 제거. discard 된 차량의 탑승자는 분리(dismount)되어 월드에 남으므로 스냅샷에서 빼지 않는다.
         // 탑승자도 함께 kill 되는 경우엔 각 엔티티가 자기 snapRemove 호출을 받는다.
         // (과거 'if (e.hasPassengers()) return;' 은 SNAP_GEN 을 stale 로 남겨 snapAdd 와 동일한 버그를 유발.)
-        SNAP_ENTITIES.remove(e);
+        if (SNAP_ENTITIES.remove(e)) SNAP_FP -= _entFp(e);          // 17차: 지문 증분 동기
         SNAP_GEN = ENTITY_GEN;
     }
 
@@ -607,6 +626,7 @@ public final class KfcGen {
     // 14차: 틱 간 증분 유지용 외부-드리프트 감지 상태.
     private static int  TB_PLN = -1, TB_PLH = 0;            // 플레이어 목록 지문(수 + identity 합)
     private static int  TB_RECON_TICK = Integer.MIN_VALUE;  // 주기 화해 스탬프
+    private static long TB_FP = Long.MIN_VALUE;             // 17차: 버킷이 마지막으로 본 개체군 지문
     // TAG_BUCKETS 가 clear 될 때마다(=틱/gen/서버 변화 rebuild, NBT 리로드 태그변경) 증가.
     // 정적 승격된 Tags 핸들(pass-4)이 (서버,틱,gen,epoch) 4-스탬프가 모두 일치할 때만
     // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
@@ -625,7 +645,15 @@ public final class KfcGen {
             for (int i = 0; i < pn; i++) ph += System.identityHashCode(pl.get(i));
             boolean drift = (pn != TB_PLN || ph != TB_PLH);
             TB_PLN = pn; TB_PLH = ph;
-            if (drift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
+            // 17차: 개체군 지문 대조 — 청크 로드/언로드·바닐라 스폰/사망처럼 snapAdd/snapRemove
+            // 훅을 거치지 않는 개체군 변화를 그 틱에 감지해 재구축한다(바닐라 동등 ≤1틱 가시성).
+            // [버그 이력] enter-room 의 forceload 로 로드된 track-main 등 태그 엔티티가 버킷에
+            // 누락 → 트랙 선택룸 UI 가 다음 ENTITY_GEN 범프까지(1~2초) 무반응이었다.
+            // 훅 경유 변화(경주 중 스폰/킬)는 지문이 동기 유지되어 재구축을 유발하지 않는다.
+            entitiesSnapshot(ctx);                    // 이 틱 스냅샷/지문 확정(첫 접근 시 재구축)
+            boolean popDrift = (SNAP_FP != TB_FP);
+            TB_FP = SNAP_FP;
+            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
                 TB_RECON_TICK = tk;
                 TAG_BUCKETS.clear(); TB_EPOCH++;
             }
@@ -652,7 +680,10 @@ public final class KfcGen {
         // 부재 태그도 '빈 버킷'을 맵에 삽입해 반환 — 종전 lazy-cache 와 동일 계약.
         // (Tags 정적 핸들 등이 버킷 '참조'를 스탬프 기간 동안 보관하므로, 같은 틱 내 addTag 가
         //  '같은 리스트 객체'에 append 되어야 캐시된 참조가 최신 상태를 본다.)
-        return TAG_BUCKETS.computeIfAbsent(tag, k2 -> new java.util.ArrayList<>());
+        // 16차: 적중(대다수) 경로는 get 으로 처리 — computeIfAbsent 의 함수형 디스패치/노드
+        // 처리 비용(스파크 0.41%p 중 질의분)을 미스 시에만 지불한다. 삽입 계약은 동일.
+        java.util.ArrayList<net.minecraft.entity.Entity> hit = TAG_BUCKETS.get(tag);
+        return hit != null ? hit : TAG_BUCKETS.computeIfAbsent(tag, k2 -> new java.util.ArrayList<>());
     }
 
     /** 거리상한(박스) 스캔용 후보: 양성 태그 버킷이 충분히 작을 때만 반환(그 외 null → 섹션 스캔 유지).
@@ -5787,9 +5818,18 @@ public static net.minecraft.entity.Entity firstEntity(
     private static final java.util.Map<net.minecraft.entity.Entity, NbtSnap> ENTITY_NBT_SNAP =
             java.util.Collections.synchronizedMap(new java.util.WeakHashMap<net.minecraft.entity.Entity, NbtSnap>());
 
-    /** 엔티티 writeNbt 스냅샷(현재 틱·미변경이면 재사용). 읽기 전용으로만 사용 — 변형 금지. */
+    /** 엔티티 writeNbt 스냅샷(현재 틱·미변경이면 재사용). 읽기 전용으로만 사용 — 변형 금지.
+     *  [버그 이력·16차] interaction 엔티티는 캐시 제외. InteractionEntity.tick() 은 빈 메서드라
+     *  (바이트코드: return 1줄) age 가 영원히 불변 → 'age 변화 = 틱 경계 무효화' 불변식이 깨져
+     *  스냅샷이 무기한 유효했다. 그런데 클릭 데이터(interaction.attack/player)는 바닐라가 우리
+     *  쓰기 훅 밖에서 기록하므로 캐시에 가려져, 온디맨드 소환 UI(트랙 선택룸)의 첫 클릭이
+     *  ENTITY_GEN 이 우연히 오를 때까지(로비에서 1~2초) 무시됐다(상시 소환 사운드룸은 주변
+     *  시스템의 잦은 무효화로 증상이 안 보였을 뿐 같은 결함). interaction 은 NBT 표면이 작고
+     *  (width/height/response/attack/interaction) UI 폴링에서만 읽혀 fresh writeNbt 비용이 미미하다.
+     *  (marker 등 다른 무틱 엔티티는 바닐라발 NBT 변이 경로가 없어 — 클릭류 기록은 interaction
+     *  전용 메커니즘 — 종전 캐시 유지가 안전하다. 우리 쓰기는 전부 invalidateSnapshot 경유.) */
     private static net.minecraft.nbt.NbtCompound entitySnapshot(net.minecraft.entity.Entity e) {
-        if (ENTITY_READ_CACHE) {
+        if (ENTITY_READ_CACHE && !(e instanceof net.minecraft.entity.decoration.InteractionEntity)) {
             NbtSnap s = ENTITY_NBT_SNAP.get(e);
             if (s != null && s.age == e.age && s.gen == ENTITY_GEN) return s.nbt;
             net.minecraft.nbt.NbtCompound n = new net.minecraft.nbt.NbtCompound();

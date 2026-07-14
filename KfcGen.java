@@ -2315,7 +2315,10 @@ public final class KfcGen {
             // 함수 사이에 움직였으면 위치가 달라 자동 미스(정확성은 구조적으로 보존).
             Object[] veh = (t != null) ? ONP_VEH.get(e) : null;
             if (veh != null && _tplEq((Object[]) veh[0], t)) {
-                out = (java.util.List<net.minecraft.server.command.ServerCommandSource>) veh[1];
+                @SuppressWarnings("unchecked")   // ONP_VEH 값은 이 메서드만 기록 — 타입 불변
+                java.util.List<net.minecraft.server.command.ServerCommandSource> shared =
+                        (java.util.List<net.minecraft.server.command.ServerCommandSource>) veh[1];
+                out = shared;
             } else {
                 java.util.ArrayList<net.minecraft.server.command.ServerCommandSource> tmp =
                         new java.util.ArrayList<>(ps.size());
@@ -2702,12 +2705,252 @@ public final class KfcGen {
         }
     }
 
+    /** NbtComponent 내부 컴파운드 읽기 전용 참조 — copyNbt(딥카피) 회피용.
+     *  deprecated 억제를 이 한 곳으로 고립한다(변형 금지 계약은 호출측 주석 참조). */
+    @SuppressWarnings("deprecation")
+    private static net.minecraft.nbt.NbtCompound kfc$nbtOf(net.minecraft.component.type.NbtComponent nc) {
+        return nc.getNbt();
+    }
+
     /** 텍스트 컴포넌트 JSON → Text. 실패 시 null. */
     public static net.minecraft.text.Text parseText(net.minecraft.server.MinecraftServer server, String json) {
         try {
             return net.minecraft.text.Text.Serialization.fromJson(json, server.getRegistryManager());
         } catch (Exception ex) {
             return null;
+        }
+    }
+
+    // ──────────── 24차: 동적 텍스트(숫자 hole) 런타임 템플릿 ────────────
+    // 생성 코드가 매크로 값을 concat 한 텍스트(예: {translate:"m:ss.cc",...})는 매 틱 새
+    // 문자열이라 TEXT_CACHE 가 무력하고 packrat 풀 파싱이 반복된다. 숫자 런을 마스킹한
+    // '형태 키'(digit-run → \u0001)당 센티널 2조 파싱으로 hole 잎(plain 문자열 / translate
+    // 키)을 diff 로 찾아 골격을 만들고, 이후 호출은 hole 잎만 재조립한다.
+    // 미지원(스타일 diff = 스타일 내 숫자, translatable 인자 diff, 비문자 leaf, 형제 수 불일치,
+    // 센티널 모호)은 구성 단계에서 영구 풀-파싱. 최초 2회는 실파싱과 equals 자기검증.
+    // 공유 서브트리는 불변 재사용 — TEXT_CACHE 인스턴스 재사용과 동일 계약(읽기 전용).
+    private static final java.util.Map<String, TxtTmpl> TEXT_TMPL = boundedMap(2048);
+    private static final class TxtLeaf {
+        final int[] path; final byte kind;   // kind 0=plain 문자열, 1=translate 키
+        final int[] holes; final String[] segs;
+        TxtLeaf(int[] p, byte k, int[] h, String[] s) { path = p; kind = k; holes = h; segs = s; }
+    }
+    private static final class TxtTmpl {
+        byte state = 0;              // 0=구성전 1=활성 2=영구 풀파싱
+        int verifyLeft = 2;          // 활성 후 실파싱 equals 검증 횟수
+        int k;                       // hole 수
+        net.minecraft.text.Text skeleton;
+        java.util.List<TxtLeaf> leafs;
+        boolean isStatic;            // 형태 불변 — 인스턴스 공통
+        String lastJson;             // 1-슬롯 메모(상수 문자열 지름길)
+        CachedText lastCached;
+    }
+
+    /** json 의 숫자 런 [시작,끝) 목록. */
+    private static java.util.ArrayList<int[]> _digitRuns(String s) {
+        java.util.ArrayList<int[]> runs = new java.util.ArrayList<>();
+        int i = 0, n = s.length();
+        while (i < n) {
+            char c = s.charAt(i);
+            if (c >= '0' && c <= '9') {
+                int j = i + 1;
+                while (j < n && s.charAt(j) >= '0' && s.charAt(j) <= '9') j++;
+                runs.add(new int[]{i, j});
+                i = j;
+            } else i++;
+        }
+        return runs;
+    }
+    private static String _joinRuns(String s, java.util.ArrayList<int[]> runs, String[] fill) {
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        int prev = 0;
+        for (int i = 0; i < runs.size(); i++) {
+            int[] r = runs.get(i);
+            sb.append(s, prev, r[0]).append(fill == null ? "\u0001" : fill[i]);
+            prev = r[1];
+        }
+        sb.append(s, prev, s.length());
+        return sb.toString();
+    }
+    /** packrat(명령 인자 파서) + 구 JSON 폴백 — parseTextResolved 의 파싱 체인과 동일. */
+    private static net.minecraft.text.Text _txtParse(
+            net.minecraft.server.command.ServerCommandSource source, String json) {
+        try {
+            net.minecraft.command.CommandRegistryAccess cra =
+                    net.minecraft.command.CommandRegistryAccess.of(
+                            source.getRegistryManager(), source.getEnabledFeatures());
+            return net.minecraft.command.argument.TextArgumentType.text(cra)
+                    .parse(new com.mojang.brigadier.StringReader(json));
+        } catch (Exception primaryFail) {
+            try {
+                return net.minecraft.text.Text.Serialization.fromJson(json, source.getRegistryManager());
+            } catch (Exception ex) { return null; }
+        }
+    }
+
+    /** 두 파싱 트리의 diff → hole 잎 목록. 미지원 형태면 false. */
+    private static boolean _txtDiff(net.minecraft.text.Text a, net.minecraft.text.Text b,
+                                    java.util.ArrayDeque<Integer> path, String[] s1, String[] s2,
+                                    boolean[] seen, java.util.List<TxtLeaf> out) {
+        if (!a.getStyle().equals(b.getStyle())) return false;   // 스타일 내 숫자(hex 색 등) — 미지원
+        net.minecraft.text.TextContent ca = a.getContent(), cb = b.getContent();
+        if (ca instanceof net.minecraft.text.PlainTextContent pa
+                && cb instanceof net.minecraft.text.PlainTextContent pb) {
+            String va = pa.string(), vb = pb.string();
+            if (!va.equals(vb) && !_txtLeaf(va, vb, path, (byte) 0, s1, s2, seen, out)) return false;
+        } else if (ca instanceof net.minecraft.text.TranslatableTextContent ta
+                && cb instanceof net.minecraft.text.TranslatableTextContent tb) {
+            if (!java.util.Objects.equals(ta.getFallback(), tb.getFallback())) return false;
+            Object[] aa = ta.getArgs(), ba = tb.getArgs();
+            if (aa.length != ba.length) return false;
+            for (int i = 0; i < aa.length; i++) if (!java.util.Objects.equals(aa[i], ba[i])) return false;
+            String ka = ta.getKey(), kb = tb.getKey();
+            if (!ka.equals(kb) && !_txtLeaf(ka, kb, path, (byte) 1, s1, s2, seen, out)) return false;
+        } else if (!ca.equals(cb)) {
+            return false;   // 그 외 콘텐츠에 hole — 미지원(score/selector/nbt/keybind 등)
+        }
+        java.util.List<net.minecraft.text.Text> sa = a.getSiblings(), sb2 = b.getSiblings();
+        if (sa.size() != sb2.size()) return false;
+        for (int i = 0; i < sa.size(); i++) {
+            path.addLast(i);
+            boolean ok = _txtDiff(sa.get(i), sb2.get(i), path, s1, s2, seen, out);
+            path.removeLast();
+            if (!ok) return false;
+        }
+        return true;
+    }
+    /** 문자열 leaf 의 센티널 분해(SnbtTmplN 과 동일 규칙). */
+    private static boolean _txtLeaf(String va, String vb, java.util.ArrayDeque<Integer> path,
+                                    byte kind, String[] s1, String[] s2,
+                                    boolean[] seen, java.util.List<TxtLeaf> out) {
+        if (va.length() != vb.length()) return false;
+        int k = s1.length;
+        java.util.ArrayList<int[]> occ = new java.util.ArrayList<>();
+        for (int i = 0; i < k; i++) {
+            int ia = va.indexOf(s1[i]);
+            if (ia < 0) continue;
+            if (ia != va.lastIndexOf(s1[i])) return false;
+            if (!vb.startsWith(s2[i], ia) || vb.indexOf(s2[i]) != ia || vb.lastIndexOf(s2[i]) != ia) return false;
+            if (seen[i]) return false;
+            occ.add(new int[]{ia, i});
+        }
+        if (occ.isEmpty()) return false;
+        occ.sort((x, y) -> Integer.compare(x[0], y[0]));
+        int n = occ.size();
+        int[] holes = new int[n];
+        String[] segs = new String[n + 1];
+        int prev = 0;
+        for (int oi = 0; oi < n; oi++) {
+            int pos = occ.get(oi)[0], hole = occ.get(oi)[1];
+            if (pos < prev) return false;
+            holes[oi] = hole;
+            segs[oi] = va.substring(prev, pos);
+            prev = pos + s1[hole].length();
+        }
+        segs[n] = va.substring(prev);
+        if (!vb.endsWith(segs[n])) return false;
+        for (int oi = 0; oi < n; oi++) seen[holes[oi]] = true;
+        int[] pth = new int[path.size()];
+        int pi = 0;
+        for (Integer x : path) pth[pi++] = x;
+        out.add(new TxtLeaf(pth, kind, holes, segs));
+        return true;
+    }
+    /** 골격을 vals 로 재조립 — hole 경로만 새 노드, 나머지 서브트리는 공유. */
+    private static net.minecraft.text.Text _txtRebuild(net.minecraft.text.Text n,
+                                                       java.util.List<TxtLeaf> leafs, int depth,
+                                                       String[] vals) {
+        TxtLeaf here = null;
+        boolean below = false;
+        for (int i = 0; i < leafs.size(); i++) {
+            TxtLeaf l = leafs.get(i);
+            if (l.path.length == depth) here = l;
+            else below = true;
+        }
+        if (here == null && !below) return n;
+        net.minecraft.text.TextContent content = n.getContent();
+        if (here != null) {
+            StringBuilder sb = new StringBuilder(here.segs[0]);
+            for (int oi = 0; oi < here.holes.length; oi++)
+                sb.append(vals[here.holes[oi]]).append(here.segs[oi + 1]);
+            String nv = sb.toString();
+            if (here.kind == 0) {
+                content = net.minecraft.text.PlainTextContent.of(nv);
+            } else {
+                net.minecraft.text.TranslatableTextContent tc =
+                        (net.minecraft.text.TranslatableTextContent) content;
+                content = new net.minecraft.text.TranslatableTextContent(nv, tc.getFallback(), tc.getArgs());
+            }
+        }
+        net.minecraft.text.MutableText m = net.minecraft.text.MutableText.of(content);
+        m.setStyle(n.getStyle());
+        java.util.List<net.minecraft.text.Text> sibs = n.getSiblings();
+        for (int i = 0; i < sibs.size(); i++) {
+            java.util.ArrayList<TxtLeaf> sub = null;
+            for (int j = 0; j < leafs.size(); j++) {
+                TxtLeaf l = leafs.get(j);
+                if (l.path.length > depth && l.path[depth] == i) {
+                    if (sub == null) sub = new java.util.ArrayList<>(2);
+                    sub.add(l);
+                }
+            }
+            m.append(sub == null ? sibs.get(i) : _txtRebuild(sibs.get(i), sub, depth + 1, vals));
+        }
+        return m;
+    }
+
+    /** 동적(숫자 포함) 문자열의 템플릿 해석. 불가/미검증 실패면 null(호출측 풀 파싱). */
+    private static CachedText txtTmplTry(net.minecraft.server.command.ServerCommandSource source,
+                                         String json) {
+        try {
+            java.util.ArrayList<int[]> runs = _digitRuns(json);
+            int k = runs.size();
+            if (k == 0 || k > 20) return null;
+            String masked = _joinRuns(json, runs, null);
+            TxtTmpl t = TEXT_TMPL.get(masked);
+            if (t == null) {
+                t = new TxtTmpl();
+                TEXT_TMPL.put(masked, t);
+            }
+            if (t.state == 2) return null;
+            if (t.state == 0) {                     // 형태당 1회 구성
+                t.state = 2;                        // 실패 기본값(fail-closed) — 성공 시에만 1
+                if (k > 0) {
+                    String[] s1 = new String[k], s2 = new String[k];
+                    for (int i = 0; i < k; i++) { s1[i] = Integer.toString(101 + i); s2[i] = Integer.toString(201 + i); }
+                    net.minecraft.text.Text a = _txtParse(source, _joinRuns(json, runs, s1));
+                    net.minecraft.text.Text b = _txtParse(source, _joinRuns(json, runs, s2));
+                    if (a != null && b != null) {
+                        java.util.List<TxtLeaf> leafs = new java.util.ArrayList<>();
+                        boolean[] seen = new boolean[k];
+                        if (_txtDiff(a, b, new java.util.ArrayDeque<>(), s1, s2, seen, leafs)) {
+                            boolean all = true;
+                            for (int i = 0; i < k; i++) if (!seen[i]) { all = false; break; }
+                            if (all) {
+                                t.k = k; t.skeleton = a; t.leafs = leafs;
+                                t.isStatic = isStaticText(a);
+                                t.state = 1;
+                            }
+                        }
+                    }
+                }
+                if (t.state != 1) return null;
+            }
+            if (t.k != k) return null;              // 형태 키 충돌 방어(이론상 불가)
+            if (json.equals(t.lastJson)) return t.lastCached;   // 상수 문자열 지름길(1-슬롯)
+            String[] vals = new String[k];
+            for (int i = 0; i < k; i++) vals[i] = json.substring(runs.get(i)[0], runs.get(i)[1]);
+            net.minecraft.text.Text patched = _txtRebuild(t.skeleton, t.leafs, 0, vals);
+            if (t.verifyLeft > 0) {                 // 최초 2회 — 실파싱과 equals 자기검증
+                net.minecraft.text.Text truth = _txtParse(source, json);
+                if (truth == null || !patched.equals(truth)) { t.state = 2; return null; }
+                t.verifyLeft--;
+            }
+            CachedText ct = new CachedText(patched, t.isStatic);
+            t.lastJson = json; t.lastCached = ct;
+            return ct;
+        } catch (Exception ex) {
+            return null;                            // 어떤 예외든 풀 파싱 폴백
         }
     }
 
@@ -2723,6 +2966,7 @@ public final class KfcGen {
         // separator 컴포넌트가 바닐라와 미묘하게 달라 외부 HUD 모드가 인식하지 못했음.)
         try {
             CachedText cached = TEXT_CACHE.get(json);
+            if (cached == null) cached = txtTmplTry(source, json);   // 24차: 동적(숫자 hole) 문자열 — 형태 키 템플릿
             if (cached == null) {
                 net.minecraft.text.Text parsed;
                 try {
@@ -5519,7 +5763,8 @@ public static net.minecraft.entity.Entity firstEntity(
                 });
                 if (!(exp instanceof net.minecraft.nbt.NbtCompound expected)) return false;
                 // matches 는 읽기 전용 — copyNbt(전체 딥카피) 대신 내부 컴파운드 직접 참조.
-                if (!net.minecraft.nbt.NbtHelper.matches(expected, nc.getNbt(), true)) return false;
+                // (getNbt 의 deprecated 는 '변형 금지' 경고 — 여기선 읽기만 하므로 의도적 사용.)
+                if (!net.minecraft.nbt.NbtHelper.matches(expected, kfc$nbtOf(nc), true)) return false;
             } catch (Exception ex) { return false; }
         }
         return true;

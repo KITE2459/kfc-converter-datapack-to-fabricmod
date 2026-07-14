@@ -7193,14 +7193,22 @@ public static net.minecraft.entity.Entity firstEntity(
         final boolean wrap;
         final boolean ok;
         final net.minecraft.nbt.NbtElement skeleton;
-        final String[][] paths;              // hole i → compound 키 경로
-        // 15차: hole i 의 종류(0=수치/1=문자열)와 문자열 슬롯의 전후 조각.
-        final byte[] kinds; final String[] sPre, sSuf;
+        // 18차: leaf 단위 patch unit — 한 leaf 가 여러 hole 을 담을 수 있다(문자열 leaf).
+        //   kinds[u]  : 0=수치 1-hole leaf / 1=문자열 leaf(다중 hole, 세그먼트 재조립)
+        //   paths[u]  : leaf 까지의 compound 키 경로(길이 0 = 루트 전체)
+        //   holeIdx[u]: 이 leaf 에 박힌 hole 번호들(등장 위치순)
+        //   segs[u]   : 상수 세그먼트(holeIdx.length+1 개) — leaf 값 = seg0+val+seg1+val+...
+        final String[][] paths;
+        final byte[] kinds;
+        final int[][] holeIdx;
+        final String[][] segs;
+        final byte[] holeKind;               // hole i → 0(수치)/1(문자열) — patchN 가드용
 
         SnbtTmplN(boolean wrap, String[] lits) {
             this.lits = lits; this.wrap = wrap;
-            boolean okv = false; net.minecraft.nbt.NbtElement sk = null; String[][] pth = null;
-            byte[] kdA = null; String[] spA = null, ssA = null;
+            boolean okv = false; net.minecraft.nbt.NbtElement sk = null;
+            String[][] pth = null; byte[] kdA = null; int[][] hiA = null; String[][] sgA = null;
+            byte[] hkA = null;
             try {
                 int k = lits.length - 1;
                 String[] s1 = new String[k], s2 = new String[k];
@@ -7210,41 +7218,75 @@ public static net.minecraft.entity.Entity firstEntity(
                 if (a != null && b != null) {
                     java.util.List<java.util.List<String>> diffs = new java.util.ArrayList<>();
                     SnbtTmpl._collectDiffs(a, b, new java.util.ArrayDeque<>(), diffs);
-                    if (diffs.size() == k) {
-                        String[][] byHole = new String[k][];
-                        byte[] kd = new byte[k]; String[] sp = new String[k], ss = new String[k];
+                    int u = diffs.size();
+                    if (u >= 1 && u <= k) {
+                        String[][] ps = new String[u][];
+                        byte[] kd = new byte[u];
+                        int[][] hi = new int[u][];
+                        String[][] sg = new String[u][];
+                        byte[] hk = new byte[k];
+                        boolean[] seen = new boolean[k];
                         boolean map = true;
+                        int ui = 0;
                         for (java.util.List<String> dp : diffs) {
-                            String[] p = dp.toArray(new String[0]);
-                            net.minecraft.nbt.NbtElement la = SnbtTmpl._leafAt(a, p);
-                            net.minecraft.nbt.NbtElement lb = SnbtTmpl._leafAt(b, p);
-                            int hole = -1; byte hk = 0; String hsp = null, hss = null;
-                            if (la instanceof net.minecraft.nbt.AbstractNbtNumber num) {
-                                hole = (int) Math.round(num.doubleValue()) - 101;   // 센티널 → hole 번호
+                            String[] pp = dp.toArray(new String[0]);
+                            net.minecraft.nbt.NbtElement la = SnbtTmpl._leafAt(a, pp);
+                            net.minecraft.nbt.NbtElement lb = SnbtTmpl._leafAt(b, pp);
+                            if (la instanceof net.minecraft.nbt.AbstractNbtNumber num
+                                    && lb instanceof net.minecraft.nbt.AbstractNbtNumber) {
+                                int hole = (int) Math.round(num.doubleValue()) - 101;   // 센티널 → hole 번호
+                                if (hole < 0 || hole >= k || seen[hole]) { map = false; break; }
+                                seen[hole] = true;
+                                ps[ui] = pp; kd[ui] = 0; hi[ui] = new int[]{hole};
+                                sg[ui] = null; hk[hole] = 0;
                             } else if (la instanceof net.minecraft.nbt.NbtString
                                     && lb instanceof net.minecraft.nbt.NbtString) {
-                                // 15차: 문자열 슬롯 — 정확히 한 sentinel 만 유일 출현+전후 일치.
+                                // 18차: 문자열 leaf — 등장하는 모든 sentinel 을 위치순으로 수집해
+                                // (hole 목록, 상수 세그먼트) 로 분해한다. 각 sentinel 은 전체 템플릿에서
+                                // 1회만, b-파싱과 같은 오프셋·같은 세그먼트여야 한다(불일치 = 비활성).
                                 String va = ((net.minecraft.nbt.NbtString) la).asString().orElse(null);
                                 String vb = ((net.minecraft.nbt.NbtString) lb).asString().orElse(null);
-                                if (va != null && vb != null) {
-                                    boolean ambig = false;
-                                    for (int i = 0; i < k; i++) {
-                                        int ia = va.indexOf(s1[i]);
-                                        if (ia < 0 || ia != va.lastIndexOf(s1[i])) continue;
-                                        int ib = vb.indexOf(s2[i]);
-                                        if (ib != ia || ib != vb.lastIndexOf(s2[i])) continue;
-                                        if (!va.substring(0, ia).equals(vb.substring(0, ia))) continue;
-                                        if (!va.substring(ia + s1[i].length())
-                                                .equals(vb.substring(ia + s2[i].length()))) continue;
-                                        if (hole != -1) { ambig = true; break; }
-                                        hole = i; hk = 1;
-                                        hsp = va.substring(0, ia); hss = va.substring(ia + s1[i].length());
-                                    }
-                                    if (ambig) hole = -1;
+                                if (va == null || vb == null || va.length() != vb.length()) { map = false; break; }
+                                java.util.ArrayList<int[]> occ = new java.util.ArrayList<>();   // {pos, hole}
+                                for (int i = 0; i < k; i++) {
+                                    int ia = va.indexOf(s1[i]);
+                                    if (ia < 0) continue;
+                                    if (ia != va.lastIndexOf(s1[i])) { map = false; break; }
+                                    if (!vb.startsWith(s2[i], ia)) { map = false; break; }
+                                    if (vb.indexOf(s2[i]) != ia || vb.lastIndexOf(s2[i]) != ia) { map = false; break; }
+                                    if (seen[i]) { map = false; break; }
+                                    occ.add(new int[]{ia, i});
                                 }
+                                if (!map) break;
+                                if (occ.isEmpty()) { map = false; break; }
+                                occ.sort((x, y) -> Integer.compare(x[0], y[0]));
+                                int n2 = occ.size();
+                                int[] holes = new int[n2];
+                                String[] sgs = new String[n2 + 1];
+                                int prev = 0;
+                                boolean overlap = false;
+                                for (int oi = 0; oi < n2; oi++) {
+                                    int pos = occ.get(oi)[0], hole = occ.get(oi)[1];
+                                    if (pos < prev) { overlap = true; break; }   // sentinel 겹침 — 비활성
+                                    holes[oi] = hole;
+                                    sgs[oi] = va.substring(prev, pos);
+                                    prev = pos + s1[hole].length();
+                                    // b-파싱 세그먼트 동일성 확인(위 startsWith 가 오프셋 일치를 보장,
+                                    // 세그먼트는 sentinel 외 구간이므로 va/vb 동일해야 함)
+                                    if (!vb.startsWith(sgs[oi], pos - sgs[oi].length())) { overlap = true; break; }
+                                }
+                                if (overlap) { map = false; break; }
+                                sgs[n2] = va.substring(prev);
+                                if (!vb.endsWith(sgs[n2])) { map = false; break; }
+                                for (int oi = 0; oi < n2; oi++) { seen[holes[oi]] = true; hk[holes[oi]] = 1; }
+                                ps[ui] = pp; kd[ui] = 1; hi[ui] = holes; sg[ui] = sgs;
+                            } else {
+                                map = false; break;
                             }
-                            if (hole < 0 || hole >= k || byHole[hole] != null) { map = false; break; }
-                            byHole[hole] = p; kd[hole] = hk; sp[hole] = hsp; ss[hole] = hss;
+                            ui++;
+                        }
+                        if (map) {
+                            for (int i = 0; i < k; i++) if (!seen[i]) { map = false; break; }   // 전 hole 피복
                         }
                         if (map) {
                             boolean good = true;
@@ -7252,20 +7294,23 @@ public static net.minecraft.entity.Entity firstEntity(
                             String[] strProbe = {"abc", "0:12.34", "a b", ""};
                             for (int trial = 0; trial < 3 && good; trial++) {
                                 String[] vals = new String[k];
-                                for (int i = 0; i < k; i++) vals[i] = (kd[i] == 0)
+                                for (int i = 0; i < k; i++) vals[i] = (hk[i] == 0)
                                         ? numProbe[(i + trial) % numProbe.length]
                                         : strProbe[(i + trial) % strProbe.length];
-                                net.minecraft.nbt.NbtElement patched = _patchN(a, byHole, kd, sp, ss, vals);
+                                net.minecraft.nbt.NbtElement patched = _patchN(a, ps, kd, hi, sg, vals);
                                 net.minecraft.nbt.NbtElement truth = _parseN(lits, vals, wrap);
                                 if (patched == null || truth == null || !patched.equals(truth)) { good = false; break; }
                             }
-                            if (good) { okv = true; sk = a.copy(); pth = byHole; kdA = kd; spA = sp; ssA = ss; }
+                            if (good) {
+                                okv = true; sk = a.copy();
+                                pth = ps; kdA = kd; hiA = hi; sgA = sg; hkA = hk;
+                            }
                         }
                     }
                 }
             } catch (Exception ignored) {}
             this.ok = okv; this.skeleton = sk; this.paths = pth;
-            this.kinds = kdA; this.sPre = spA; this.sSuf = ssA;
+            this.kinds = kdA; this.holeIdx = hiA; this.segs = sgA; this.holeKind = hkA;
         }
 
         private static net.minecraft.nbt.NbtElement _parseN(String[] lits, String[] vals, boolean wrap) {
@@ -7278,25 +7323,30 @@ public static net.minecraft.entity.Entity firstEntity(
             } catch (Exception ex) { return null; }
         }
 
-        /** skeleton 1회 copy 후 각 hole 잎을 제자리 set. 가드/타입 불일치 = null. */
+        /** skeleton 1회 copy 후 각 unit leaf 를 제자리 set. 가드/타입 불일치 = null. */
         private static net.minecraft.nbt.NbtElement _patchN(net.minecraft.nbt.NbtElement root,
                                                             String[][] paths, byte[] kinds,
-                                                            String[] sPre, String[] sSuf, String[] vals) {
+                                                            int[][] holeIdx, String[][] segs,
+                                                            String[] vals) {
             try {
                 net.minecraft.nbt.NbtElement copy = root.copy();
-                for (int h = 0; h < paths.length; h++) {
+                for (int u = 0; u < paths.length; u++) {
                     net.minecraft.nbt.NbtElement ve;
-                    if (kinds[h] == 0) {
+                    if (kinds[u] == 0) {
                         net.minecraft.nbt.NbtCompound w =
-                                net.minecraft.nbt.StringNbtReader.readCompound("{v:" + vals[h] + "}");
+                                net.minecraft.nbt.StringNbtReader.readCompound("{v:" + vals[holeIdx[u][0]] + "}");
                         ve = w.get("v");
                         if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
                     } else {
-                        ve = net.minecraft.nbt.NbtString.of(sPre[h] + vals[h] + sSuf[h]);
+                        String[] sgs = segs[u];
+                        int[] holes = holeIdx[u];
+                        StringBuilder sb = new StringBuilder(sgs[0]);
+                        for (int oi = 0; oi < holes.length; oi++) sb.append(vals[holes[oi]]).append(sgs[oi + 1]);
+                        ve = net.minecraft.nbt.NbtString.of(sb.toString());
                     }
-                    if (paths[h].length == 0) { copy = ve; continue; }   // 루트 hole(단일-diff 시에만 발생)
+                    String[] p = paths[u];
+                    if (p.length == 0) { copy = ve; continue; }   // 루트 hole(단일-diff 시에만 발생)
                     net.minecraft.nbt.NbtElement cur = copy;
-                    String[] p = paths[h];
                     for (int i = 0; i < p.length - 1; i++) {
                         if (!(cur instanceof net.minecraft.nbt.NbtCompound c)) return null;
                         cur = c.get(p[i]);
@@ -7310,13 +7360,13 @@ public static net.minecraft.entity.Entity firstEntity(
         }
 
         net.minecraft.nbt.NbtElement patchN(String[] vals) {
-            if (!ok || vals == null || vals.length != paths.length) return null;
+            if (!ok || vals == null || vals.length != holeKind.length) return null;
             for (int i = 0; i < vals.length; i++) {
                 String v = vals[i];
                 if (v == null) return null;
-                if (kinds[i] == 0 ? !_NUM_TOKEN.matcher(v).matches() : !_strTokenOk(v)) return null;
+                if (holeKind[i] == 0 ? !_NUM_TOKEN.matcher(v).matches() : !_strTokenOk(v)) return null;
             }
-            return _patchN(skeleton, paths, kinds, sPre, sSuf, vals);
+            return _patchN(skeleton, paths, kinds, holeIdx, segs, vals);
         }
 
         String concat(String[] vals) {

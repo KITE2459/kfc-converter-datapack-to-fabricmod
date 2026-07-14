@@ -6988,21 +6988,37 @@ public static net.minecraft.entity.Entity firstEntity(
     //      하나라도 어긋나면 비활성 — 구현 버그까지 여기서 걸러 concat 폴백만 남긴다.
     //   3) 매 호출: 인자가 엄격 수치 토큰(구조문자 불가 → 인젝션 불가)일 때만 fast-path, 아니면 concat.
     //  compound 키 경로만 탐색(리스트 슬롯은 leaf 불일치로 자동 비활성) — NbtList API 미사용.
+    //  [15차] 문자열 hole 지원: 따옴표 리터럴 내부의 슬롯("...$v...")을 센티널 전후조각 일치로
+    //  식별해 NbtString 제자리 set 으로 처리한다. 호출 가드는 따옴표/역슬래시 포함 값 거부
+    //  (이스케이프·인용부호 상호작용 원천 차단 — 그런 값만 concat 폴백). bare 문자열 슬롯은
+    //  probe("0:12.34"/"a b")가 재파싱 실패를 일으켜 구성 단계에서 자동 비활성(fail-closed).
     // ════════════════════════════════════════════════════════════════
     private static final boolean SNBT_TEMPLATE =
             !"off".equalsIgnoreCase(System.getProperty("kfc.snbttemplate", "on"));
     private static final java.util.regex.Pattern _NUM_TOKEN =
             java.util.regex.Pattern.compile("[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[bBsSlLfFdD]?");
+    /** 15차: 문자열 hole 가드 — 따옴표/역슬래시 포함 값은 concat 파싱과 이스케이프 상호작용이
+     *  생길 수 있어 fast-path 를 포기한다(concat 폴백 = 원본 동작 그대로). */
+    private static boolean _strTokenOk(String v) {
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == '"' || c == '\'' || c == '\\') return false;
+        }
+        return true;
+    }
 
     public static final class SnbtTmpl {
         final String pre, post; final boolean wrap;   // wrap=true: storage 값({v:..}) / false: compound
         final boolean ok;
         final net.minecraft.nbt.NbtElement skeleton;   // pre+"0"+post 파싱 결과(unwrap 후)
         final String[] path;                            // hole 까지의 compound 키 경로(마지막=슬롯 키)
+        // 15차: hole 종류 — 0=수치 슬롯(종전), 1=문자열 슬롯(따옴표 리터럴 내부, sPre+val+sSuf).
+        final byte kind; final String sPre, sSuf;
 
         SnbtTmpl(String pre, String post, boolean wrap) {
             this.pre = pre; this.post = post; this.wrap = wrap;
             boolean okv = false; net.minecraft.nbt.NbtElement sk = null; String[] pth = null;
+            byte kd = 0; String sp = null, ss = null;
             try {
                 net.minecraft.nbt.NbtElement a = _parse(pre, "111", post, wrap);
                 net.minecraft.nbt.NbtElement b = _parse(pre, "222", post, wrap);
@@ -7012,11 +7028,33 @@ public static net.minecraft.entity.Entity firstEntity(
                     if (diffs.size() == 1) {
                         String[] p = diffs.get(0).toArray(new String[0]);
                         net.minecraft.nbt.NbtElement la = _leafAt(a, p), lb = _leafAt(b, p);
+                        String[] probes = null;
                         if (la instanceof net.minecraft.nbt.AbstractNbtNumber
                                 && lb instanceof net.minecraft.nbt.AbstractNbtNumber) {
+                            probes = new String[]{"333", "-7", "40000", "5", "12.5"};   // 수치 슬롯(종전)
+                        } else if (la instanceof net.minecraft.nbt.NbtString
+                                && lb instanceof net.minecraft.nbt.NbtString) {
+                            // 15차: 문자열 슬롯 — sentinel 이 양쪽 leaf 에 각 1회, 같은 위치,
+                            // 전후 조각 동일일 때만 채택. 그 외는 ok=false(concat 폴백).
+                            String va = ((net.minecraft.nbt.NbtString) la).asString().orElse(null);
+                            String vb = ((net.minecraft.nbt.NbtString) lb).asString().orElse(null);
+                            if (va != null && vb != null) {
+                                int ia = va.indexOf("111"), ib = vb.indexOf("222");
+                                if (ia >= 0 && ia == va.lastIndexOf("111")
+                                        && ib == ia && ib == vb.lastIndexOf("222")
+                                        && va.substring(0, ia).equals(vb.substring(0, ib))
+                                        && va.substring(ia + 3).equals(vb.substring(ib + 3))) {
+                                    kd = 1; sp = va.substring(0, ia); ss = va.substring(ia + 3);
+                                    // "0:12.34"/"a b" 는 bare(비따옴표) 슬롯이면 재파싱이 실패해
+                                    // 자동 비활성 — 따옴표 슬롯만 통과한다.
+                                    probes = new String[]{"abc", "0:12.34", "12", "a b", ""};
+                                }
+                            }
+                        }
+                        if (probes != null) {
                             boolean good = true;
-                            for (String probe : new String[]{"333", "-7", "40000", "5", "12.5"}) {
-                                net.minecraft.nbt.NbtElement patched = _patchCopy(a, p, probe, wrap);
+                            for (String probe : probes) {
+                                net.minecraft.nbt.NbtElement patched = _patchCopy(a, p, probe, wrap, kd, sp, ss);
                                 net.minecraft.nbt.NbtElement truth = _parse(pre, probe, post, wrap);
                                 if (patched == null || truth == null || !patched.equals(truth)) { good = false; break; }
                             }
@@ -7026,12 +7064,14 @@ public static net.minecraft.entity.Entity firstEntity(
                 }
             } catch (Exception ignored) {}
             this.ok = okv; this.skeleton = sk; this.path = pth;
+            this.kind = kd; this.sPre = sp; this.sSuf = ss;
         }
 
-        /** 인자를 슬롯에 꽂은 결과 element. 비수치/파싱실패/비활성이면 null(→ 호출측 concat 폴백). */
+        /** 인자를 슬롯에 꽂은 결과 element. 가드 불통과/파싱실패/비활성이면 null(→ 호출측 concat 폴백). */
         net.minecraft.nbt.NbtElement patch(String val) {
-            if (!ok || val == null || !_NUM_TOKEN.matcher(val).matches()) return null;
-            return _patchCopy(skeleton, path, val, wrap);
+            if (!ok || val == null) return null;
+            if (kind == 0 ? !_NUM_TOKEN.matcher(val).matches() : !_strTokenOk(val)) return null;
+            return _patchCopy(skeleton, path, val, wrap, kind, sPre, sSuf);
         }
 
         private static net.minecraft.nbt.NbtElement _parse(String pre, String mid, String post, boolean wrap) {
@@ -7070,14 +7110,21 @@ public static net.minecraft.entity.Entity firstEntity(
             return cur;
         }
 
-        // skeleton 을 deep copy 후 path 슬롯을 parse(val) 로 set. 수치 아니면 null.
+        // skeleton 을 deep copy 후 path 슬롯을 set. 수치 슬롯=parse(val), 문자열 슬롯=NbtString.
         private static net.minecraft.nbt.NbtElement _patchCopy(net.minecraft.nbt.NbtElement root, String[] p,
-                                                               String val, boolean wrap) {
+                                                               String val, boolean wrap,
+                                                               byte kind, String sPre, String sSuf) {
             try {
-                net.minecraft.nbt.NbtCompound w =
-                        net.minecraft.nbt.StringNbtReader.readCompound("{v:" + val + "}");
-                net.minecraft.nbt.NbtElement ve = w.get("v");
-                if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                net.minecraft.nbt.NbtElement ve;
+                if (kind == 0) {
+                    net.minecraft.nbt.NbtCompound w =
+                            net.minecraft.nbt.StringNbtReader.readCompound("{v:" + val + "}");
+                    ve = w.get("v");
+                    if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                } else {
+                    ve = net.minecraft.nbt.NbtString.of(sPre + val + sSuf);
+                }
+                if (p.length == 0) return ve;   // 루트 전체가 hole(값 전체 치환형 `set value $(v)`)
                 net.minecraft.nbt.NbtElement copy = root.copy();
                 net.minecraft.nbt.NbtElement cur = copy;
                 for (int i = 0; i < p.length - 1; i++) {
@@ -7107,10 +7154,13 @@ public static net.minecraft.entity.Entity firstEntity(
         final boolean ok;
         final net.minecraft.nbt.NbtElement skeleton;
         final String[][] paths;              // hole i → compound 키 경로
+        // 15차: hole i 의 종류(0=수치/1=문자열)와 문자열 슬롯의 전후 조각.
+        final byte[] kinds; final String[] sPre, sSuf;
 
         SnbtTmplN(boolean wrap, String[] lits) {
             this.lits = lits; this.wrap = wrap;
             boolean okv = false; net.minecraft.nbt.NbtElement sk = null; String[][] pth = null;
+            byte[] kdA = null; String[] spA = null, ssA = null;
             try {
                 int k = lits.length - 1;
                 String[] s1 = new String[k], s2 = new String[k];
@@ -7122,34 +7172,60 @@ public static net.minecraft.entity.Entity firstEntity(
                     SnbtTmpl._collectDiffs(a, b, new java.util.ArrayDeque<>(), diffs);
                     if (diffs.size() == k) {
                         String[][] byHole = new String[k][];
+                        byte[] kd = new byte[k]; String[] sp = new String[k], ss = new String[k];
                         boolean map = true;
                         for (java.util.List<String> dp : diffs) {
                             String[] p = dp.toArray(new String[0]);
                             net.minecraft.nbt.NbtElement la = SnbtTmpl._leafAt(a, p);
-                            if (!(la instanceof net.minecraft.nbt.AbstractNbtNumber num)) { map = false; break; }
-                            int hole = (int) Math.round(num.doubleValue()) - 101;   // 센티널 → hole 번호
+                            net.minecraft.nbt.NbtElement lb = SnbtTmpl._leafAt(b, p);
+                            int hole = -1; byte hk = 0; String hsp = null, hss = null;
+                            if (la instanceof net.minecraft.nbt.AbstractNbtNumber num) {
+                                hole = (int) Math.round(num.doubleValue()) - 101;   // 센티널 → hole 번호
+                            } else if (la instanceof net.minecraft.nbt.NbtString
+                                    && lb instanceof net.minecraft.nbt.NbtString) {
+                                // 15차: 문자열 슬롯 — 정확히 한 sentinel 만 유일 출현+전후 일치.
+                                String va = ((net.minecraft.nbt.NbtString) la).asString().orElse(null);
+                                String vb = ((net.minecraft.nbt.NbtString) lb).asString().orElse(null);
+                                if (va != null && vb != null) {
+                                    boolean ambig = false;
+                                    for (int i = 0; i < k; i++) {
+                                        int ia = va.indexOf(s1[i]);
+                                        if (ia < 0 || ia != va.lastIndexOf(s1[i])) continue;
+                                        int ib = vb.indexOf(s2[i]);
+                                        if (ib != ia || ib != vb.lastIndexOf(s2[i])) continue;
+                                        if (!va.substring(0, ia).equals(vb.substring(0, ia))) continue;
+                                        if (!va.substring(ia + s1[i].length())
+                                                .equals(vb.substring(ia + s2[i].length()))) continue;
+                                        if (hole != -1) { ambig = true; break; }
+                                        hole = i; hk = 1;
+                                        hsp = va.substring(0, ia); hss = va.substring(ia + s1[i].length());
+                                    }
+                                    if (ambig) hole = -1;
+                                }
+                            }
                             if (hole < 0 || hole >= k || byHole[hole] != null) { map = false; break; }
-                            byHole[hole] = p;
+                            byHole[hole] = p; kd[hole] = hk; sp[hole] = hsp; ss[hole] = hss;
                         }
                         if (map) {
                             boolean good = true;
-                            String[][] probes = {
-                                new String[]{"7", "-3", "40000", "12.5"},
-                                new String[]{"-12.5", "0", "3", "999999"},
-                                new String[]{"1", "2.25", "-40000", "8"}};
-                            for (String[] pv : probes) {
+                            String[] numProbe = {"7", "-3", "40000", "12.5"};
+                            String[] strProbe = {"abc", "0:12.34", "a b", ""};
+                            for (int trial = 0; trial < 3 && good; trial++) {
                                 String[] vals = new String[k];
-                                for (int i = 0; i < k; i++) vals[i] = pv[i % pv.length];
-                                net.minecraft.nbt.NbtElement patched = _patchN(a, byHole, vals);
+                                for (int i = 0; i < k; i++) vals[i] = (kd[i] == 0)
+                                        ? numProbe[(i + trial) % numProbe.length]
+                                        : strProbe[(i + trial) % strProbe.length];
+                                net.minecraft.nbt.NbtElement patched = _patchN(a, byHole, kd, sp, ss, vals);
                                 net.minecraft.nbt.NbtElement truth = _parseN(lits, vals, wrap);
                                 if (patched == null || truth == null || !patched.equals(truth)) { good = false; break; }
                             }
-                            if (good) { okv = true; sk = a.copy(); pth = byHole; }
+                            if (good) { okv = true; sk = a.copy(); pth = byHole; kdA = kd; spA = sp; ssA = ss; }
                         }
                     }
                 }
             } catch (Exception ignored) {}
             this.ok = okv; this.skeleton = sk; this.paths = pth;
+            this.kinds = kdA; this.sPre = spA; this.sSuf = ssA;
         }
 
         private static net.minecraft.nbt.NbtElement _parseN(String[] lits, String[] vals, boolean wrap) {
@@ -7162,16 +7238,23 @@ public static net.minecraft.entity.Entity firstEntity(
             } catch (Exception ex) { return null; }
         }
 
-        /** skeleton 1회 copy 후 각 hole 잎을 제자리 set. 비수치/실패 = null. */
+        /** skeleton 1회 copy 후 각 hole 잎을 제자리 set. 가드/타입 불일치 = null. */
         private static net.minecraft.nbt.NbtElement _patchN(net.minecraft.nbt.NbtElement root,
-                                                            String[][] paths, String[] vals) {
+                                                            String[][] paths, byte[] kinds,
+                                                            String[] sPre, String[] sSuf, String[] vals) {
             try {
                 net.minecraft.nbt.NbtElement copy = root.copy();
                 for (int h = 0; h < paths.length; h++) {
-                    net.minecraft.nbt.NbtCompound w =
-                            net.minecraft.nbt.StringNbtReader.readCompound("{v:" + vals[h] + "}");
-                    net.minecraft.nbt.NbtElement ve = w.get("v");
-                    if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                    net.minecraft.nbt.NbtElement ve;
+                    if (kinds[h] == 0) {
+                        net.minecraft.nbt.NbtCompound w =
+                                net.minecraft.nbt.StringNbtReader.readCompound("{v:" + vals[h] + "}");
+                        ve = w.get("v");
+                        if (!(ve instanceof net.minecraft.nbt.AbstractNbtNumber)) return null;
+                    } else {
+                        ve = net.minecraft.nbt.NbtString.of(sPre[h] + vals[h] + sSuf[h]);
+                    }
+                    if (paths[h].length == 0) { copy = ve; continue; }   // 루트 hole(단일-diff 시에만 발생)
                     net.minecraft.nbt.NbtElement cur = copy;
                     String[] p = paths[h];
                     for (int i = 0; i < p.length - 1; i++) {
@@ -7188,8 +7271,12 @@ public static net.minecraft.entity.Entity firstEntity(
 
         net.minecraft.nbt.NbtElement patchN(String[] vals) {
             if (!ok || vals == null || vals.length != paths.length) return null;
-            for (String v : vals) if (v == null || !_NUM_TOKEN.matcher(v).matches()) return null;
-            return _patchN(skeleton, paths, vals);
+            for (int i = 0; i < vals.length; i++) {
+                String v = vals[i];
+                if (v == null) return null;
+                if (kinds[i] == 0 ? !_NUM_TOKEN.matcher(v).matches() : !_strTokenOk(v)) return null;
+            }
+            return _patchN(skeleton, paths, kinds, sPre, sSuf, vals);
         }
 
         String concat(String[] vals) {

@@ -588,7 +588,10 @@ public final class KfcGen {
     // ── 틱 단위 태그→엔티티 버킷 (@e[tag=..] 무제한 스캔 핫패스용) ──
     // 무제한(박스 미적용) 태그 스캔이 매번 typeBucket/스냅샷 '전체'를 순회하던 것을 태그별
     // 소수 목록만 보게 한다. 타입버킷과 달리 멤버십(태그) 자체가 버킷 키라서 '사용 시 라이브
-    // 재필터'만으론 누락(스캔 사이에 태그가 붙은 엔티티)을 못 잡는다 → 변형 훅으로 유지:
+    // 재필터'만으론 누락(스캔 사이에 태그가 붙은 엔티티)을 못 잡는다 → 변형 훅으로 유지.
+    // 14차: 버킷은 틱 간 증분 유지된다(매 틱 재구축 ~1.8%p 제거). 잔류(죽음/언로드/태그
+    // 상실) 원소는 호출측 라이브 재검사(matchTagsAlive 등)가 걸러 무해하고, 누락은 아래
+    // 훅 + 플레이어 입장 감지 + 100틱 주기 화해 + ENTITY_GEN(브릿지) 축이 막는다:
     //   · KfcGen.addTag/removeTag — 생성 코드의 tag add/remove 전부 이 경유(증분 갱신)
     //   · summon/kill(snapAdd/snapRemove) — 증분 갱신(스폰 NBT 태그 반영/제거)
     //   · 브릿지(instantExecute*: 바닐라 /tag 가능) — ENTITY_GEN++ → epoch 불일치로 전체 무효화
@@ -601,6 +604,9 @@ public final class KfcGen {
     private static net.minecraft.server.MinecraftServer TB_SERVER;
     private static int  TB_TICK = Integer.MIN_VALUE;
     private static long TB_GEN  = -1;
+    // 14차: 틱 간 증분 유지용 외부-드리프트 감지 상태.
+    private static int  TB_PLN = -1, TB_PLH = 0;            // 플레이어 목록 지문(수 + identity 합)
+    private static int  TB_RECON_TICK = Integer.MIN_VALUE;  // 주기 화해 스탬프
     // TAG_BUCKETS 가 clear 될 때마다(=틱/gen/서버 변화 rebuild, NBT 리로드 태그변경) 증가.
     // 정적 승격된 Tags 핸들(pass-4)이 (서버,틱,gen,epoch) 4-스탬프가 모두 일치할 때만
     // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
@@ -608,8 +614,24 @@ public final class KfcGen {
 
     static java.util.List<net.minecraft.entity.Entity> tagBucket(GameContext ctx, String tag) {
         int tk = ctx.server.getTicks();
-        if (TB_SERVER != ctx.server || TB_TICK != tk || TB_GEN != ENTITY_GEN) {
-            TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_TICK = tk; TB_GEN = ENTITY_GEN;
+        // 14차: 틱 경계에서 버킷을 버리지 않는다(증분 훅이 진실 유지). 틱당 1회만
+        // 외부 드리프트를 검사: (a) 플레이어 입퇴장(퇴장=잔류 무해, 입장=저장된 Tags 가
+        // 훅 밖에서 리로드될 수 있음) → 즉시 전체 재구축, (b) 100틱 주기 화해(콘솔/OP 의
+        // /tag·/summon 개입 수렴 — 문서화된 편차: 종전 1틱 → 최대 100틱).
+        if (TB_TICK != tk) {
+            TB_TICK = tk;
+            java.util.List<net.minecraft.server.network.ServerPlayerEntity> pl = ctx.allPlayers;
+            int pn = pl.size(), ph = 0;
+            for (int i = 0; i < pn; i++) ph += System.identityHashCode(pl.get(i));
+            boolean drift = (pn != TB_PLN || ph != TB_PLH);
+            TB_PLN = pn; TB_PLH = ph;
+            if (drift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
+                TB_RECON_TICK = tk;
+                TAG_BUCKETS.clear(); TB_EPOCH++;
+            }
+        }
+        if (TB_SERVER != ctx.server || TB_GEN != ENTITY_GEN) {
+            TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_GEN = ENTITY_GEN;
         }
         if (TAG_BUCKETS.isEmpty()) {
             // [실측 ~4.5%p] 종전 '태그별 지연 구축'은 질의 태그마다 스냅샷 전 엔티티 ×

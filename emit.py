@@ -1085,44 +1085,33 @@ def _dynamic_dispatch(fid: str, em: "Emitted") -> "list[str] | None":
     if "$(" in fid:
         em.reason = "동적 function: 매크로 토큰 미정규화"
         return None
-    if ":" not in fid:
-        em.reason = "동적 function: 네임스페이스(:) 없음"
+    if ":" not in fid or "MACROVAR_" not in fid:
+        em.reason = "동적 function: 네임스페이스(:) 없음" if ":" not in fid else "동적 function: 매크로 없음"
         return None
-    ns, path = fid.split(":", 1)
-    segs = [ns] + path.split("/")
-    var_pos = [i for i, s in enumerate(segs) if re.fullmatch(r"MACROVAR_\d+", s)]
-    if len(var_pos) != 1 or any(("MACROVAR_" in s) for i, s in enumerate(segs) if i not in var_pos):
-        em.reason = "동적 function: 단일 전체-세그먼트 변수만 지원"
-        return None
-    vp = var_pos[0]
-    sel_token = segs[vp]   # MACROVAR_i (이후 substitute_macro_token 이 macroArgs.get(var) 로 환원)
-    # 후보 열거: vp 위치만 자유, 나머지 세그먼트는 고정 일치.
-    cands = []
-    for cf in ALL_FIDS:
-        if ":" not in cf:
-            continue
-        cns, cpath = cf.split(":", 1)
-        cs = [cns] + cpath.split("/")
-        if len(cs) != len(segs):
-            continue
-        if all(i == vp or cs[i] == segs[i] for i in range(len(segs))):
-            cands.append((cs[vp], cf))
-    # 매크로 함수 후보는 무인자 execute(source) 가 없음(원본도 무인자 호출 시 무효) -> 제외.
-    cands = [(val, cf) for val, cf in cands if cf not in MACRO_FNS]
+    # [일반화] 대상 이름의 임의 개수/부분 세그먼트 매크로를 지원한다.
+    #   패턴을 정규식(매크로=한 경로컴포넌트 [^/:]+)으로 만들어 후보 함수를 열거하고,
+    #   런타임에 전체 경로 문자열을 매크로로 조립(_dp)한 뒤 그 값으로 switch → 네이티브 callee.
+    #   예: tower:spawn/model/$(model)/lv$(level)
+    #       _dp = "tower:spawn/model/" + macroArgs.get("model") + "/lv" + macroArgs.get("level")
+    #   null 매크로면 "...null..."/빈문자로 조립돼 어느 case 와도 불일치 → default no-op
+    #   (바닐라: 인자 미제공/무효 경로 = 그 줄 무효). switch(_dp) 는 _dp 가 항상 non-null 이라 안전.
+    parts = [p for p in re.split(r'(MACROVAR_\d+)', fid) if p != ""]
+    rx = re.compile("^" + "".join(
+        ("[^/:]+" if p.startswith("MACROVAR_") else re.escape(p)) for p in parts) + "$")
+    cands = [cf for cf in ALL_FIDS
+             if ":" in cf and rx.match(cf) and cf not in MACRO_FNS]
     if not cands:
         em.reason = "동적 function: 호출가능 후보 없음(레지스트리 미주입/매칭 0)"
         return None
     cands = sorted(set(cands))
-    # 매크로 디스패치 키(예: macroArgs.get("model"))가 null 이면 switch(null) 은 String.hashCode()
-    # 호출로 NPE 가 나 서버가 죽는다. 바닐라 mcfunction 은 매크로 인자가 비면 명령을 조용히
-    # 건너뛰므로(no-op), 키를 지역변수로 받아 null 가드 후에만 switch 한다(블록으로 스코프 격리).
-    lines = [f"{{ String _dk = {sel_token};", "  if (_dk != null) switch (_dk) {"]
-    for val, cf in cands:
-        lines.append(f"    case {jstr(val)}: {fqcn(cf)}.executeReturn(source); break;")
-    lines.append("    default: break;")   # 알 수 없는 값 = 원본도 무효 함수(no-op)
+    path_expr = " + ".join(p if p.startswith("MACROVAR_") else jstr(p) for p in parts)
+    lines = [f"{{ String _dp = {path_expr};", "  switch (_dp) {"]
+    for cf in cands:
+        lines.append(f"    case {jstr(cf)}: {fqcn(cf)}.executeReturn(source); break;")
+    lines.append("    default: break;")   # 매칭 함수 없음(미존재/무효 경로) = no-op
     lines.append("  } }")
     em.kind = "native"
-    em.reason = f"동적 function 디스패치({len(cands)}개 후보)"
+    em.reason = f"동적 function 디스패치({len(cands)}개 후보, {sum(1 for p in parts if p.startswith('MACROVAR_'))}변수)"
     return lines
 
 
@@ -1549,6 +1538,18 @@ def _fanout_target(tgt, var, body, em, reason_label):
         em.java.append(f'if (executor != null) {body("executor")}')
         em.kind = "native"; return True
     sel = parse_selector(tgt)
+    # [버그수정] @n/@p/@r/limit=1 은 '단일'(최근접/첫) 셀렉터다 — 전체 루프로 전개하면
+    #   같은 셀렉터가 소스(single_entity_expr=단일)와 타깃(loop=전체)에서 다르게 해소돼
+    #   (예: item replace 3-way 스왑) 멀티플레이 시 아이템이 EMPTY(air)가 된다.
+    #   단일 셀렉터는 반드시 single_entity_expr(단일)로 해소해 소스/타깃 해소를 일치시킨다.
+    single = sel is not None and (sel.base in ("s", "n", "p", "r") or sel.limit == 1)
+    if single:
+        ent = single_entity_expr(tgt)
+        if ent is not None:
+            em.java.append(f'{{ net.minecraft.entity.Entity {var} = {ent};'
+                           f' if ({var} != null) {body(var)} }}')
+            em.kind = "native"; return True
+        # 단일인데 식 해소 실패 → 아래 loop/bridge 로 폴백
     lo = entity_loop_open(sel, var) if sel else None
     if lo is None:
         ent = single_entity_expr(tgt)
@@ -7768,7 +7769,10 @@ def single_entity_expr(raw: str) -> str | None:
         _vc = _volume_cond(sel, "executor")
         if _vc: guards.append(_vc)
         if sel.distance is not None:
-            return None  # @s 에 distance 는 무의미/특이 - 미지원
+            # @s[distance=..N] = 실행자가 '현재 실행 위치'에서 distance 이내인지 검사(무의미 아님).
+            #   positioned as @s[distance=..1] 등에서 나온다. source 위치 기준 inRange 가드로 네이티브화.
+            _dl, _dh = sel.distance
+            guards.append(f'KfcGen.inRange(source.getPosition(), executor, {_dist_arg(_dl)}, {_dist_arg(_dh)})')
         if not guards:
             return "executor"
         return f'(({" && ".join(guards)}) ? executor : null)'

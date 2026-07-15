@@ -855,7 +855,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
     conds += _score_conds(sel, evar)
     # predicate (런타임 testPredicate 폴백 포함)
     if sel.predicates:
-        pg = predicate_guards(sel.predicates, evar, player=player)
+        pg = predicate_guards(sel.predicates, evar, player=player, src_var=src_var)
         if pg is None:
             return None
         conds += pg
@@ -955,9 +955,11 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             key = pid[1:] if neg_p else pid
             expr = PREDICATES.get(key)
             if expr is None:
-                # 컴파일타임 JSON 부재 -> 런타임 LootCondition 평가
+                # 컴파일타임 JSON 부재 -> 런타임 LootCondition 평가.
+                # 위치·문맥 의존 술어를 위해 재바인딩 소스(src_var)로 평가(다른 분기의
+                # src_var.getPosition() 사용과 일관; bare source 면 positioned/at 뒤 어긋남).
                 pid_norm = key if ":" in key else "minecraft:" + key
-                e = f'KfcGen.testPredicate(source, executor, {jstr(pid_norm)})'
+                e = f'KfcGen.testPredicate({src_var}, executor, {jstr(pid_norm)})'
             else:
                 e = expr.replace("{E}", "executor")
             parts.append(f'!({e})' if neg_p else e)
@@ -1373,7 +1375,11 @@ def block_pos_java(raw: str | None) -> str | None:
     parts = raw.split()
     if len(parts) != 3 or any(p.startswith("^") for p in parts):
         return None
-    bases = ["executor.getX()", "executor.getY()", "executor.getZ()"]
+    # `~` 상대좌표는 바닐라에서 '소스(실행) 위치' 기준이다. executor 기준으로 계산하면
+    # (1) positioned/at <타엔티티> 로 소스≠executor 가 되면 위치가 어긋나고
+    # (2) executor 가 없는 소스(명령블록/함수 루트)에서 NPE 가 난다.
+    # 소스 위치로 산출하며, 리프 본문 치환(source→cur_src)이 재바인딩까지 반영한다.
+    bases = ["source.getPosition().x", "source.getPosition().y", "source.getPosition().z"]
     axes = []
     for i, p in enumerate(parts):
         if p.startswith("~"):
@@ -3075,7 +3081,7 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     return True
 
 
-def predicate_guards(predicates, var: str, player: bool = False):
+def predicate_guards(predicates, var: str, player: bool = False, src_var: str = "source"):
     """predicate id 목록 -> var 대상 boolean 식 리스트. 미컴파일 predicate 있으면 None.
 
     안전성 원칙: 항상 instanceof 가드가 포함된 일반식 PREDICATES({E}) 만 사용한다.
@@ -3096,8 +3102,10 @@ def predicate_guards(predicates, var: str, player: bool = False):
         ex = PREDICATES.get(key)
         if ex is None:
             # 컴파일타임 predicate JSON 부재 -> 런타임 LootCondition 평가로 대체.
+            # src_var: 위치·문맥 의존 술어를 재바인딩 소스로 평가(_selector_entity_guards 가
+            # 셀렉터의 src_var 를 전달). 미전달 경로는 "source"(단일식은 _resrc/리프치환이 잡음).
             pid_norm = key if ":" in key else "minecraft:" + key
-            e = f'KfcGen.testPredicate(source, {var}, {jstr(pid_norm)})'
+            e = f'KfcGen.testPredicate({src_var}, {var}, {jstr(pid_norm)})'
         else:
             e = ex.replace("{P}", var).replace("{E}", var).replace("_kp", f"_kp{i}")
         out.append(f"!({e})" if neg else e)
@@ -6145,7 +6153,10 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 expr = PREDICATES.get(pid["raw"])
                 if expr is None:
                     pid_norm = pid["raw"] if ":" in pid["raw"] else "minecraft:" + pid["raw"]
-                    c = f'KfcGen.testPredicate(source, executor, {jstr(pid_norm)})'
+                    # 술어는 location_check/weather/position 등 위치·문맥 의존 조건을 담을 수 있으므로
+                    # execute at/positioned/rotated 로 재바인딩된 소스(cur_src)로 평가해야 한다.
+                    # (bare source 는 원본 실행 위치라, at @s 뒤 위치 술어가 어긋난다.)
+                    c = f'KfcGen.testPredicate({cur_src}, executor, {jstr(pid_norm)})'
                 else:
                     c = expr.replace("{E}", "executor")
                 conds.append(f'!({c})' if neg else c)
@@ -8321,3 +8332,4 @@ _DISPATCH_SIMPLE = {
     "stopsound": emit_stopsound, "playsound": emit_playsound,
     "tp": emit_tp, "teleport": emit_tp,
 }
+# (무결성 감사 패스: 문맥 전달 source→cur_src 치환 보강 완료)

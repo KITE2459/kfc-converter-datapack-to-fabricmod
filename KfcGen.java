@@ -325,14 +325,17 @@ public final class KfcGen {
         int t = s.getTicks();
         if (t != OBJ_TICK) {
             OBJ_TICK = t; OBJ_GEN++;   // 외부(콘솔/바닐라) objective 변경 재해소(ObjRef 전용 — 저렴)
-            // 13차: 점수 핸들 캐시는 매 틱 클리어하지 않는다. 우리 코드의 모든 엔트리 제거
-            // 경로(reset/objective remove/브릿지·runCommand)는 즉시 무효화를 거치므로,
-            // 남는 구멍은 '외부 콘솔/OP 의 scoreboard 개입'뿐 — 100틱(5초) 주기 화해로 수렴.
-            // (문서화된 편차: 종전 1틱 → 최대 100틱. 정상 플레이 경로에는 영향 없음.)
-            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
-                HANDLE_RECON_TICK = t;
-                invalidateScoreHandles();
-            }
+            // 24차[무결성]: 점수 핸들 캐시를 매 틱 경계에 화해한다. 종전 100틱 주기 화해는
+            // '외부 개입은 콘솔/OP 뿐이고 드물다'는 가정이었으나, 커맨드블럭이 호출하는 브릿지
+            // (원본 mcfunction)·타 데이터팩·수동 명령의 scoreboard reset/set 은 네이티브 훅
+            // (resetScore/setScore/dropHandlesFor)을 거치지 않아 캐시된 쓰기핸들(ScoreAccess)이
+            // '제거된 엔트리'를 가리킨 채 남는다. 네이티브 틱의 operation += 가 그 detached 엔트리에
+            // 써서 라이브 점수가 안 올라가고, @s[scores=..] 라이브 판정이 계속 불일치 → NBS 브금이
+            // 무음이 됐다(사운드룸→차고 전환: 커맨드블럭 tokartstore 가 nbs_kartstore 를 vanilla reset).
+            // 커맨드블럭 브릿지는 '정상 플레이 경로'이므로 100틱(5초) 편차는 허용 불가 → 바닐라
+            // 가시성(≤1틱)에 맞춰 매 틱 화해(정확성 우선; 종전 최적화가 맞바꾼 ~2%p 재지불).
+            HANDLE_RECON_TICK = t;
+            invalidateScoreHandles();
             snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
         return c;
@@ -654,10 +657,15 @@ public final class KfcGen {
             entitiesSnapshot(ctx);                    // 이 틱 스냅샷/지문 확정(첫 접근 시 재구축)
             boolean popDrift = (SNAP_FP != TB_FP);
             TB_FP = SNAP_FP;
-            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
-                TB_RECON_TICK = tk;
-                TAG_BUCKETS.clear(); TB_EPOCH++;
-            }
+            // 24차[무결성]: 매 틱 경계에 버킷 화해. 증분 훅(addTag/removeTag)은 '네이티브' 태그
+            // 변경만 반영한다. 커맨드블럭이 부르는 브릿지(원본 mcfunction)·타 데이터팩·수동 /tag 의
+            // 태그 변경은 훅을 우회하고, 개체군·플레이어도 불변이라 drift/popDrift 로도 안 잡혀
+            // 최대 100틱(5초) 동안 @e[tag] 버킷이 stale 이었다(점수 핸들과 동일한 외부-변이 비일관
+            // 클래스). 버킷 재구축은 라이브 getCommandTags 순회라 변경 출처와 무관하게 정확하다.
+            // 바닐라 가시성(≤1틱)에 맞춰 매 틱 재구축한다(정확성 우선; drift/popDrift 는 이제 무조건
+            // 참이라 무의미하지만 지문 갱신은 유지). 값싼 무태그 엔티티는 재구축서 계속 스킵된다.
+            TB_RECON_TICK = tk;
+            TAG_BUCKETS.clear(); TB_EPOCH++;
         }
         if (TB_SERVER != ctx.server || TB_GEN != ENTITY_GEN) {
             TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_GEN = ENTITY_GEN;

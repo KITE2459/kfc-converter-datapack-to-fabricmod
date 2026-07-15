@@ -5897,6 +5897,21 @@ def _emit_execute_legacy(line: str, chain: list[dict], em: Emitted) -> bool:
     return True
 
 
+def _resrc(expr, src):
+    """조건/재바인딩용 셀렉터 식의 하드코딩된 bare 'source' 를 현재 rebind 소스(cur_src)로 치환.
+       single_entity_expr/nearest_entity_java 는 위치 기준을 'source.getPosition()' 으로
+       고정 생성하는데, execute at/positioned/rotated/facing 로 소스가 재바인딩(kfcSrcN)된
+       뒤의 셀렉터 조건은 그 재바인딩 위치를 써야 한다.
+         예) `execute at @s if data entity @n[tag=..,distance=..1.39] data.bgm run ...`
+             — BGM 함수는 카트에서 먼 위치에서 호출되므로 원본 source 로 @n 을 찾으면
+               1.39칸 내 대상이 없어 조건이 거짓이 되고 카트별 고정 BGM 기믹이 소실됐다.
+       cur_src=='source' 면 무변경. executor 는 위치 재바인딩에 불변이라 치환 대상 아님
+       (single_entity_expr 이 executor 를 그대로 두는 것과 일관)."""
+    if expr is None or src == "source":
+        return expr
+    return re.sub(r'\bsource\b', src, expr)
+
+
 def parse_modifiers(head: list[dict], src_var: str = "source"):
     """execute 수정자 시퀀스를 (conds, loops, unsupported) 로.
        conds: 자바 boolean 식 리스트
@@ -5933,7 +5948,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 # 셀렉터 홀더(@s[tag], @n, @p, @e[limit=1]) -> 단일 엔티티 식
                 ent_expr = None
                 if h is None and tgt:
-                    ent_expr = single_entity_expr(tgt["raw"])
+                    ent_expr = _resrc(single_entity_expr(tgt["raw"]), cur_src)
                     if ent_expr is None:
                         return ("UNS", [], f"if score 비-@s/# 홀더: {tgt}", [])
                 if disc == "matches":
@@ -5957,7 +5972,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                     hb = holder_expr(src["raw"]) if src else None
                     src_ent = None
                     if hb is None and src:
-                        src_ent = single_entity_expr(src["raw"])
+                        src_ent = _resrc(single_entity_expr(src["raw"]), cur_src)
                         if src_ent is None:
                             return ("UNS", [], f"if score 비교형 비-@s/# 소스홀더: {src}", [])
                     # 대상/소스가 셀렉터(단일 엔티티)면 식을 그대로 인자로 넘긴다
@@ -6040,7 +6055,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                             # 필터 불통과 = 대상 없음 = 미실행(가드는 negate 바깥, 항상 양성)
                             c = f'({g} && {_pred_call("executor")})'
                         else:
-                            eexpr = single_entity_expr(ent["raw"])
+                            eexpr = _resrc(single_entity_expr(ent["raw"]), cur_src)
                             if eexpr is None:
                                 return ("UNS", [], f"if items 대상({ent['raw'][:20]}) 미해소(복합 술어)", [])
                             c = _pred_call(eexpr)
@@ -6067,7 +6082,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                         conds.append(c)
                         i = skip_after(nn, i, "item_predicate")
                         continue
-                    eexpr = single_entity_expr(ent["raw"])
+                    eexpr = _resrc(single_entity_expr(ent["raw"]), cur_src)
                     if eexpr is not None:
                         # 단일 셀렉터(@n/@p/…): 해소 실패(null) = 대상 없음 = 미실행 — itemsCond 가 처리
                         c = f'KfcGen.itemsCond({eexpr}, {slot_j}, {iid_j}, {nbt_j}, {neg_j})'
@@ -6104,7 +6119,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                     if ent["raw"] == "@s":
                         eexpr = "executor"
                     else:
-                        eexpr = single_entity_expr(ent["raw"])
+                        eexpr = _resrc(single_entity_expr(ent["raw"]), cur_src)
                         if eexpr is None:
                             return ("UNS", [], f"if data entity 셀렉터({ent['raw'][:20]}) 미해소", [])
                     if is_compound_match:
@@ -6273,7 +6288,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
             single = psel and ((psel.base in ("n", "p", "r")) or psel.limit == 1)
             if not single:
                 return ("UNS", [], f"at {raw_at[:25]} (비단일 위치 재바인딩 1차 미지원)", [])
-            ent = single_entity_expr(raw_at)
+            ent = _resrc(single_entity_expr(raw_at), cur_src)
             if ent is None:
                 return ("UNS", [], f"at {raw_at[:25]} (단일 엔티티 해소 불가)", [])
             ev = f"_atE{len(rebinds)+1}"
@@ -6300,7 +6315,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                     i += 2
                     continue
                 # positioned as <단일 셀렉터> - 그 엔티티의 위치로
-                ent = single_entity_expr(traw)
+                ent = _resrc(single_entity_expr(traw), cur_src)
                 if ent is None:
                     return ("UNS", [], f"positioned as {traw[:20]} (단일 해소 불가)", [])
                 ev = f"_posE{len(rebinds)+1}"
@@ -6338,7 +6353,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                     i += 2
                     continue
                 # rotated as <단일 셀렉터> - 그 엔티티의 회전을 복사
-                ent = single_entity_expr(traw)
+                ent = _resrc(single_entity_expr(traw), cur_src)
                 if ent is None:
                     return ("UNS", [], f"rotated as {traw[:25]} (단일 엔티티 해소 불가)", [])
                 nv = f"kfcSrc{_uid()}"
@@ -6386,7 +6401,7 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                 anchor = next_arg("anchor")
                 traw = tsel["raw"] if tsel else ""
                 eyes = "true" if (anchor and anchor["raw"] == "eyes") else "false"
-                ent = single_entity_expr(traw)
+                ent = _resrc(single_entity_expr(traw), cur_src)
                 if ent is None:
                     return ("UNS", [], f"facing entity {traw[:20]} (단일 해소 불가)", [])
                 ev = f"_faceE{_uid()}"

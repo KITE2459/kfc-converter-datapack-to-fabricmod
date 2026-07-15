@@ -1565,6 +1565,16 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
 
     macro_note = f"\n *  매크로 함수 - 변수: {', '.join(macro_params)}." if is_macro_fn else ""
 
+    # [바닐라 정확성] 매크로 함수가 쓰는 $(var) 중 하나라도 호출 인자에 없으면, 바닐라는
+    #   인스턴스화 실패로 '어떤 줄도 실행하지 않는다'. 변환본은 비-매크로 라인이 먼저 실행돼
+    #   버려(예: savehelditem-2 의 `item replace container.9 ...`) 인벤토리가 파괴됐다.
+    #   진입 시 사용 변수 존재를 검사해 미제공이면 즉시 return 0(무실행)으로 재현한다.
+    mv_guard = ""
+    if is_macro_fn and macro_params:
+        _mvk = ", ".join('"' + str(v).replace('\\','\\\\').replace('"','\\"') + '"' for v in macro_params)
+        mv_guard = (f"if (!KfcGen.macroHasAll(macroArgs, {_mvk})) return 0;   "
+                    f"// 바닐라: 미제공 매크로변수 = 인스턴스화 실패(함수 전체 미실행)\n        ")
+
     if is_macro_fn:
         # int executeReturn(source, macroArgs) 가 본문(return 값 전파), void execute 는 래퍼.
         # → `store result score X run function <macro> with ...` 가 반환값을 캡처 가능.
@@ -1579,7 +1589,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     }}
 
     public static int executeReturn(ServerCommandSource source, Map<String, String> macroArgs) {{
-        try {{
+        {mv_guard}try {{
         {prelude}
         {seg_calls}{indented_body_stripped}{tail_return}
         }} catch (KfcGen.MacroParseFail _mf) {{

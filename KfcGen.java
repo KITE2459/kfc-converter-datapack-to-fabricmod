@@ -7808,6 +7808,14 @@ public static net.minecraft.entity.Entity firstEntity(
     // 호출부에서 만든 Map<String,String> 을 피호출 함수의 execute(source, macroArgs) 로 넘긴다.
 
     /** 가변 인자 (k1,v1,k2,v2,...) → Map. 인라인 {compound} 호출에서 사용. */
+    /** 바닐라 매크로 인스턴스화: 함수가 쓰는 $(var) 중 하나라도 인자에 없으면 그 함수 호출은
+     *  '전체 실패'(어떤 줄도 미실행)한다. 이 함수가 그 사전검사 — keys 전부 있으면 true. */
+    public static boolean macroHasAll(java.util.Map<String, String> m, String... keys) {
+        if (m == null) return keys.length == 0;
+        for (String k : keys) if (!m.containsKey(k)) return false;
+        return true;
+    }
+
     public static java.util.Map<String, String> macroArgs(String... kv) {
         java.util.Map<String, String> m = new java.util.HashMap<>();
         for (int i = 0; i + 1 < kv.length; i += 2) m.put(kv[i], kv[i + 1]);
@@ -7985,6 +7993,17 @@ public static net.minecraft.entity.Entity firstEntity(
     public static java.util.Map<String, String> entityMacroArgs(
             net.minecraft.entity.Entity e, String path) {
         if (e == null) return new java.util.HashMap<>();
+        // [버그수정] equipment.offhand / weapon.mainhand / container.N / SelectedItem 등은
+        //   '가상 슬롯 경로'다 — 플레이어 오프핸드는 Inventory[Slot:-106] 에 저장돼 raw writeNbt
+        //   경로(compoundAt)로는 안 잡힌다. data entity 읽기와 동일하게 슬롯 접근자로 해소해야
+        //   아이템 NBT({id,count,components})가 나온다. 이걸 안 하면 `function ... with entity @s
+        //   equipment.offhand` 매크로 인자가 빈 맵이 돼(savehelditem 류) 아이템 저장이 실패하고
+        //   교체 시 슬롯이 사라진다. 슬롯경로가 아니거나 raw NBT 경로(Inventory[{Slot:9b}] 등)면
+        //   slotAccessorNbt 가 null → 아래 raw 경로(compoundAt)로 폴백한다.
+        if (path != null && !path.isEmpty()) {
+            net.minecraft.nbt.NbtElement se = slotAccessorNbt(e, path);
+            if (se instanceof net.minecraft.nbt.NbtCompound sc) return compoundToMacroArgs(sc, null);
+        }
         net.minecraft.nbt.NbtCompound nbt = entitySnapshot(e);
         if (path == null || path.isEmpty()) return compoundToMacroArgs(nbt, null);
         return compoundToMacroArgs(compoundAt(nbt, path), null);

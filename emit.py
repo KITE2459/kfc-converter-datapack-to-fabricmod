@@ -2567,13 +2567,27 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
 
         # ---- target ----
         tk = target_nodes[0] if target_nodes else None
+        # 목적지 좌표 arg 는 targetPos (mine/fish 소스의 pos 와 구분). 이전엔 "pos" 로 찾아
+        # None 이 돼 loot spawn/insert/replace block 이 전부 브릿지됐다.
+        def _dpos():
+            return sect(target_nodes, "targetPos") or sect(target_nodes, "pos")
         if tk == "spawn":
-            tpos = sect(target_nodes, "pos")
+            tpos = _dpos()
             tpe = cond_pos_expr(tpos) if tpos else None
             if tpe is None:
                 em.reason = f"loot spawn 좌표({tpos}) 미지원"
                 return False
             em.java.append(f"{{ {loot_decl} KfcGen.lootSpawn(source.getWorld(), {tpe}, _loot); }}")
+            em.kind = "native"
+            return True
+        if tk == "insert":
+            tpos = _dpos()
+            tpe = cond_pos_expr(tpos) if tpos else None
+            if tpe is None:
+                em.reason = f"loot insert 좌표({tpos}) 미지원"
+                return False
+            em.java.append(f"{{ {loot_decl} KfcGen.lootInsert(source, "
+                           f"net.minecraft.util.math.BlockPos.ofFloored({tpe}), _loot); }}")
             em.kind = "native"
             return True
 
@@ -2603,7 +2617,7 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
                     lambda e: f"if ({e} != null) KfcGen.lootReplaceEntity({e}, {jstr(slot)}, {cnt_arg}, _loot);",
                     em, "loot replace entity", loot_decl)
             if sub == "block":
-                bpos = sect(target_nodes, "pos")
+                bpos = _dpos()
                 bpe = cond_pos_expr(bpos) if bpos else None
                 if bpe is None:
                     em.reason = f"loot replace block 좌표({bpos}) 미지원"

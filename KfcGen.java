@@ -3773,6 +3773,37 @@ public final class KfcGen {
     }
 
     /** target: replace entity <e> <slot> [count] — slot 베이스부터 count 칸. count<0 이면 loot.size(). */
+        /** loot insert <pos> <소스> — 소스 아이템들을 <pos> 컨테이너에 삽입(바닐라: 병합 후 빈 슬롯). */
+    public static void lootInsert(net.minecraft.server.command.ServerCommandSource source,
+                                  net.minecraft.util.math.BlockPos pos,
+                                  java.util.List<net.minecraft.item.ItemStack> loot) {
+        if (loot == null || loot.isEmpty()) return;
+        net.minecraft.block.entity.BlockEntity be = source.getWorld().getBlockEntity(pos);
+        if (!(be instanceof net.minecraft.inventory.Inventory inv)) return;
+        boolean changed = false;
+        for (net.minecraft.item.ItemStack st : loot) {
+            if (st == null || st.isEmpty()) continue;
+            net.minecraft.item.ItemStack rem = st.copy();
+            // 1) 같은 아이템 스택에 병합
+            for (int i = 0; i < inv.size() && !rem.isEmpty(); i++) {
+                net.minecraft.item.ItemStack sl = inv.getStack(i);
+                if (!sl.isEmpty() && net.minecraft.item.ItemStack.areItemsAndComponentsEqual(sl, rem)) {
+                    int can = Math.min(rem.getCount(), sl.getMaxCount() - sl.getCount());
+                    if (can > 0) { sl.increment(can); rem.decrement(can); changed = true; }
+                }
+            }
+            // 2) 빈 슬롯에 배치
+            for (int i = 0; i < inv.size() && !rem.isEmpty(); i++) {
+                if (inv.getStack(i).isEmpty()) {
+                    int put = Math.min(rem.getCount(), rem.getMaxCount());
+                    net.minecraft.item.ItemStack place = rem.copy(); place.setCount(put);
+                    inv.setStack(i, place); rem.decrement(put); changed = true;
+                }
+            }
+        }
+        if (changed) be.markDirty();
+    }
+
     public static void lootReplaceEntity(net.minecraft.entity.Entity e, String slotName, int count,
                                          java.util.List<net.minecraft.item.ItemStack> loot) {
         if (e == null || loot == null) return;

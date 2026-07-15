@@ -182,7 +182,7 @@ def _scbound(v, sentinel):
     if v is None:
         return sentinel
     sv = str(v)
-    return sv if sv.lstrip("-").isdigit() else f"Integer.parseInt({sv})"
+    return sv if sv.lstrip("-").isdigit() else f"KfcGen.macroI({sv})"
 
 
 _JSTR_LIMIT = 55000   # 클래스파일 CONSTANT_Utf8 한계(65535B) 대비 안전 여유
@@ -233,17 +233,28 @@ def _jnum(tok, parse_fn, suffix=""):
 
 
 def jfloat(tok):
-    e = _jnum(tok, "Float.parseFloat")
+    e = _jnum(tok, "KfcGen.macroF")
     return e if e is not None else f'{float(tok)}f'
 
 
 def jdouble(tok):
-    e = _jnum(tok, "Double.parseDouble")
+    e = _jnum(tok, "KfcGen.macroD")
+    return e if e is not None else repr(float(tok))
+
+
+def jdouble_g(tok):
+    """셀렉터 수치필드(박스 dx/dy/dz, 원점 x/y/z)용 '가드된' double 식.
+       이 값들은 조건식(posInBox/anyEntityInBox) 안에서 평가되므로, 매크로 변수를
+       unguarded Double.parseDouble 로 두면 (a) raw String 이 그대로 새어 컴파일 에러이거나
+       (b) 비수치 매크로에서 NumberFormatException 이 함수 밖으로 튄다. KfcGen.coord(s,false)
+       는 비수치/null 이면 MACRO_FAIL 을 던져(=바닐라: 매크로 인스턴스화 실패 → 줄 스킵),
+       함수의 catch(MacroParseFail) 로 안전하게 잡힌다. 리터럴은 숫자 그대로."""
+    e = _jnum(str(tok), "KfcGen.macroD")
     return e if e is not None else repr(float(tok))
 
 
 def jint(tok):
-    e = _jnum(tok, "Integer.parseInt")
+    e = _jnum(tok, "KfcGen.macroI")
     return e if e is not None else str(int(tok))
 
 
@@ -263,7 +274,7 @@ def _dist_arg(v) -> str:
         숫자 파라미터에 맞게 파싱되도록 보장.)"""
     if v is None:
         return "-1"
-    e = _jnum(str(v), "Double.parseDouble")
+    e = _jnum(str(v), "KfcGen.macroD")
     return e if e is not None else str(v)
 
 
@@ -272,7 +283,7 @@ def _int_arg(v, default: str) -> str:
        None -> default, MACROVAR 포함 -> Integer.parseInt(...) 런타임 파싱, 숫자 -> 그대로."""
     if v is None:
         return default
-    e = _jnum(str(v), "Integer.parseInt")
+    e = _jnum(str(v), "KfcGen.macroI")
     return e if e is not None else str(v)
 
 
@@ -454,11 +465,11 @@ def parse_selector(raw: str) -> Selector | None:
             # 파싱 실패로 처리해 해당 줄을 거부/폴백시킨다 - 정확성 우선.
             return None
     if isinstance(sel.volume, dict):
-        sel.volume = (sel.volume["dx"], sel.volume["dy"], sel.volume["dz"])
+        sel.volume = (jdouble_g(sel.volume["dx"]), jdouble_g(sel.volume["dy"]), jdouble_g(sel.volume["dz"]))
     if isinstance(sel.origin, dict):
         if not all(a in sel.origin for a in ("x", "y", "z")):
             return None  # 부분 좌표 원점 1차 미지원
-        sel.origin = (sel.origin["x"], sel.origin["y"], sel.origin["z"])
+        sel.origin = (jdouble_g(sel.origin["x"]), jdouble_g(sel.origin["y"]), jdouble_g(sel.origin["z"]))
     return sel
 
 
@@ -2724,19 +2735,20 @@ def rotation_conds(sel, evar: str):
     if sel.x_rotation is not None:
         lo, hi = sel.x_rotation
         if lo is not None:
-            out.append(f'{evar}.getPitch() >= {lo}')
+            out.append(f'{evar}.getPitch() >= {_dist_arg(lo)}')
         if hi is not None:
-            out.append(f'{evar}.getPitch() <= {hi}')
+            out.append(f'{evar}.getPitch() <= {_dist_arg(hi)}')
     if sel.y_rotation is not None:
         lo, hi = sel.y_rotation
-        if lo is not None and hi is not None and float(lo) > float(hi):
+        _ymac = ("MACROVAR_" in str(lo)) or ("MACROVAR_" in str(hi))   # 매크로면 정적 래핑판정 불가
+        if lo is not None and hi is not None and not _ymac and float(lo) > float(hi):
             # 래핑 범위: yaw>=lo OR yaw<=hi (예: y_rotation=170..-170 -> 정면 뒤쪽)
-            out.append(f'({evar}.getYaw() >= {lo} || {evar}.getYaw() <= {hi})')
+            out.append(f'({evar}.getYaw() >= {_dist_arg(lo)} || {evar}.getYaw() <= {_dist_arg(hi)})')
         else:
             if lo is not None:
-                out.append(f'{evar}.getYaw() >= {lo}')
+                out.append(f'{evar}.getYaw() >= {_dist_arg(lo)}')
             if hi is not None:
-                out.append(f'{evar}.getYaw() <= {hi}')
+                out.append(f'{evar}.getYaw() <= {_dist_arg(hi)}')
     return out
 
 

@@ -3217,6 +3217,23 @@ public final class KfcGen {
         return v;
     }
 
+    /** 셀렉터 수치필드(박스 dx/dy/dz·원점 x/y/z, distance, level 등)용 '가드된' 매크로 double 파싱.
+     *  비수치/null 이면 MACRO_FAIL(=바닐라 매크로 인스턴스화 실패 → 줄 스킵)을 던진다.
+     *  조건식(posInBox/inRange 등) 안에서 평가돼도 함수의 catch(MacroParseFail)로 안전하게 잡힌다. */
+    public static double macroD(String tok) { return coord(tok, false); }
+
+    /** macroD 의 int 판(scores/limit/level 정수 바운드). 비수치/null → MACRO_FAIL. */
+    public static int macroI(String tok) {
+        if (tok == null) throw MACRO_FAIL;
+        try { return Integer.parseInt(tok.trim()); } catch (NumberFormatException e) { throw MACRO_FAIL; }
+    }
+
+    /** macroD 의 float 판(playsound 볼륨/피치 등). 비수치/null → MACRO_FAIL. */
+    public static float macroF(String tok) {
+        if (tok == null) throw MACRO_FAIL;
+        try { return Float.parseFloat(tok.trim()); } catch (NumberFormatException e) { throw MACRO_FAIL; }
+    }
+
     /** summon <type> <pos> <nbt> — NBT 에 id 주입 후 위치 설정해 스폰. */
     public static void summon(net.minecraft.server.world.ServerWorld world, String type,
                               double x, double y, double z, String nbtSnbt) {

@@ -1110,6 +1110,20 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     scaffold_build_env(out_root, profile, group, _datapack_base_name(datapack_root))
     _tlog("scaffold (build env)")
 
+    # ── [type-check] KfcGen 호출 타입 정합성 게이트 (javac 이전 안정망) ──
+    #   생성 산출물의 모든 KfcGen.<m>(...) 호출을 KfcGen 시그니처에 대조해, String/매크로 값이
+    #   수치·불리언 파라미터에 들어가는 확정적 타입 불일치(=컴파일 붕괴)를 즉시 전수 검출한다.
+    #   javac 의 난해한 에러 대신, convert 시점에 파일:라인·메서드·인자로 정확히 지목한다.
+    try:
+        import validate_types as _vt
+        _kfc = Path(__file__).resolve().parent / "KfcGen.java"
+        _n = _vt.run(str(_kfc), str(src_root))
+        if _n:
+            print("[generate][!!] 위 타입 불일치는 컴파일이 깨지는 지점입니다 — emit 수정 필요.")
+    except Exception as _ve:
+        print(f"[generate][warn] type-check skipped: {_ve}")
+    _tlog("type-check")
+
 
 
 # ════════════════════════════════════════════════════════════════════

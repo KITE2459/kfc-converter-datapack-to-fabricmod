@@ -1437,12 +1437,17 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.command.CommandManager;
+import com.mojang.brigadier.CommandDispatcher;
 
 /**
  * 자동 생성 모드 진입점.
  *  - tick 태그 함수 -> 매 서버 틱 (#minecraft:tags/function/tick 대응)
 {load_note} * 명령 컨텍스트는 서버 커맨드 소스(level 4, silent)를 사용한다.
+ *  - `kfc-converted` 명령 등록: 데이터팩이 '이 팩이 네이티브 변환(최적화)되어 실행 중인지'를
+ *    감지(execute if / return 값)해 조건부 기능을 활성화하는 용도. 부수효과 없이 1 을 반환한다.
  */
 public final class ModEntry implements ModInitializer {{
     @Override
@@ -1452,6 +1457,14 @@ public final class ModEntry implements ModInitializer {{
 {tick_body}
             {group}.generated.KfcGen.tickNativeSchedule(server);
         }});
+        CommandRegistrationCallback.EVENT.register(
+                (dispatcher, registryAccess, environment) -> register(dispatcher));
+    }}
+
+    public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {{
+        dispatcher.register(CommandManager.literal("kfc-converted")
+                .executes(ctx -> 1)
+        );
     }}
 }}
 """

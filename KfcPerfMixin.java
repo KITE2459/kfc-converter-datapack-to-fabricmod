@@ -12,8 +12,8 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * [20차 — 바닐라 초월 최적화 / 25차 개정: refmap 무의존] 대형 승객 리스트(수백 파츠 모델 리그)
- * 에서 바닐라의 O(승객수²) 틱 비용을 O(승객수)로 낮춘다. spark 실측: tickPassenger →
+ * [20차 — 바닐라 초월 최적화 / 26차 개정: loom in-place 리맵 사용] 대형 승객 리스트(수백 파츠
+ * 모델 리그)에서 바닐라의 O(승객수²) 틱 비용을 O(승객수)로 낮춘다. spark 실측: tickPassenger →
  * updatePassengerPosition → hasPassenger(ImmutableList.contains) ~1.2%p +
  * getPassengerAttachmentPos(List.indexOf) ~0.25%p — 승객마다 선형 탐색이라 파츠² 스케일.
  *
@@ -22,18 +22,22 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * 변이 경로와도 정합이 보장된다. Entity.equals 는 identity 이므로 Reference 맵과
  * contains/indexOf 시맨틱이 동일하다.
  *
- * [25차 개정 — 왜 refmap 무의존인가] 드롭인 빌드에서 refmap 미생성 시 @Shadow(yarn 필드명)가
- * 런타임 intermediary 에서 해석되지 못해 통째로 비활성이었다(실측 로그: "No refMap loaded").
- *  - 필드 @Shadow 제거: 공개 getPassengerList() '코드 참조'는 remapJar 가 항상 리맵한다.
- *  - 어노테이션 타깃은 intermediary(프로덕션)/yarn(개발) 이중 명시 + remap=false —
- *    환경마다 한쪽이 매치되고(require=0), refmap 조회 자체를 하지 않는다.
- *  - intermediary 이름은 1.21.5 yarn 매핑에서 확정: hasPassenger(Entity)=method_5626,
- *    static getPassengerAttachmentPos=method_55665 (각 이름은 클래스 내 유일 — 서명 생략 안전).
+ * [26차 개정 — 왜 intermediary 하드코딩을 제거했나] 25차는 refmap 미생성 환경을 가정해 어노테이션
+ * 타깃에 intermediary(method_5626/method_55665) 를 직접 박고 remap=false 로 두었다. 그러나 빌드
+ * 설정을 loom.mixin.useLegacyMixinAp=false 로 바꿔 loom 자체 in-place 믹스인 리매퍼가 정상 동작
+ * 하면서, 그 하드코딩 intermediary 가 오히려 리매퍼와 충돌해 "Cannot remap method_5626 …" 경고를
+ * 내고 주입이 안 붙었다. 이제 KfcFuncCoherenceMixin 과 동일하게 'yarn 시그니처 + remap=true(기본)'
+ * 로 두어 loom 이 remapJar 에서 intermediary 로 정확히 리맵하게 한다.
+ *   · method 타깃은 오버로드가 있으므로 반드시 '전체 디스크립터' 로 지정(1.21.5 yarn 확인):
+ *       hasPassenger(Entity)               — hasPassenger(Predicate) 오버로드와 구분
+ *       getPassengerAttachmentPos(Entity,Entity,EntityAttachments)Vec3d — (Entity,EntityDimensions,float) 와 구분
+ *   · @At INVOKE 의 java.util.List.indexOf 는 MC 심볼이 아니므로 그 @At 만 remap=false 유지.
+ *   · getPassengerList() 는 '코드 참조' 라 remapJar 가 항상 리맵(어노테이션 아님).
  *
  * fail-closed:
  *  - 승객 8명 미만은 바닐라 경로 그대로(동작·비용 모두 불변, 오버헤드 0).
- *  - mixins.json 이 required=false / defaultRequire=0, 각 주입도 require=0 이라 미래 MC 에서
- *    타깃이 사라져도 크래시 없이 바닐라 경로로 남는다(최적화만 소실).
+ *  - mixins.json required=false / defaultRequire=0, 각 주입도 require=0 이라 미래 MC 에서 타깃이
+ *    사라져도 크래시 없이 바닐라 경로로 남는다(최적화만 소실).
  */
 @Mixin(Entity.class)
 public abstract class KfcPerfMixin {
@@ -55,9 +59,10 @@ public abstract class KfcPerfMixin {
         return kfc$idx.getInt(p);
     }
 
-    /** hasPassenger(Entity) = passengerList.contains — 대형 리스트만 O(1) 맵 조회로 대체. */
-    @Inject(method = {"method_5626", "hasPassenger(Lnet/minecraft/entity/Entity;)Z"},
-            at = @At("HEAD"), cancellable = true, require = 0, remap = false)
+    /** hasPassenger(Entity) = passengerList.contains — 대형 리스트만 O(1) 맵 조회로 대체.
+     *  yarn 시그니처 + remap=true(기본): loom 이 intermediary 로 리맵. 오버로드 구분 위해 디스크립터 명시. */
+    @Inject(method = "hasPassenger(Lnet/minecraft/entity/Entity;)Z",
+            at = @At("HEAD"), cancellable = true, require = 0)
     private void kfc$hasPassengerFast(Entity passenger, CallbackInfoReturnable<Boolean> cir) {
         List<Entity> l = ((Entity) (Object) this).getPassengerList();
         if (l.size() >= KFC$LINEAR_MAX) {
@@ -66,12 +71,12 @@ public abstract class KfcPerfMixin {
     }
 
     /** static getPassengerAttachmentPos 내부의 getPassengerList().indexOf(passenger) 대체.
-     *  리다이렉트 수신 리스트는 vehicle 의 승객 리스트와 동일 객체이므로 vehicle 측 캐시를 쓴다. */
-    @Redirect(method = {"method_55665",
-                        "getPassengerAttachmentPos(Lnet/minecraft/entity/Entity;Lnet/minecraft/entity/Entity;Lnet/minecraft/entity/EntityAttachments;)Lnet/minecraft/util/math/Vec3d;"},
+     *  리다이렉트 수신 리스트는 vehicle 의 승객 리스트와 동일 객체이므로 vehicle 측 캐시를 쓴다.
+     *  method 는 remap=true(기본)로 loom 이 리맵; @At target(java List.indexOf)만 remap=false. */
+    @Redirect(method = "getPassengerAttachmentPos(Lnet/minecraft/entity/Entity;Lnet/minecraft/entity/Entity;Lnet/minecraft/entity/EntityAttachments;)Lnet/minecraft/util/math/Vec3d;",
               at = @At(value = "INVOKE",
                        target = "Ljava/util/List;indexOf(Ljava/lang/Object;)I", remap = false),
-              require = 0, remap = false)
+              require = 0)
     private static int kfc$attachmentIndexOf(List<?> list, Object passenger,
                                              Entity vehicle, Entity passenger2, EntityAttachments attachments) {
         if (list.size() >= KFC$LINEAR_MAX && passenger instanceof Entity pe) {

@@ -1170,6 +1170,15 @@ sourceSets {
 // 아래 플래그로 대형 메서드까지 전부 JIT 컴파일되게 한다(코드 변경 없이 성능 회복).
 // (프로덕션 서버는 이 플래그를 서버 실행 스크립트에 직접 넣어야 한다 — gradle.properties 참고.)
 loom {
+    // 25차: 아래 JavaCompile 의 -proc:none(대형 생성 코드 컴파일 최적화)이 애너테이션 프로세싱을
+    // 전부 꺼서, loom 의 sponge mixin AP(refmap 생성기)도 안 돈다 → refmap 미생성 → build 산출물
+    // (intermediary 리맵)에서 믹스인이 @Inject 대상(executeWithPrefix 등)을 못 찾아 '조용히' 실패
+    // (require=0 → 로그도 비콘도 없음). loom 1.10 은 기본이 레거시 AP 라 -proc:none 과 충돌한다.
+    // 해결: AP 가 필요 없는 loom 자체 in-place 믹스인 리매퍼로 전환(useLegacyMixinAp=false) →
+    // remapJar 가 믹스인 참조를 직접 리맵하므로 refmap 불필요, -proc:none 최적화도 유지된다.
+    mixin {
+        useLegacyMixinAp = false
+    }
     runs {
         configureEach {
             vmArgs '-XX:-DontCompileHugeMethods'   // 8KB 초과 대형 메서드도 JIT 컴파일 허용

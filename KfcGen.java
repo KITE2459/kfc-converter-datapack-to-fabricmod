@@ -319,23 +319,32 @@ public final class KfcGen {
     // 컨텍스트를 새로 만들던 비용(getOverworld/getScoreboard/getPlayerList 게터 체인) 제거.
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
+        // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브
+        // 접근인 이 지점에서 캐시를 화해한다. KfcFuncCoherenceMixin 이 CommandManager.executeWithPrefix
+        // 에서 EXTERNAL_DIRTY 를 세팅 → 명령 실행 자체엔 부하 0, 화해는 여기로 지연(coalesce).
+        // 외부 명령 실행 중 네이티브는 재진입하지 않으므로, 여기 도달 시점엔 변이가 이미 반영돼 있다.
+        if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; onExternalFunctionExecuted(); }
         GameContext c = CTX_CACHE;
         net.minecraft.server.MinecraftServer s = src.getServer();
         if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
         int t = s.getTicks();
         if (t != OBJ_TICK) {
             OBJ_TICK = t; OBJ_GEN++;   // 외부(콘솔/바닐라) objective 변경 재해소(ObjRef 전용 — 저렴)
-            // 24차[무결성]: 점수 핸들 캐시를 매 틱 경계에 화해한다. 종전 100틱 주기 화해는
-            // '외부 개입은 콘솔/OP 뿐이고 드물다'는 가정이었으나, 커맨드블럭이 호출하는 브릿지
-            // (원본 mcfunction)·타 데이터팩·수동 명령의 scoreboard reset/set 은 네이티브 훅
-            // (resetScore/setScore/dropHandlesFor)을 거치지 않아 캐시된 쓰기핸들(ScoreAccess)이
-            // '제거된 엔트리'를 가리킨 채 남는다. 네이티브 틱의 operation += 가 그 detached 엔트리에
-            // 써서 라이브 점수가 안 올라가고, @s[scores=..] 라이브 판정이 계속 불일치 → NBS 브금이
-            // 무음이 됐다(사운드룸→차고 전환: 커맨드블럭 tokartstore 가 nbs_kartstore 를 vanilla reset).
-            // 커맨드블럭 브릿지는 '정상 플레이 경로'이므로 100틱(5초) 편차는 허용 불가 → 바닐라
-            // 가시성(≤1틱)에 맞춰 매 틱 화해(정확성 우선; 종전 최적화가 맞바꾼 ~2%p 재지불).
-            HANDLE_RECON_TICK = t;
-            invalidateScoreHandles();
+            // 25차[무결성·성능 양립]: 외부 변이 화해의 '즉시 경로'는 KfcFuncCoherenceMixin 이
+            // 담당한다 — 커맨드블럭/타 데이터팩/수동이 CommandFunctionManager.execute 로 외부
+            // 함수를 실행한 직후 onExternalFunctionExecuted() 가 캐시를 무효화(≤1틱). 그래서
+            // 정상 네이티브 틱 경로는 캐시를 유지해 성능을 회복한다(24차의 매 틱 blanket 무효화 철회).
+            // 여기(틱 경계)는 '안전망'만 남긴다: 함수를 거치지 않는 bare 커맨드블럭 명령(/scoreboard
+            // /tag /data 직접)·콘솔/OP 개입은 믹스인 범위 밖이므로 100틱(5초) 주기로 수렴시킨다.
+            // (믹스인이 미적용된 환경에서도 이 안전망이 최종 정합을 보장 — fail-safe.)
+            // 믹스인 미검증(!MIXIN_PROVEN) 동안엔 매 틱 무조건 화해(검증된 안전 경로) → 믹스인이
+            // 안 붙어도 정확. 믹스인이 발동을 증명하면 100틱 안전망으로 완화(성능 회복; 즉시 화해는
+            // dirty-flag 가 담당). bare 커맨드블럭/콘솔의 잔여 편차는 이 100틱 주기가 수렴시킨다.
+            if (!MIXIN_PROVEN || HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
+                HANDLE_RECON_TICK = t;
+                invalidateScoreHandles();
+                ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
+            }
             snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
         return c;
@@ -657,15 +666,15 @@ public final class KfcGen {
             entitiesSnapshot(ctx);                    // 이 틱 스냅샷/지문 확정(첫 접근 시 재구축)
             boolean popDrift = (SNAP_FP != TB_FP);
             TB_FP = SNAP_FP;
-            // 24차[무결성]: 매 틱 경계에 버킷 화해. 증분 훅(addTag/removeTag)은 '네이티브' 태그
-            // 변경만 반영한다. 커맨드블럭이 부르는 브릿지(원본 mcfunction)·타 데이터팩·수동 /tag 의
-            // 태그 변경은 훅을 우회하고, 개체군·플레이어도 불변이라 drift/popDrift 로도 안 잡혀
-            // 최대 100틱(5초) 동안 @e[tag] 버킷이 stale 이었다(점수 핸들과 동일한 외부-변이 비일관
-            // 클래스). 버킷 재구축은 라이브 getCommandTags 순회라 변경 출처와 무관하게 정확하다.
-            // 바닐라 가시성(≤1틱)에 맞춰 매 틱 재구축한다(정확성 우선; drift/popDrift 는 이제 무조건
-            // 참이라 무의미하지만 지문 갱신은 유지). 값싼 무태그 엔티티는 재구축서 계속 스킵된다.
-            TB_RECON_TICK = tk;
-            TAG_BUCKETS.clear(); TB_EPOCH++;
+            // 25차[무결성·성능 양립]: 외부 태그 변이의 즉시 화해는 KfcFuncCoherenceMixin 이
+            // 담당한다(외부 함수 실행 직후 onExternalFunctionExecuted()→ENTITY_GEN++ 가 아래
+            // TB_GEN 검사로 버킷을 무효화). 여기는 종전 안전망(플레이어 드리프트 즉시 + 개체군
+            // 지문 드리프트 즉시 + 100틱 주기)만 유지 — 함수 밖 bare /tag·콘솔 개입 수렴용.
+            // (24차의 매 틱 무조건 clear 는 성능 회복 위해 철회.)
+            if (!MIXIN_PROVEN || drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
+                TB_RECON_TICK = tk;
+                TAG_BUCKETS.clear(); TB_EPOCH++;
+            }
         }
         if (TB_SERVER != ctx.server || TB_GEN != ENTITY_GEN) {
             TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_GEN = ENTITY_GEN;
@@ -4476,6 +4485,42 @@ public final class KfcGen {
     private static void invalidateScoreHandles() {
         SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++;
         HANDLE_GEN++; SH_GEN = HANDLE_GEN;   // 지연 검사(scoreHandle/readHandle)와 즉시 동기
+    }
+
+    // ──────────────── 외부 명령 실행 후 캐시 화해 (25차) ────────────────
+    // KfcFuncCoherenceMixin 이 net.minecraft.server.command.CommandManager.executeWithPrefix 의
+    // HEAD 에서 markExternalCommand() 를 호출한다. 이 메서드는 '모든 명령 문자열 실행'의 단일
+    // 관문이다 — 커맨드블럭(CommandBlockExecutor)·플레이어 채팅 명령·/function·타 데이터팩이 전부
+    // 여기를 지난다. (종전 CommandFunctionManager.execute 는 현대 MC 의 스텝 실행 리팩터로 /function
+    // 경로가 안 타서 감지 실패했다 — executeWithPrefix 가 올바른 관문. 우리 브릿지 runCommand 도
+    // 이 메서드를 쓰므로 시그니처가 검증돼 있다.)
+    // 화해 자체는 명령 실행 중이 아니라 '다음 네이티브 접근'(getOrCreateContext)으로 지연한다:
+    //   · 명령 실행에 부하 0(플래그 세팅만), 틱 내 다중 외부 명령은 1회 화해로 coalesce.
+    //   · 네이티브는 외부 명령 실행 중 재진입하지 않으므로, 소비 시점엔 변이가 반영돼 있다.
+    // 우리 네이티브 틱(생성 executeReturn 직접호출)과 함수 브릿지(callWithContext)는 executeWithPrefix
+    // 를 안 타므로 정상 경로 캐시는 유지된다(성능). 화해 규약은 브릿지 직후와 동일:
+    //   ENTITY_GEN++ → 태그버킷/NBT스냅샷/타입인덱스/엔티티스냅샷 연쇄 무효화
+    //   OBJ_GEN++    → objectives add/remove 반영,  invalidateScoreHandles() → detached 점수핸들 폐기,
+    //   NAME_GEN++   → /team·CustomName 반영.
+    private static volatile boolean EXTERNAL_DIRTY = false;
+    // 25차[자가조정]: 믹스인이 실제로 붙어 발동한 적이 있는지. false 인 동안엔 getOrCreateContext/
+    // tagBucket 이 '매 틱 무조건 화해'(검증된 안전 경로)로 동작해 믹스인 미적용 환경에서도 버그가
+    // 없다. 믹스인이 한 번이라도 발동하면(첫 외부 명령) true 로 굳어, 이후엔 dirty-flag 즉시 화해 +
+    // 100틱 안전망으로 완화되어 성능이 회복된다. 되돌릴 일 없는 단방향 래치(외부 명령은 세션 중
+    // 반드시 발생하므로 대개 즉시 전환).
+    private static volatile boolean MIXIN_PROVEN = false;
+    public static void markExternalCommand() {
+        if (!MIXIN_PROVEN) {
+            MIXIN_PROVEN = true;
+            System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix) — per-tick fallback disabled");
+        }
+        EXTERNAL_DIRTY = true;
+    }
+    public static void onExternalFunctionExecuted() {
+        ENTITY_GEN++;
+        OBJ_GEN++;
+        invalidateScoreHandles();
+        NAME_GEN++;
     }
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.

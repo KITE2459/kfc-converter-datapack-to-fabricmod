@@ -1,4 +1,4 @@
-package kartriderpack.mixin;
+package __KFC_GROUP__.mixin;
 
 import it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap;
 import java.util.List;

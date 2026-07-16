@@ -939,18 +939,23 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     else:
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
 
-    # KfcPerfMixin.java 자동 포함 (20차 — 바닐라 초월 최적화: 대형 승객 리스트 O(n^2) -> O(n)).
-    # KfcGen 과 동일 방식: convert.py 옆의 템플릿을 group 패키지로 치환해 배치.
-    mixin_src = Path(__file__).parent / "KfcPerfMixin.java"
-    if mixin_src.exists():
-        mx = mixin_src.read_text(encoding="utf-8")
-        mx = re.sub(r'^package\s+[\w.]+;', f'package {group}.mixin;', mx, count=1, flags=re.M)
-        mixin_dir = src_root / Path(*f"{group}.mixin".split("."))
+    # Kfc*Mixin.java 자동 포함. convert.py 옆의 모든 믹스인 템플릿을 group 패키지로 치환해 배치.
+    #   - 20차 KfcPerfMixin(승객 리스트 O(n^2)->O(n)), 25차 KfcFuncCoherenceMixin(외부 함수 실행
+    #     후 캐시 화해) 등. 새 믹스인은 파일만 추가하면 자동 포함된다(mixins.json 은 write_resources
+    #     가 동일 템플릿 디렉토리를 스캔해 목록을 맞춘다).
+    #   - 치환: __KFC_GROUP__ 플레이스홀더(KfcGen 등 그룹 참조) + 패키지 라인.
+    mixin_dir = src_root / Path(*f"{group}.mixin".split("."))
+    _mixin_templates = sorted(Path(__file__).parent.glob("Kfc*Mixin.java"))
+    if _mixin_templates:
         mixin_dir.mkdir(parents=True, exist_ok=True)
-        write_if_changed(mixin_dir / "KfcPerfMixin.java", mx)
-        print(f"[generate] KfcPerfMixin.java -> {group}.mixin")
+        for _mx_path in _mixin_templates:
+            mx = _mx_path.read_text(encoding="utf-8")
+            mx = mx.replace("__KFC_GROUP__", group)
+            mx = re.sub(r'^package\s+[\w.]+;', f'package {group}.mixin;', mx, count=1, flags=re.M)
+            write_if_changed(mixin_dir / _mx_path.name, mx)
+            print(f"[generate] {_mx_path.name} -> {group}.mixin")
     else:
-        print("[!]  KfcPerfMixin.java is not next to convert.py - perf mixin skipped")
+        print("[!]  no Kfc*Mixin.java next to convert.py - mixins skipped")
 
     write_report(out_root, fn_meta, stats, group)
     _tlog("stubs+KfcGen+report")
@@ -1500,14 +1505,17 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
         json.dumps(fabric_mod, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[generate] resources/fabric.mod.json (id={mod_id}, entry={group}.ModEntry)")
 
-    # 20차: 성능 믹스인 설정. required=false + defaultRequire=0 — 미래 MC 에서 주입이
-    # 실패해도 크래시 없이 바닐라 경로 유지(fail-closed: 최적화만 소실).
+    # 20차: 믹스인 설정. required=false + defaultRequire=0 — 미래 MC 에서 주입이 실패해도
+    # 크래시 없이 바닐라 경로 유지(fail-safe: 최적화·화해만 소실, KfcGen 안전망이 정합 보장).
+    # 25차: 목록을 convert.py 옆 Kfc*Mixin.java 템플릿에서 동적 수집 — 존재하지 않는 클래스를
+    # 나열해 로딩 에러가 나던 것을 방지하고(과거 KfcPerfMixin 부재 시), 새 믹스인 자동 반영.
+    _mixin_names = sorted(p.stem for p in Path(__file__).parent.glob("Kfc*Mixin.java"))
     mixins_json = {
         "required": False,
         "package": f"{group}.mixin",
         "compatibilityLevel": "JAVA_21",
         "minVersion": "0.8",
-        "mixins": ["KfcPerfMixin"],
+        "mixins": _mixin_names,
         "injectors": {"defaultRequire": 0}
     }
     (res / f"{mod_id}.mixins.json").write_text(

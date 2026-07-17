@@ -6643,6 +6643,13 @@ public static net.minecraft.entity.Entity firstEntity(
         net.minecraft.item.ItemStack ns =
                 net.minecraft.item.ItemStack.fromNbt(lookup, itemNbt)
                         .orElse(net.minecraft.item.ItemStack.EMPTY);   // == readCustomDataFromNbt
+        // [헤드 플래시 수정] ItemStack 은 equals 미구현(신원 비교)이라 DataTracker 가 '같은 값의 새
+        // 객체'도 항상 dirty 처리한다 → 값이 안 변한 프레임 머지(컷씬/GHZ 바다 애니 타일)도 매번
+        // 클라에 스택이 재전송되고, 클라는 수신 스택마다 profile 을 재해석해 준비될 때까지 기본
+        // 머리(스티브)를 그린다. 바닐라 /data merge 는 병합 결과가 같으면 'Nothing changed' 로
+        // 무부작용이므로, 값 동등(areEqual: 아이템·수량·컴포넌트) 시 재세팅을 생략해 바닐라와
+        // 관측을 일치시킨다(무변경 타일 재전송 0 — 패킷·클라 텍스처 재바인딩 제거).
+        if (net.minecraft.item.ItemStack.areEqual(d.getItemStack(), ns)) return true;
         d.setItemStack(ns);
         return true;
     }
@@ -6746,6 +6753,8 @@ public static net.minecraft.entity.Entity firstEntity(
                 net.minecraft.item.ItemStack _ns = (_m instanceof net.minecraft.nbt.NbtCompound _mc)
                         ? net.minecraft.item.ItemStack.fromNbt(_lk, _mc).orElse(net.minecraft.item.ItemStack.EMPTY)
                         : net.minecraft.item.ItemStack.EMPTY;
+                // [헤드 플래시 수정] 동등 스택 재세팅 생략 — applyItemDisplayNbt 의 게이트와 동일 근거.
+                if (net.minecraft.item.ItemStack.areEqual(_id.getItemStack(), _ns)) return true;
                 _id.setItemStack(_ns);
                 return true;
             }

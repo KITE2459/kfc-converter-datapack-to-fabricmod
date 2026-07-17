@@ -354,6 +354,50 @@ _PURE_PREFIX = re.compile(
 
 _INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
 
+# ── [EBB] 조건부 순수 점수쓰기: if (scoreMatches(단일,순수)) <단일 순수 쓰기>; ──
+#   조건식이 단일 scoreMatches(부수효과 없음)이고 then 이 단일 순수 점수쓰기(set/add/opScoreN
+#   상수)인 인라인 조건문만 인식한다. else/중괄호/함수호출/return then 은 매칭 실패 → 배리어.
+#   추적 키 읽기는 지역변수로 치환, 대상 키는 조건부로 지역변수 갱신(로드 후 조건 덮어쓰기)
+#   하여 강등 체인을 조건문 너머로 잇는다. 관측 시점(경계 flush)은 종전과 동일.
+_L_IF = re.compile(
+    r'^(\s*)if \(KfcGen\.scoreMatches\(sb, "(' + _H + r')", "(' + _O + r')", ('
+    + _INT + r'), (' + _INT + r')\)\) (.+);\s*$')
+_W_SET = re.compile(r'^KfcGen\.setScore\(sb, "(' + _H + r')", "(' + _O + r')", (.+)\)$')
+_W_ADD = re.compile(r'^KfcGen\.addScore\(sb, "(' + _H + r')", "(' + _O + r')", (.+)\)$')
+_W_OPN = re.compile(r'^KfcGen\.opScoreN\(sb, "(' + _H + r')", "(' + _O
+                    + r')", "(=|\+=|-=|\*=|/=|%=|<|>)", (-?\d+)\)$')
+
+def _match_then_write(then: str):
+    """then 문자열(마지막 ; 제외)이 단일 순수 쓰기면 (kind, h, o, payload) 반환, 아니면 None."""
+    m = _W_SET.match(then)
+    if m: return ("set", m.group(1), m.group(2), m.group(3))
+    m = _W_ADD.match(then)
+    if m: return ("add", m.group(1), m.group(2), m.group(3))
+    m = _W_OPN.match(then)
+    if m: return ("opn", m.group(1), m.group(2), (m.group(3), m.group(4)))
+    return None
+
+
+def _ebb_update(var: str, kind: str, payload):
+    """조건부 then 쓰기를 지역변수 갱신문으로 (기존 op 강등과 동일 규칙)."""
+    if kind == "set":
+        return f'{var} = {payload}'
+    if kind == "add":
+        return f'{var} += ({payload})'
+    op, nlit = payload
+    if op == "=":
+        return f'{var} = {nlit}'
+    if op in ("+=", "-=", "*="):
+        return f'{var} {op} {nlit}'
+    if op == "/=":
+        return f'{var} = KfcGen.sdiv({var}, {nlit})'
+    if op == "%=":
+        return f'{var} = KfcGen.smod({var}, {nlit})'
+    if op == "<":
+        return f'{var} = Math.min({var}, {nlit})'
+    return f'{var} = Math.max({var}, {nlit})'
+
+
 
 def _read_pats(h: str, o: str):
     hq, oq = re.escape(f'"{h}"'), re.escape(f'"{o}"')
@@ -394,6 +438,13 @@ def _demote_segment(seg: list[str], safe_objs: set, var_seq: list) -> tuple[list
             write_count[(m.group(2), m.group(3))] = write_count.get((m.group(2), m.group(3)), 0) + 1
         elif kind in ("op", "opn"):
             write_count[(m.group(2), m.group(3))] = write_count.get((m.group(2), m.group(3)), 0) + 1
+        else:
+            mif = _L_IF.match(ln)
+            if mif:
+                tw = _match_then_write(mif.group(6))
+                if tw is not None and tw[2] in safe_objs:
+                    wk = (tw[1], tw[2])
+                    write_count[wk] = write_count.get(wk, 0) + 1
     hot = {k for k, n in write_count.items() if n >= 2}
     if not hot:
         return seg, 0
@@ -572,6 +623,40 @@ def _demote_segment(seg: list[str], safe_objs: set, var_seq: list) -> tuple[list
             else:
                 out.append(ln)
             continue
+        # [EBB] 조건부 순수 점수쓰기: if (scoreMatches(단일)) <단일 순수 쓰기>;
+        mif = _L_IF.match(ln)
+        if mif:
+            ind = mif.group(1)
+            ch, co, cmin, cmax = mif.group(2), mif.group(3), mif.group(4), mif.group(5)
+            tw = _match_then_write(mif.group(6))
+            if tw is not None and tw[2] in safe_objs:
+                wkind, th, to, payload = tw
+                wkey = (th, to)
+                cond = subst_reads(f'KfcGen.scoreMatches(sb, "{ch}", "{co}", {cmin}, {cmax})')
+                if wkind in ("set", "add"):
+                    payload = subst_reads(payload)
+                probe = ind + cond + (payload if isinstance(payload, str) else "")
+                leftover_guard(probe, wkey)
+                # 존재/부재 시맨틱 보존: 대상 키가 '이미 active'(= 이 구간에서 무조건 쓰기로
+                # 존재가 보장됨)일 때만 조건부 지역변수 갱신으로 강등한다. active 가 아니면
+                # (첫 등장이 조건부이거나 reset 이후) 원본처럼 조건부 '라이브' 쓰기를 유지해야
+                # 조건 미발동 시 엔트리 부재가 그대로 보존된다(spurious flush 0-엔트리 방지).
+                if wkey in active:
+                    var = active[wkey][0]
+                    out.append(f'{ind}if ({cond}) {_ebb_update(var, wkind, payload)};')
+                    demoted += 1
+                else:
+                    if wkind == "set":
+                        out.append(f'{ind}if ({cond}) KfcGen.setScore(sb, "{th}", "{to}", {payload});')
+                    elif wkind == "add":
+                        out.append(f'{ind}if ({cond}) KfcGen.addScore(sb, "{th}", "{to}", {payload});')
+                    else:
+                        op, nlit = payload
+                        out.append(f'{ind}if ({cond}) KfcGen.opScoreN(sb, "{th}", "{to}", "{op}", {nlit});')
+                continue
+            # 인식 실패(방어적): 아래 일반 처리로 낙하 — 실제로는 _is_pure_line 이 걸러 도달 안 함
+
+
         # 순수 run 안의 기타 줄(다른 홀더 resetScore/opScore, CSE 선언 등):
         # 추적 키 읽기 치환 + 잔여 리터럴 가드 후 통과
         ln2 = subst_reads(ln)
@@ -603,6 +688,11 @@ def _is_pure_line(line: str, safe_objs: set) -> bool:
     s = line.strip()
     if not s or s.startswith("//"):
         return False        # 중립 줄은 별도 처리(_is_neutral_line)
+    # [EBB] 안전한 조건부 점수쓰기(단일 scoreMatches + 단일 순수 쓰기)만 구간에 포함.
+    mif = _L_IF.match(line)
+    if mif:
+        tw = _match_then_write(mif.group(6))
+        return tw is not None and tw[2] in safe_objs
     if not _PURE_PREFIX.match(line):
         return False
     kind, _ = _line_kind(line, safe_objs)

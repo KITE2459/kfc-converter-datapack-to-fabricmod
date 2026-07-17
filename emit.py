@@ -6780,11 +6780,33 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         if _bfinal != "es":
             body = [re.sub(r'\bes\b', _bfinal, b) for b in body]
 
+    # [D-10] as+at 융합: 첫 수정자 리바인딩이 `at @s`(→ atEntity(es, e))이고, 나머지 리바인딩·
+    # 조건·본문 어디에도 융합 전 소스(es) 참조가 남지 않으면 withEntity+atEntity 3-생성 체인을
+    # KfcGen.withEntityAt(부모, e) 단일 생성으로 병합한다. es 참조가 남으면(= at 이전 위치 기준
+    # 조건 등) 원형 유지(fail-closed) — atEntity 자체도 D-10 융합 1-생성이라 그 경우도 손해 없음.
+    _fuse_at = None
+    if mod_rebinds:
+        _mAT = re.match(
+            r'^\s*ServerCommandSource (kfcSrc\d+) = '
+            r'(?:KfcGen\.atEntity\(es, e\)|\(e != null \? KfcGen\.atEntity\(es, e\) : es\));\s*$',
+            mod_rebinds[0])
+        if _mAT:
+            _atv = _mAT.group(1)
+            if not any(re.search(r'\bes\b', x)
+                       for x in (mod_rebinds[1:] + mod_conds + body)):
+                _fuse_at = _atv
+    if _fuse_at is not None:
+        mod_rebinds = [re.sub(r'\b' + _fuse_at + r'\b', 'es', x) for x in mod_rebinds[1:]]
+        mod_conds = [re.sub(r'\b' + _fuse_at + r'\b', 'es', c) for c in mod_conds]
+        body = [re.sub(r'\b' + _fuse_at + r'\b', 'es', b) for b in body]
+
     # 엔티티 타입 결정
     if sel.base in ("a", "p", "r"):
         # 플레이어 루프
         head_line = "for (ServerPlayerEntity e : ctx.allPlayers) {"
-        src_line = f"ServerCommandSource es = {pre_src}.withEntity(e);"  # 바닐라 as: 부모(as 앞 수정자 적용) 컨텍스트 상속
+        src_line = (f"ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);"  # [D-10] as+at 단일 생성
+                    if _fuse_at is not None else
+                    f"ServerCommandSource es = {pre_src}.withEntity(e);")  # 바닐라 as: 부모 컨텍스트 상속
         type_filter = None
     else:
         jtypes = resolve_entity_types(sel)
@@ -6800,7 +6822,9 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             jtypes = "ANY"
         else:
             type_exclude_cond = None
-        src_line = f"ServerCommandSource es = {pre_src}.withEntity(e);"  # 바닐라 as: 부모(as 앞 수정자 적용) 컨텍스트 상속
+        src_line = (f"ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);"  # [D-10] as+at 단일 생성
+                    if _fuse_at is not None else
+                    f"ServerCommandSource es = {pre_src}.withEntity(e);")  # 바닐라 as: 부모 컨텍스트 상속
 
     # 태그 필터 + scores 필터 (en. 기준; 플레이어 루프는 아래서 e. 로 치환)
     conds = []
@@ -6858,7 +6882,12 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         out.append(f'{{ net.minecraft.entity.Entity e = {pre_src}.getEntity();')
         out.append(f'  if ({guard}) {{')
         if _es_used("es", mod_rebinds, mod_conds, body):
-            out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+            # [D-10] 융합 발동 시 at@s 리바인딩이 mod_rebinds 에서 제거돼 있으므로 여기서도
+            # 단일 생성 withEntityAt 으로 만들어야 위치·회전 시맨틱이 보존된다.
+            if _fuse_at is not None:
+                out.append(f'    ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);')
+            else:
+                out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:
@@ -6884,7 +6913,12 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         out.append(f'{{ net.minecraft.entity.Entity e = {ent};')
         out.append('  if (e != null) {')
         if _es_used("es", mod_rebinds, mod_conds, body):
-            out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+            # [D-10] 융합 발동 시 at@s 리바인딩이 mod_rebinds 에서 제거돼 있으므로 여기서도
+            # 단일 생성 withEntityAt 으로 만들어야 위치·회전 시맨틱이 보존된다.
+            if _fuse_at is not None:
+                out.append(f'    ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);')
+            else:
+                out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:

@@ -932,6 +932,8 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     if kfcgen_src.exists():
         kg = kfcgen_src.read_text(encoding="utf-8")
         kg = re.sub(r'^package\s+[\w.]+;', f'package {group}.generated;', kg, count=1, flags=re.M)
+        # D-10: KfcGen 이 KfcScsMixin(그룹.mixin) 을 참조하므로 그룹 토큰도 치환.
+        kg = kg.replace("__KFC_GROUP__", group)
         gen_dir = src_root / Path(*f"{group}.generated".split("."))
         gen_dir.mkdir(parents=True, exist_ok=True)
         write_if_changed(gen_dir / "KfcGen.java", kg)

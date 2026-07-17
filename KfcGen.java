@@ -3078,11 +3078,49 @@ public final class KfcGen {
     // 이 메서드 스코프로 옮겨 JIT 이스케이프 분석이 스칼라 치환하기 쉬운 형태로 만들고,
     // withPosition/withRotation 의 값-동일 단락(this 반환)을 그대로 활용한다(관측 동일:
     // 두 with 의 합성과 정확히 같은 pos/rot 소스). null 은 바닐라 at 처럼 no-op(src 유지).
+    // [D-10] KfcScsMixin(접근자+생성자 인보커) 적용 시 '단일 생성' 리바인드. 미적용이면
+    // instanceof 가 거짓 → 기존 with* 체인 폴백(관측 동일). 첫 융합 시 1회 로그(적용 검증용).
+    private static boolean SCS_FUSE_LOGGED = false;
+    private static void scsFuseLog() {
+        if (!SCS_FUSE_LOGGED) {
+            SCS_FUSE_LOGGED = true;
+            System.out.println("[KFC] SCS fused rebind active (KfcScsMixin single-construction)");
+        }
+    }
+
     public static net.minecraft.server.command.ServerCommandSource atEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
         if (e == null) return src;
+        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
+            scsFuseLog();
+            // 기존 withPosition+withRotation 2-체인과 필드 단위로 동일(pos·rot 만 교체, world 불변).
+            return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
+                    acc.kfc$output(), e.getPos(),
+                    new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()),
+                    src.getWorld(), acc.kfc$level(), src.getName(), src.getDisplayName(),
+                    src.getServer(), src.getEntity(), src.isSilent(), src.getReturnValueConsumer(),
+                    src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
+        }
         return src.withPosition(e.getPos())
                   .withRotation(new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()));
+    }
+
+    /** [D-10] `as <e> at @s` 융합: withEntity(e)+atEntity(…,e) 3-생성 체인 → 단일 생성.
+     *  withEntity 의 name/displayName 갱신(getNameForScoreboard/getDisplayName — 바이트코드 확인)
+     *  + at 의 pos/rot 교체를 한 번에 수행. 필드 단위로 기존 체인과 동일. 믹스인 미적용 폴백 동일. */
+    public static net.minecraft.server.command.ServerCommandSource withEntityAt(
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
+        if (e == null) return src;
+        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
+            scsFuseLog();
+            return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
+                    acc.kfc$output(), e.getPos(),
+                    new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()),
+                    src.getWorld(), acc.kfc$level(), e.getNameForScoreboard(), e.getDisplayName(),
+                    src.getServer(), e, src.isSilent(), src.getReturnValueConsumer(),
+                    src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
+        }
+        return atEntity(src.withEntity(e), e);
     }
 
     /** anchored eyes — caret(^) 원점을 실행자 눈 위치로(소스 위치 리바인드). */

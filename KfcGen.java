@@ -4560,11 +4560,17 @@ public final class KfcGen {
     // 검증돼 종전의 !MIXIN_PROVEN per-tick 폴백 분기는 제거했다 — 상시 dirty-flag 즉시 화해 +
     // 100틱 안전망 경로로만 동작한다(이유 없는 분기 제거).
     private static boolean COHERENCE_LOGGED = false;
-    public static void markExternalCommand() {
+    // 진단 토글: -Dkfc.debug.coherence=true 로 켜면 executeWithPrefix 훅이 '발동할 때마다' 명령
+    // 문자열과 함께 로그 → 훅이 실제로 붙어 도는지 명령별로 확인(일회성 활성 로그의 한계 보완:
+    // 활성 로그는 부팅 초기 load-tag 명령/내부 runCommand 가 이미 소비해 이후 안 보일 수 있음).
+    // 미설정 시 per-call 비용은 static final boolean 분기 1회(무시 가능).
+    private static final boolean DEBUG_COHERENCE = Boolean.getBoolean("kfc.debug.coherence");
+    public static void markExternalCommand(String command) {
         if (!COHERENCE_LOGGED) {
             COHERENCE_LOGGED = true;
             System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix)");
         }
+        if (DEBUG_COHERENCE) System.out.println("[KFC] executeWithPrefix fired: /" + command);
         EXTERNAL_DIRTY = true;
     }
     public static void onExternalFunctionExecuted() {

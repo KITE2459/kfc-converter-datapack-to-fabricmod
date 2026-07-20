@@ -1468,6 +1468,22 @@ import com.mojang.brigadier.CommandDispatcher;
 public final class ModEntry implements ModInitializer {{
     @Override
     public void onInitialize() {{
+        // [KFC] 믹스인 부팅 감사 — 각 믹스인이 '적용'됐는지 부팅 시 1회 확인(사용 로그와 별개).
+        //   SCS  : ServerCommandSource 가 인터페이스 믹스인을 구현하는지(적용 시 implements).
+        //   Perf : Entity 에 @Unique 필드(kfc$idx)가 병합됐는지.
+        //   FuncCoherence : CommandManager.<init> 주입 핸들러가 부팅 시 직접 로그(같은 리맵 경로).
+        System.out.println("[KFC] mixin apply-check (boot):");
+        try {{
+            boolean scs = {group}.mixin.KfcScsMixin.class.isAssignableFrom(
+                    net.minecraft.server.command.ServerCommandSource.class);
+            System.out.println("[KFC]   SCS(ServerCommandSource) = " + (scs ? "APPLIED" : "MISSING"));
+        }} catch (Throwable t) {{ System.out.println("[KFC]   SCS = ERROR " + t); }}
+        try {{
+            net.minecraft.entity.Entity.class.getDeclaredField("kfc$idx");
+            System.out.println("[KFC]   Perf(Entity) = APPLIED");
+        }} catch (NoSuchFieldException e) {{
+            System.out.println("[KFC]   Perf(Entity) = MISSING");
+        }} catch (Throwable t) {{ System.out.println("[KFC]   Perf(Entity) = ERROR " + t); }}
         ServerTickEvents.START_SERVER_TICK.register(server -> {{
             ServerCommandSource src = server.getCommandSource().withSilent();
 {tick_body}

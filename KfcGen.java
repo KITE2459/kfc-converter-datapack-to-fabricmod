@@ -337,10 +337,9 @@ public final class KfcGen {
             // 여기(틱 경계)는 '안전망'만 남긴다: 함수를 거치지 않는 bare 커맨드블럭 명령(/scoreboard
             // /tag /data 직접)·콘솔/OP 개입은 믹스인 범위 밖이므로 100틱(5초) 주기로 수렴시킨다.
             // (믹스인이 미적용된 환경에서도 이 안전망이 최종 정합을 보장 — fail-safe.)
-            // 믹스인 미검증(!MIXIN_PROVEN) 동안엔 매 틱 무조건 화해(검증된 안전 경로) → 믹스인이
-            // 안 붙어도 정확. 믹스인이 발동을 증명하면 100틱 안전망으로 완화(성능 회복; 즉시 화해는
-            // dirty-flag 가 담당). bare 커맨드블럭/콘솔의 잔여 편차는 이 100틱 주기가 수렴시킨다.
-            if (!MIXIN_PROVEN || HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
+            // coherence 믹스인 발동이 확인돼(1회 활성 로그) 상시 dirty-flag 즉시 화해로 동작한다.
+            // 여기는 함수를 거치지 않는 bare 커맨드블럭/콘솔 개입만 100틱(5초) 주기로 수렴시키는 안전망.
+            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
                 HANDLE_RECON_TICK = t;
                 invalidateScoreHandles();
                 ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
@@ -671,7 +670,7 @@ public final class KfcGen {
             // TB_GEN 검사로 버킷을 무효화). 여기는 종전 안전망(플레이어 드리프트 즉시 + 개체군
             // 지문 드리프트 즉시 + 100틱 주기)만 유지 — 함수 밖 bare /tag·콘솔 개입 수렴용.
             // (24차의 매 틱 무조건 clear 는 성능 회복 위해 철회.)
-            if (!MIXIN_PROVEN || drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
+            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
                 TB_RECON_TICK = tk;
                 TAG_BUCKETS.clear(); TB_EPOCH++;
             }
@@ -4552,17 +4551,19 @@ public final class KfcGen {
     //   ENTITY_GEN++ → 태그버킷/NBT스냅샷/타입인덱스/엔티티스냅샷 연쇄 무효화
     //   OBJ_GEN++    → objectives add/remove 반영,  invalidateScoreHandles() → detached 점수핸들 폐기,
     //   NAME_GEN++   → /team·CustomName 반영.
-    private static volatile boolean EXTERNAL_DIRTY = false;
-    // 25차[자가조정]: 믹스인이 실제로 붙어 발동한 적이 있는지. false 인 동안엔 getOrCreateContext/
-    // tagBucket 이 '매 틱 무조건 화해'(검증된 안전 경로)로 동작해 믹스인 미적용 환경에서도 버그가
-    // 없다. 믹스인이 한 번이라도 발동하면(첫 외부 명령) true 로 굳어, 이후엔 dirty-flag 즉시 화해 +
-    // 100틱 안전망으로 완화되어 성능이 회복된다. 되돌릴 일 없는 단방향 래치(외부 명령은 세션 중
-    // 반드시 발생하므로 대개 즉시 전환).
-    private static volatile boolean MIXIN_PROVEN = false;
+    // [스레드 노트 준수] 커맨드 실행·네이티브 틱 모두 서버 메인 스레드 전용(상단 스레드 노트)이라
+    // 이 플래그도 단일 스레드에서만 쓰인다 — writer=markExternalCommand(executeWithPrefix HEAD),
+    // reader=getOrCreateContext(네이티브 틱). 가드하는 캐시들이 전부 non-volatile HashMap 이므로
+    // volatile 은 실질 안전 이득 없이 hot path(executeReturn 마다 읽음)에 메모리 배리어만 부과했다 → 제거.
+    private static boolean EXTERNAL_DIRTY = false;
+    // 믹스인 발동 여부는 SCS(SCS_FUSE_LOGGED)와 동일하게 '1회 활성 로그'로만 확인한다. 작동이
+    // 검증돼 종전의 !MIXIN_PROVEN per-tick 폴백 분기는 제거했다 — 상시 dirty-flag 즉시 화해 +
+    // 100틱 안전망 경로로만 동작한다(이유 없는 분기 제거).
+    private static boolean COHERENCE_LOGGED = false;
     public static void markExternalCommand() {
-        if (!MIXIN_PROVEN) {
-            MIXIN_PROVEN = true;
-            System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix) — per-tick fallback disabled");
+        if (!COHERENCE_LOGGED) {
+            COHERENCE_LOGGED = true;
+            System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix)");
         }
         EXTERNAL_DIRTY = true;
     }

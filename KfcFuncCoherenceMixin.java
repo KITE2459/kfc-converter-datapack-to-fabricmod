@@ -2,6 +2,7 @@ package __KFC_GROUP__.mixin;
 
 import net.minecraft.server.command.CommandManager;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
@@ -31,6 +32,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  */
 @Mixin(CommandManager.class)
 public class KfcFuncCoherenceMixin {
+    @Unique private static boolean kfc$applyLogged = false;
+
+    // [부팅 적용 로그] CommandManager 는 서버 부팅(및 /reload) 시 생성된다 — 이 핸들러가 붙어
+    // 실행되면 CommandManager 로의 메서드 주입이 성공했다는 뜻(executeWithPrefix 훅도 같은 클래스·
+    // 같은 리맵 경로라 사실상 함께 적용된다). SCS 처럼 1회만 로그. 부팅 전용이라 hot path 아님.
+    @Inject(method = "<init>", at = @At("TAIL"), require = 0)
+    private void kfc$logApply(CallbackInfo ci) {
+        if (!kfc$applyLogged) {
+            kfc$applyLogged = true;
+            System.out.println("[KFC] mixin apply-check: FuncCoherence(CommandManager) = APPLIED (executeWithPrefix hook live)");
+        }
+    }
+
     @Inject(method = "executeWithPrefix", at = @At("HEAD"), require = 0)
     private void kfc$onExternalCommand(CallbackInfo ci) {
         __KFC_GROUP__.generated.KfcGen.markExternalCommand();

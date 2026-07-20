@@ -247,6 +247,10 @@ public final class KfcGen {
     // reload 과 무관(레지스트리 '키'일 뿐 내용 아님) → 캐시 안전. null 입력은 그대로 null 반환.
     private static final java.util.HashMap<String, net.minecraft.util.Identifier>
             ID_CACHE = new java.util.HashMap<>();
+    // UUID.fromString 은 호출당 문자열 파싱(hex→2 long)+할당. 컷씬 <uuid> 리터럴은 상수라
+    // 프레임마다 재파싱이 낭비 → String→UUID 캐시(idOf/soundEventCached 와 동일 패턴). UUID 불변,
+    // 파싱 결정적이라 안전. 유효 파싱만 캐시(불량 리터럴은 실사용에 없음 — 미캐시 재시도).
+    private static final java.util.Map<String, java.util.UUID> UUID_CACHE = boundedMap(4096);
 
     private static net.minecraft.util.Identifier idOf(String s) {
         if (s == null) return null;
@@ -4062,7 +4066,10 @@ public final class KfcGen {
             } else {
                 ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
             }
-            _movePassengersByDelta(ps, dx, dy, dz);   // 빈 리스트는 진입부 n==0 으로 즉시 복귀
+            // 잎 승객(모델 파츠 대다수 — 승객 없음)은 빈 재귀 진입(getPassengerList+빈 루프+프레임)을
+            // 생략한다. hasPassengers()=passengerList.isEmpty() 필드검사 1회로 재귀 method-call 을 없앤다.
+            // 관측 동등: 승객 없는 엔티티의 재귀는 원래도 무동작이었다.
+            if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
         }
     }
 
@@ -7441,9 +7448,12 @@ public static net.minecraft.entity.Entity firstEntity(
      *  getEntity(uuid) 를 찾는다(EntitySelector.getEntities 바이트코드 확인). 축약 UUID
      *  ("7437-0-a-0-0" 등)는 UUID.fromString 이 그룹별 16진 파싱으로 허용한다(바닐라 동일). */
     public static net.minecraft.entity.Entity entityByUuid(GameContext ctx, String uuid) {
-        java.util.UUID id;
-        try { id = java.util.UUID.fromString(uuid); }
-        catch (IllegalArgumentException e) { return null; }
+        java.util.UUID id = UUID_CACHE.get(uuid);
+        if (id == null) {
+            try { id = java.util.UUID.fromString(uuid); }
+            catch (IllegalArgumentException e) { return null; }   // 불량 리터럴(실사용 무): 미캐시
+            UUID_CACHE.put(uuid, id);
+        }
         for (net.minecraft.server.world.ServerWorld w : ctx.server.getWorlds()) {
             net.minecraft.entity.Entity e = w.getEntity(id);
             if (e != null) return e;

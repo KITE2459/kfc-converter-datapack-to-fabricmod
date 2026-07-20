@@ -60,6 +60,11 @@ public final class KfcGen {
     // 행렬의 재파싱·재분해를 제거한다(distinct 행렬당 1회). 캐시 인스턴스 공유는 불변이라 안전.
     private static final java.util.Map<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
             TRANSFORM_CACHE = boundedMap(8192);
+    // [identity 1차 캐시] 이 팩의 transformation 은 전부 상수 리터럴(동일 NbtElement 객체 재사용)이라
+    // 값 기준 deep hashCode/equals 없이 객체 identity 로 즉시 히트시킨다. 미스 시 값 기준 TRANSFORM_CACHE
+    // 로 폴백(서로 다른 객체·같은 값 dedup 유지 → 범용성 보존). 둘 다 불변 매핑이라 무효화 불필요.
+    private static final java.util.IdentityHashMap<net.minecraft.nbt.NbtElement, net.minecraft.util.math.AffineTransformation>
+            TRANSFORM_ID_CACHE = new java.util.IdentityHashMap<>();
     /** 파싱된 텍스트 + '정적(재해석 불필요)' 플래그. score/selector/nbt 컴포넌트가 없는 트리는
      *  Texts.parse 가 항등(불변 Text 복제)이므로 파싱된 인스턴스를 그대로 재사용해도 관측 동일. */
     private static final class CachedText {
@@ -6726,16 +6731,8 @@ public static net.minecraft.entity.Entity firstEntity(
                 }
             }
             case "transformation": {
-                net.minecraft.util.math.AffineTransformation at = TRANSFORM_CACHE.get(v);
-                if (at == null) {
-                    java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
-                            net.minecraft.util.math.AffineTransformation.ANY_CODEC
-                                    .parse(net.minecraft.nbt.NbtOps.INSTANCE, v).result();
-                    if (r.isEmpty()) return false;
-                    at = r.get();
-                    // 동적값 폭주 대비 소프트 캡(이 팩의 transformation 은 전부 상수 리터럴이라 distinct 유한).
-                    if (TRANSFORM_CACHE.size() < 8192) TRANSFORM_CACHE.put(v.copy(), at);
-                }
+                net.minecraft.util.math.AffineTransformation at = transformCached(v);
+                if (at == null) return false;
                 d.setTransformation(at);
                 // 바닐라 /data modify 는 readNbt 를 거쳐 setStartInterpolation(force=true)을
                 // 호출하므로 보간이 매번 재트리거된다. setTransformation 만으로는
@@ -7367,6 +7364,24 @@ public static net.minecraft.entity.Entity firstEntity(
 
     /** data merge entity <e> {snbt} — 컴파운드를 엔티티 NBT 에 깊은 병합(/data merge 시맨틱). */
     /** display fast 머지가 가능한 키들 — 전부 직접 setter 가 있는 DataTracker 필드. */
+    // transformation NbtElement → 파싱·TRS분해된 AffineTransformation(불변). identity 1차 + 값기준 2차.
+    // 파싱 실패 시 null(호출부는 fast-path 포기). 관측·캐시 동작은 종전 인라인 로직과 동일.
+    private static net.minecraft.util.math.AffineTransformation transformCached(net.minecraft.nbt.NbtElement v) {
+        net.minecraft.util.math.AffineTransformation at = TRANSFORM_ID_CACHE.get(v);   // identity: deep hashCode 회피
+        if (at != null) return at;
+        at = TRANSFORM_CACHE.get(v);                                                    // 값 기준 dedup(범용성)
+        if (at == null) {
+            java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
+                    net.minecraft.util.math.AffineTransformation.ANY_CODEC
+                            .parse(net.minecraft.nbt.NbtOps.INSTANCE, v).result();
+            if (r.isEmpty()) return null;
+            at = r.get();
+            if (TRANSFORM_CACHE.size() < 8192) TRANSFORM_CACHE.put(v.copy(), at);       // 동적값 소프트 캡
+        }
+        if (TRANSFORM_ID_CACHE.size() < 8192) TRANSFORM_ID_CACHE.put(v, at);
+        return at;
+    }
+
     private static boolean displayMergeFast(net.minecraft.entity.Entity e,
                                             net.minecraft.nbt.NbtCompound patch) {
         if (!(e instanceof net.minecraft.entity.decoration.DisplayEntity d)) return false;
@@ -7395,15 +7410,8 @@ public static net.minecraft.entity.Entity firstEntity(
         // 롤백성 튐이 발생했다. 여기서는 각 setter 를 고정 순서로 정확히 1회만 호출한다.
         if (patch.contains("transformation")) {
             net.minecraft.nbt.NbtElement tv = patch.get("transformation");
-            net.minecraft.util.math.AffineTransformation at = TRANSFORM_CACHE.get(tv);
-            if (at == null) {
-                java.util.Optional<net.minecraft.util.math.AffineTransformation> r =
-                        net.minecraft.util.math.AffineTransformation.ANY_CODEC
-                                .parse(net.minecraft.nbt.NbtOps.INSTANCE, tv).result();
-                if (r.isEmpty()) return false;
-                at = r.get();
-                if (TRANSFORM_CACHE.size() < 8192) TRANSFORM_CACHE.put(tv.copy(), at);
-            }
+            net.minecraft.util.math.AffineTransformation at = transformCached(tv);
+            if (at == null) return false;
             d.setTransformation(at);
         }
         if (patch.contains("interpolation_duration"))

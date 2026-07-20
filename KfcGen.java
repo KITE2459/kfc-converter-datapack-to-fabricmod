@@ -1900,6 +1900,18 @@ public final class KfcGen {
         return lv >= lo && lv <= hi;
     }
 
+    /** x_rotation/y_rotation 술어 - 바닐라 EntitySelectorReader.getRotationPredicate 1:1 포팅.
+     *  엔티티 각도와 경계 both wrapDegrees([-180,180)) 정규화 후 비교하고, 무한계 쪽은
+     *  바닐라 기본값(min=0 / max=359)을 채운다. min>max(래핑)은 wrap 후 d>e 로 OR 판정.
+     *  과거 rotation_conds 는 getYaw() 원값을 직접 비교해 누적 yaw(>180도)/단측 범위에서
+     *  결과 집합이 어긋났다(예: y_rotation=45.. 를 반직선으로 처리). */
+    public static boolean rotInRange(double angle, boolean hasMin, double min, boolean hasMax, double max) {
+        double d = net.minecraft.util.math.MathHelper.wrapDegrees(hasMin ? min : 0.0);
+        double e = net.minecraft.util.math.MathHelper.wrapDegrees(hasMax ? max : 359.0);
+        double f = net.minecraft.util.math.MathHelper.wrapDegrees(angle);
+        return d > e ? (f >= d || f <= e) : (f >= d && f <= e);
+    }
+
     public static void killEntity(net.minecraft.entity.Entity e) {
         if (e == null) return;
         // 바닐라 KillCommand 는 대상 전원(플레이어 포함)에 entity.kill(world) 를 호출한다.
@@ -5360,6 +5372,34 @@ public static net.minecraft.entity.Entity nearestEntity(
             if (d < bestD) { bestD = d; best = p; }
         }
         return best;
+    }
+
+    /** @r - 매칭 플레이어 중 균등 랜덤 1명(바닐라 EntitySelectorReader RANDOM 정렬 = 셔플 후 첫). */
+    public static net.minecraft.server.network.ServerPlayerEntity randomPlayer(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        java.util.List<net.minecraft.server.network.ServerPlayerEntity> pool = null;
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (!matchTags(p, tagsPos, tagsNeg)) continue;
+            if (!inRange(origin, p, minDist, maxDist)) continue;
+            if (pool == null) pool = new java.util.ArrayList<>();
+            pool.add(p);
+        }
+        if (pool == null) return null;
+        return pool.size() == 1 ? pool.get(0) : pool.get(ctx.world.getRandom().nextInt(pool.size()));
+    }
+
+    /** @r + 추가 술어(gamemode/scores/predicate/rotation) - 매칭 중 균등 랜덤 1명. */
+    public static net.minecraft.server.network.ServerPlayerEntity randomPlayerWhere(
+            GameContext ctx, java.util.function.Predicate<net.minecraft.server.network.ServerPlayerEntity> cond) {
+        java.util.List<net.minecraft.server.network.ServerPlayerEntity> pool = null;
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (!cond.test(p)) continue;
+            if (pool == null) pool = new java.util.ArrayList<>();
+            pool.add(p);
+        }
+        if (pool == null) return null;
+        return pool.size() == 1 ? pool.get(0) : pool.get(ctx.world.getRandom().nextInt(pool.size()));
     }
 
     /** 무한거리(박스 없음) 단일 타입 조회. getEntitiesByType 의 제네릭 T 를 Entity 로 바인딩해

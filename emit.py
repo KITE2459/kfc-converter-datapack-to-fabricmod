@@ -1353,7 +1353,10 @@ def nearest_entity_java(sel: "Selector") -> str | None:
     tn = java_str_array(sel.tags_neg)
     near = _want_nearest(sel)
     if sel.base in ("a", "p", "r"):
-        fnp = "nearestPlayer" if (near or sel.base == "r") else "firstPlayer"
+        if sel.base == "r":
+            # @r = 균등 랜덤(바닐라). 과거엔 nearest 로 해소해 '항상 최근접'이 되던 divergence.
+            return f'KfcGen.randomPlayer(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
+        fnp = "nearestPlayer" if near else "firstPlayer"
         return f'KfcGen.{fnp}(ctx, source.getPosition(), {tp}, {tn}, {lo}, {hi})'
     jt = resolve_entity_types(sel)
     if jt is None:
@@ -2751,25 +2754,23 @@ def _score_conds(sel, var: str) -> list:
 
 
 def rotation_conds(sel, evar: str):
-    """x_rotation/y_rotation -> 자바 조건식 리스트. yaw 래핑(min>max)도 OR 로 지원."""
+    """x_rotation/y_rotation -> 자바 조건식 리스트(축당 1개). 바닐라
+       EntitySelectorReader.getRotationPredicate 를 그대로 옮긴 KfcGen.rotInRange 로 위임한다:
+       엔티티 각도와 경계 both wrapDegrees([-180,180)) 정규화 후 비교하고, 무한계 쪽은 바닐라
+       기본값(min=0/max=359)을 채우며 min>max(래핑)은 wrap 후 d>e 로 OR 판정한다.
+       과거처럼 getYaw() 원값을 직접 비교하면 누적 yaw(>180°)·단측 범위(예: y_rotation=45..)에서
+       결과 집합이 어긋난다. rotInRange 가 이 전부를 런타임에 정확히 재현한다."""
     out = []
-    if sel.x_rotation is not None:
-        lo, hi = sel.x_rotation
-        if lo is not None:
-            out.append(f'{evar}.getPitch() >= {_dist_arg(lo)}')
-        if hi is not None:
-            out.append(f'{evar}.getPitch() <= {_dist_arg(hi)}')
-    if sel.y_rotation is not None:
-        lo, hi = sel.y_rotation
-        _ymac = ("MACROVAR_" in str(lo)) or ("MACROVAR_" in str(hi))   # 매크로면 정적 래핑판정 불가
-        if lo is not None and hi is not None and not _ymac and float(lo) > float(hi):
-            # 래핑 범위: yaw>=lo OR yaw<=hi (예: y_rotation=170..-170 -> 정면 뒤쪽)
-            out.append(f'({evar}.getYaw() >= {_dist_arg(lo)} || {evar}.getYaw() <= {_dist_arg(hi)})')
-        else:
-            if lo is not None:
-                out.append(f'{evar}.getYaw() >= {_dist_arg(lo)}')
-            if hi is not None:
-                out.append(f'{evar}.getYaw() <= {_dist_arg(hi)}')
+    for field, getter in (("x_rotation", "getPitch"), ("y_rotation", "getYaw")):
+        rng = getattr(sel, field)
+        if rng is None:
+            continue
+        lo, hi = rng
+        haslo = "true" if lo is not None else "false"
+        hashi = "true" if hi is not None else "false"
+        loj = _dist_arg(lo) if lo is not None else "0.0"
+        hij = _dist_arg(hi) if hi is not None else "0.0"
+        out.append(f'KfcGen.rotInRange({evar}.{getter}(), {haslo}, {loj}, {hashi}, {hij})')
     return out
 
 
@@ -7886,10 +7887,15 @@ def single_entity_expr(raw: str) -> str | None:
             body5 = " && ".join(pc) if pc else "true"
             if _is_arbitrary:
                 return f'KfcGen.firstPlayerWhere(ctx, _pe -> ({body5}))'
+            if sel.base == "r":
+                return f'KfcGen.randomPlayerWhere(ctx, _pe -> ({body5}))'
             return f'KfcGen.nearestPlayerWhere(ctx, source.getPosition(), _pe -> ({body5}))'
         if _is_arbitrary:
             return f'KfcGen.firstPlayer(ctx, {tp}, {tn}, {dmin}, {dmax}, source.getPosition())'
-        _fnp = "nearestPlayer" if (_want_nearest(sel) or sel.base == "r") else "firstPlayer"
+        if sel.base == "r":
+            # @r = 균등 랜덤(바닐라). nearest 해소 divergence 교정.
+            return f'KfcGen.randomPlayer(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
+        _fnp = "nearestPlayer" if _want_nearest(sel) else "firstPlayer"
         return f'KfcGen.{_fnp}(ctx, source.getPosition(), {tp}, {tn}, {dmin}, {dmax})'
     if sel.base in ("n", "e"):
         types = resolve_entity_types(sel)

@@ -332,7 +332,7 @@ public final class KfcGen {
         // 접근인 이 지점에서 캐시를 화해한다. KfcFuncCoherenceMixin 이 CommandManager.executeWithPrefix
         // 에서 EXTERNAL_DIRTY 를 세팅 → 명령 실행 자체엔 부하 0, 화해는 여기로 지연(coalesce).
         // 외부 명령 실행 중 네이티브는 재진입하지 않으므로, 여기 도달 시점엔 변이가 이미 반영돼 있다.
-        if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; int _m = EXTERNAL_MASK; EXTERNAL_MASK = 0; onExternalFunctionExecuted(_m); }
+        if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; onExternalFunctionExecuted(); }
         GameContext c = CTX_CACHE;
         net.minecraft.server.MinecraftServer s = src.getServer();
         if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
@@ -1397,7 +1397,9 @@ public final class KfcGen {
 
     /** stopsound <targets> [category] [sound] */
     public static void stopSound(net.minecraft.server.network.ServerPlayerEntity p, String category, String soundId) {
-        net.minecraft.util.Identifier id = (soundId == null ? null : idOf(soundId));
+        net.minecraft.util.Identifier id;
+        try { id = (soundId == null ? null : idOf(soundId)); }
+        catch (Exception ex) { return; }   // 잘못된 사운드 id → stopsound no-op(vanilla 명령실패 동등, 틱 크래시 방지)
         net.minecraft.sound.SoundCategory cat = null;
         if (category != null) {
             for (net.minecraft.sound.SoundCategory c : net.minecraft.sound.SoundCategory.values()) {
@@ -2121,15 +2123,12 @@ public final class KfcGen {
 
     private static net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>
             soundEventCached(String soundId) {
-        return SOUND_CACHE.computeIfAbsent(soundId, sid -> {
-            net.minecraft.util.Identifier id = idOf(
-                    sid.contains(":") ? sid : "minecraft:" + sid);
-            net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
-            // RegistryEntry 래핑까지 캐시한다 — RegistryEntry.of(ev) 를 매 호출(이 팩 ~33만회)
-            // 새로 할당하던 비용 제거. RegistryEntry/SoundEvent 모두 불변이라 공유 안전.
-            return net.minecraft.registry.entry.RegistryEntry.of(
-                    e != null ? e : net.minecraft.sound.SoundEvent.of(id));  // 미등록도 id 그대로 재생(바닐라 허용)
-        });
+        net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> re = SOUND_CACHE.get(soundId);
+        if (re == null) {
+            re = soundEvent(soundId);                 // idOf 가드됨: 잘못된 id → null
+            if (re != null) SOUND_CACHE.put(soundId, re);   // 유효한 것만 캐시(null 미캐시)
+        }
+        return re;   // null 이면 core playSound 가 스킵(vanilla 명령실패 동등, 크래시 없음)
     }
 
     private static net.minecraft.sound.SoundCategory soundCatCached(String category) {
@@ -2152,7 +2151,9 @@ public final class KfcGen {
     //  frozen 상태라 안전. 로직은 SOUND_CACHE/SOUND_CAT_CACHE 람다와 완전 동일.
     // ════════════════════════════════════════════════════════════════
     public static net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> soundEvent(String soundId) {
-        net.minecraft.util.Identifier id = idOf(soundId.contains(":") ? soundId : "minecraft:" + soundId);
+        net.minecraft.util.Identifier id;
+        try { id = idOf(soundId.contains(":") ? soundId : "minecraft:" + soundId); }
+        catch (Exception ex) { return null; }   // 잘못된 사운드 id → null(재생 스킵). 상수/틱 크래시 방지, vanilla 명령실패 동등.
         net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
         // 미등록 id 도 그대로 재생(바닐라 허용) — RegistryEntry 래핑까지 1회.
         return net.minecraft.registry.entry.RegistryEntry.of(
@@ -2217,7 +2218,7 @@ public final class KfcGen {
                                  net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent> ev,
                                  net.minecraft.sound.SoundCategory cat,
                                  double x, double y, double z, float vol, float pitch, float minVol, long seed) {
-        if (p == null) return;
+        if (p == null || ev == null) return;   // ev==null: 잘못된 사운드 id 해소 실패 → 무재생(패킷 없음)
         double lim = vol > 1.0f ? (double) (vol * 16.0f) : 16.0;
         double dx = x - p.getX(), dy = y - p.getY(), dz = z - p.getZ();
         double d2 = dx * dx + dy * dy + dz * dz;
@@ -4571,73 +4572,6 @@ public final class KfcGen {
     // 믹스인 발동 여부는 SCS(SCS_FUSE_LOGGED)와 동일하게 '1회 활성 로그'로만 확인한다. 작동이
     // 검증돼 종전의 !MIXIN_PROVEN per-tick 폴백 분기는 제거했다 — 상시 dirty-flag 즉시 화해 +
     // 100틱 안전망 경로로만 동작한다(이유 없는 분기 제거).
-    // ── [선별 화해] 외부 명령이 실제로 무효화해야 하는 캐시 카테고리만 지운다(blanket → 선별). ──
-    // 근거: 점수 읽기/쓰기 핸들은 '엔트리 참조'를 캐시하고 값은 live 로 읽으므로, 값 변경 명령
-    // (scoreboard players set/add/remove/operation/enable)은 무효화가 불필요하다. 엔트리를 제거하는
-    // reset/objectives 와 이를 래핑할 수 있는 execute(run)/function/return/미상 만 M_SCORE 를 켠다.
-    // 태그/nbt/개체군은 M_ENTITY(ENTITY_GEN) 로 묶는다(현행 granularity). 분류 불확실 → M_ALL(현행).
-    // -Dkfc.selectivecoherence=off 로 즉시 blanket 으로 원복(안전 escape hatch).
-    private static final int M_SCORE=1, M_OBJ=2, M_ENTITY=4, M_NAME=8, M_ALL=15;
-    private static final boolean SELECTIVE_COHERENCE =
-            !"off".equalsIgnoreCase(System.getProperty("kfc.selectivecoherence","on"));
-    private static int EXTERNAL_MASK = 0;
-
-    private static String tokenAt(String c, int[] pos) {
-        int p=pos[0], n=c.length();
-        while (p<n && c.charAt(p)==' ') p++;
-        int e=p; while (e<n && c.charAt(e)!=' ') e++;
-        pos[0]=e; return c.substring(p,e);
-    }
-    /** 명령이 무효화해야 하는 캐시 카테고리 비트마스크. 불확실하면 M_ALL. */
-    static int reconcileMaskFor(String command) {
-        if (command == null) return M_ALL;
-        int n=command.length(), p=0;
-        while (p<n && (command.charAt(p)=='/'||command.charAt(p)==' ')) p++;
-        int[] pos={p};
-        String w=tokenAt(command, pos);
-        switch (w) {
-            case "scoreboard": {
-                String sub=tokenAt(command,pos);
-                if (sub.equals("players")) {
-                    switch (tokenAt(command,pos)) {
-                        case "set": case "add": case "remove": case "operation":
-                        case "enable": case "get": case "list": case "display": return 0;
-                        case "reset": return M_SCORE;
-                        default: return M_SCORE;
-                    }
-                }
-                return M_SCORE | M_OBJ;   // objectives 등 — 엔트리/objective 변화 가능
-            }
-            case "tag": return M_ENTITY;
-            case "data": case "item": case "attribute": case "effect": case "give":
-            case "clear": case "enchant": case "loot": case "experience": case "xp":
-            case "tp": case "teleport": case "rotate": case "spreadplayers":
-            case "ride": case "damage": case "spawnpoint": case "setworldspawn":
-                return M_ENTITY;
-            case "team": return M_NAME | M_ENTITY;
-            case "summon": case "kill": case "place": return M_ENTITY;
-            case "say": case "tellraw": case "title": case "subtitle": case "actionbar":
-            case "msg": case "tell": case "w": case "me": case "teammsg":
-            case "playsound": case "stopsound": case "particle": case "weather":
-            case "time": case "difficulty":
-                return 0;
-            case "execute": {
-                int mask=0;
-                int ri=command.indexOf(" run ", p);
-                if (ri<0) return 0;                       // run 없음 = 순수 조건부, 부작용 없음
-                mask |= reconcileMaskFor(command.substring(ri+5));   // 서브명령 재귀
-                int si=command.indexOf(" store ", p);
-                while (si>=0 && si<ri) {                  // store 절(run 앞) — target 이 score 아니면 nbt류
-                    int[] sp={si+7}; tokenAt(command,sp); // result|success
-                    if (!tokenAt(command,sp).equals("score")) mask |= M_ENTITY;
-                    si=command.indexOf(" store ", sp[0]);
-                }
-                return mask;
-            }
-            default: return M_ALL;                        // function/return/schedule/reload/trigger/미상
-        }
-    }
-
     private static boolean COHERENCE_LOGGED = false;
     // 진단 토글: -Dkfc.debug.coherence=true 로 켜면 executeWithPrefix 훅이 '발동할 때마다' 명령
     // 문자열과 함께 로그 → 훅이 실제로 붙어 도는지 명령별로 확인(일회성 활성 로그의 한계 보완:
@@ -4650,15 +4584,13 @@ public final class KfcGen {
             System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix)");
         }
         if (DEBUG_COHERENCE) System.out.println("[KFC] executeWithPrefix fired: /" + command);
-        int m = SELECTIVE_COHERENCE ? reconcileMaskFor(command) : M_ALL;
-        if (m != 0) { EXTERNAL_MASK |= m; EXTERNAL_DIRTY = true; }   // 무효화 대상 0 이면 화해 자체를 건너뜀
+        EXTERNAL_DIRTY = true;
     }
-    public static void onExternalFunctionExecuted() { onExternalFunctionExecuted(M_ALL); }
-    public static void onExternalFunctionExecuted(int mask) {
-        if ((mask & M_ENTITY) != 0) ENTITY_GEN++;
-        if ((mask & M_OBJ)    != 0) OBJ_GEN++;
-        if ((mask & M_SCORE)  != 0) invalidateScoreHandles();
-        if ((mask & M_NAME)   != 0) NAME_GEN++;
+    public static void onExternalFunctionExecuted() {
+        ENTITY_GEN++;
+        OBJ_GEN++;
+        invalidateScoreHandles();
+        NAME_GEN++;
     }
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.

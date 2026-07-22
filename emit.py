@@ -145,7 +145,16 @@ def set_macro_fns(s):
 BR_ENTITY, BR_OBJ, BR_SCORE, BR_NAME = 1, 2, 4, 8
 BR_ALL = 15
 _DP_SRC = None
+_DP_LINES = None        # {fid: [명령줄...]} — convert 가 공유하는 사전 수집 라인맵(zip 재읽기 제거)
 _BR_MASK_CACHE = {}
+_BR_TAINT = set()       # 사이클 참여 fid — 부분값이라 캐시 금지
+
+
+def set_datapack_lines(m):
+    """pass-2.7/2.8 이 공유하는 lines_map 주입 — bridge_mask 가 파일 재읽기 없이 분석."""
+    global _DP_LINES, _BR_MASK_CACHE
+    _DP_LINES = m
+    _BR_MASK_CACHE = {}
 
 def set_datapack_source(src):
     """브릿지 정적 분석용 데이터팩 소스 주입(open_datapack 결과 또는 경로). 미주입 시 BR_ALL."""
@@ -222,36 +231,48 @@ def _br_line_mask(line: str, _seen) -> int:
     return BR_ALL                      # 미상 명령(advancement/trigger/reload/…) — fail-closed
 
 def bridge_mask(fid: str, _seen=None) -> int:
-    """브릿지 함수 fid 의 무효화 마스크(정적 호출 그래프 전이 폐포). 미상이면 BR_ALL."""
-    if _DP_SRC is None:
+    """브릿지 함수 fid 의 무효화 마스크(정적 호출 그래프 전이 폐포). 미상이면 BR_ALL.
+       [속도] 캐시는 재귀 중에도 조회/기록한다 — 사이클 참여 fid(_BR_TAINT)만 캐시 제외.
+       종전 top-level 전용 캐시는 트리 루트마다 서브트리 전체 재순회(O(N×깊이) 파일읽기)로
+       변환 시간을 분 단위로 늘렸다."""
+    if _DP_SRC is None and _DP_LINES is None:
         return BR_ALL
     top = _seen is None
-    if top and fid in _BR_MASK_CACHE:
-        return _BR_MASK_CACHE[fid]
+    fq = fid if ":" in fid else "minecraft:" + fid
+    if fq in _BR_MASK_CACHE:
+        return _BR_MASK_CACHE[fq]
     if _seen is None:
         _seen = set()
-    if fid in _seen:
-        return 0                       # 사이클: 구성원 기여는 상위 순회가 이미 집계
-    _seen.add(fid)
-    fq = fid if ":" in fid else "minecraft:" + fid
+        _BR_TAINT.clear()
+    if fq in _seen:
+        _BR_TAINT.update(_seen)        # 사이클: 현재 경로 전원 부분값 → 캐시 금지
+        return 0
+    _seen.add(fq)
     ns, path = fq.split(":", 1)
-    txt = None
-    for folder in ("function", "functions"):   # 1.21 단수형 우선, 구포맷 호환
-        try:
-            txt = _DP_SRC.read_text(f"data/{ns}/{folder}/{path}.mcfunction")
-            break
-        except Exception:
-            continue
-    if txt is None:
+    lines = None
+    if _DP_LINES is not None:
+        lines = _DP_LINES.get(fq)
+    if lines is None and _DP_SRC is not None:
+        for folder in ("function", "functions"):
+            try:
+                txt = _DP_SRC.read_text(f"data/{ns}/{folder}/{path}.mcfunction")
+                lines = [x.strip() for x in txt.split("\n")]
+                break
+            except Exception:
+                continue
+    if lines is None:
         m = BR_ALL                     # 데이터팩 밖(외부 ns)/부재 — 내용 미상
     else:
         m = 0
-        for raw in txt.split("\n"):
+        for raw in lines:
             m |= _br_line_mask(raw.strip(), _seen)
             if m == BR_ALL:
                 break
+    _seen.discard(fq)
+    if fq not in _BR_TAINT:
+        _BR_MASK_CACHE[fq] = m
     if top:
-        _BR_MASK_CACHE[fid] = m        # 완전 폐포로 계산된 top-level 만 캐시(사이클 부분값 오염 방지)
+        _BR_TAINT.clear()
     return m
 
 

@@ -328,6 +328,33 @@ _BB_REMAP = None
 _BB_GROUP = None
 _BB_CALL_RE = re.compile(r'([A-Za-z_][\w.]+)\.(execute|executeReturn)\s*\(')
 
+def _rw_nongen(jp):
+    """[속도] 비생성 파일 1개 호출 재작성(워커) — remap 은 _bb_init 전역 공유.
+       '.execute' 부재 파일은 매치 불가 → 조기 스킵(대부분의 스텁)."""
+    from pathlib import Path as _P
+    try:
+        t = _P(jp).read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    if ".execute" not in t:
+        return 0
+    # [속도] KfcTree 의 base-90 인코딩 문자열(수십 KB 워드문자 연속)에 정규식을 통째로 돌리면
+    # 시작 위치마다 [\w.]+ 백트래킹으로 O(n²) — 실측 파일당 ~1.5s(총 264s). 호출은 항상
+    # '.execute' 를 포함한 줄에만 있으므로 줄 단위로 골라 재작성한다(인코딩 줄 통째 스킵).
+    lines = t.split("\n")
+    changed = False
+    for i, ln in enumerate(lines):
+        if ".execute" not in ln:
+            continue
+        nl = _bb_rewrite(ln)
+        if nl != ln:
+            lines[i] = nl
+            changed = True
+    if changed:
+        _write_if_changed(_P(jp), "\n".join(lines))
+        return 1
+    return 0
+
 def _bb_init(remap, group):
     global _BB_REMAP, _BB_GROUP
     _BB_REMAP = remap
@@ -808,17 +835,26 @@ def bucketize_records(records, src_root: Path, group: str,
         print(f"  [bucketize] in-worker hoist: {hoisted} sites across {written} buckets")
     _btlog(f"rewrite+write buckets (jobs={jobs if jobs > 1 and len(tasks) >= 32 else 1})")
 
-    # 7) 비생성 on-disk 파일(ModEntry/stub 등) 호출 재작성 (KfcGen·버킷 제외) — 파일 기반과 동일
-    for jf in src_root.rglob("*.java"):
-        if jf.parent == bucket_dir:
-            continue
-        if "generated" in jf.parts and jf.stem == "KfcGen":
-            continue
-        t = jf.read_text(encoding="utf-8")
-        nt = rewrite_calls(t)
-        if nt != t:
-            _write_if_changed(jf, nt)
-    _btlog("rewrite nongen files")
+    # 7) 비생성 on-disk 파일(ModEntry/stub 등) 호출 재작성 (KfcGen·버킷 제외) — 파일 기반과 동일.
+    #    [속도] 파일이 수만 개(per-fid 스텁 포함)일 수 있어 단일 스레드 read+regex 가 수 분을
+    #    차지했다(실측 263s). 버킷 빌드와 동일한 spawn 풀(remap 전역 공유)로 병렬화하고,
+    #    '.execute' 부재 파일은 읽기 직후 스킵. 파일별 독립 재작성이라 산출 바이트 동일.
+    _ng = [str(jf) for jf in src_root.rglob("*.java")
+           if jf.parent != bucket_dir and not ("generated" in jf.parts and jf.stem == "KfcGen")]
+    _ng_done = None
+    if jobs > 1 and len(_ng) >= 64:
+        try:
+            with _mpc.get_context("spawn").Pool(processes=jobs,
+                                                initializer=_bb_init,
+                                                initargs=(remap, group)) as pool:
+                _ng_done = sum(pool.imap_unordered(_rw_nongen, _ng, chunksize=64))
+        except Exception as _pe:
+            print(f"[bucketize:mem][warn] parallel nongen rewrite failed ({_pe}) — serial fallback")
+            _ng_done = None
+    if _ng_done is None:
+        _bb_init(remap, group)
+        _ng_done = sum(_rw_nongen(jp) for jp in _ng)
+    _btlog(f"rewrite nongen files (jobs={jobs if jobs > 1 and len(_ng) >= 64 else 1}, {len(_ng)} files, {_ng_done} rewritten)")
 
     if verbose:
         print(f"[bucketize:mem] {len(records)} functions -> {written} bucket classes "

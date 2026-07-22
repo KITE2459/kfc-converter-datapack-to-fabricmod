@@ -357,6 +357,8 @@ public final class KfcGen {
     // '비명령 API 직접 쓰기'(타 모드)와 memoize 된 마스크의 /reload 후 진부화만 수렴시키면 된다.
     // 더 키우면 이득은 ~0(회당 비용이 이미 분당 1회 수준)이고 그 엣지의 최악 지연만 길어진다.
     private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 1200);
+    // [selfrec-native] 비꼬리 자기재귀 함수의 깊이 가드(전역 — 바닐라 chain 예산이 전역인 것과 동형).
+    public static int REC_DEPTH;
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
         // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브

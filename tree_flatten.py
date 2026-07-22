@@ -74,6 +74,66 @@ _RANGE = r'(?:-?\d+\.\.-?\d+|-?\d+\.\.|\.\.-?\d+|-?\d+)'
 _P1 = re.compile(rf'^execute as @s\[scores=\{{({_OBJ})=({_RANGE})\}}\] run function ({_FID})$')
 _P2 = re.compile(rf'^execute if score @s ({_OBJ}) matches ({_RANGE}) run function ({_FID})$')
 
+# ── [NBS 흡수] 쌍노드 터미널 + notes 리프 패턴 ──────────────────────────────
+# 쌍노드: 본문 1줄, 주 objective 범위 + 부 objective(재생 마커) 범위 → notes 호출.
+_PAIRT = re.compile(rf'^execute as @s\[scores=\{{({_OBJ})=({_RANGE}),({_OBJ})=({_RANGE})\}}\] run function ({_FID})$')
+# notes 줄: playsound <snd> <cat> @s ~ ~ ~ <vol> <pitch> [minVol]  (전부 상수)
+_NOTE = re.compile(r'^playsound ([a-z0-9_.:/-]+) '
+                   r'(master|music|record|weather|block|hostile|neutral|player|ambient|voice) '
+                   r'@s ~ ~ ~ ([0-9]*\.?[0-9]+) ([0-9]*\.?[0-9]+)(?: ([0-9]*\.?[0-9]+))?$')
+_SETT = re.compile(rf'^scoreboard players set @s ({_OBJ}) (-?\d+)$')
+MAX_ABS_OPS = 12000    # ops 인코딩 상한(엣지 상한과 동일 근거)
+
+
+def _fbits(v: float) -> int:
+    import struct as _st
+    return _st.unpack('<i', _st.pack('<f', v))[0]
+
+
+def _pair_lines(lines, obj):
+    """모든 줄이 쌍노드 패턴(주=obj, 부=동일 objt)이면 (objt, [(lo,hi,tlo,thi,child),...]).
+       다중줄 지원 — 원본은 줄마다 부 objective 를 재읽으므로(선행 notes 가 t 를 올리면
+       후행 줄 가드가 그 값을 관측) 해석기도 엔트리마다 재읽는다. 아니면 None."""
+    if not lines:
+        return None
+    objt = None
+    out = []
+    for ln in lines:
+        m = _PAIRT.match(ln)
+        if not m:
+            return None
+        o1, r1, o2, r2, child = m.groups()
+        if o1 != obj or o2 == obj:
+            return None
+        if objt is None:
+            objt = o2
+        elif o2 != objt:
+            return None
+        lo, hi = _parse_range(r1)
+        tlo, thi = _parse_range(r2)
+        out.append((lo, hi, tlo, thi, child))
+    return objt, out
+
+
+def _notes_ops(lines, objt):
+    """notes 리프면 순서 보존 ops 리스트, 아니면 None.
+       op = ('note', snd, cat, vol, pitch, minvol) | ('sett', n)"""
+    if lines is None:
+        return None
+    ops = []
+    for ln in lines:
+        m = _NOTE.match(ln)
+        if m:
+            ops.append(('note', m.group(1), m.group(2),
+                        float(m.group(3)), float(m.group(4)), float(m.group(5) or 0.0)))
+            continue
+        m = _SETT.match(ln)
+        if m and m.group(1) == objt:
+            ops.append(('sett', int(m.group(2))))
+            continue
+        return None
+    return ops
+
 _CALL_RE = re.compile(r'([A-Za-z_][\w.]+)\.(?:execute|executeReturn)\s*\(')
 
 
@@ -248,16 +308,29 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
     # ── 3) 외부 참조 스캔 ──
     # 자바 측: 비클러스터 레코드 + on-disk 파일(ModEntry/stub 등)이 부르는 FQCN.
     all_node_fids = set(nodes)
+    # [NBS] 쌍노드/notes 후보 사전 감지 — 외부참조 스캔·레코드 제거 판단에 포함
+    cluster_objs = {o for (o, _e) in nodes.values()}
+    nbs_pairs = {}     # pair_fid -> [child_fid ...]
+    for _f, _ls in lines_map.items():
+        if _f in nodes or not _ls:
+            continue
+        _ms = [_PAIRT.match(_l) for _l in _ls]
+        if all(_ms) and all(_m.group(1) in cluster_objs and _m.group(3) != _m.group(1) for _m in _ms):
+            nbs_pairs[_f] = [_m.group(5) for _m in _ms]
+    nbs_children = set()
+    for _cs in nbs_pairs.values():
+        nbs_children.update(_cs)
     node_fqcn = {}
-    for f in all_node_fids:
+    for f in all_node_fids | set(nbs_pairs) | nbs_children:
         c = by_fid.get(f)
         node_fqcn[f] = c.fqcn if c is not None else fid_to_fqcn(f, group)
     fqcn_to_fid = {v: k for k, v in node_fqcn.items()}
 
     ext_ref = set()      # 외부에서 참조되는 노드 fid
     for c in records:
-        if getattr(c, "fid", None) in all_node_fids:
-            continue     # 클러스터 노드 간 참조는 내부
+        _fid0 = getattr(c, "fid", None)
+        if _fid0 in all_node_fids or _fid0 in nbs_pairs:
+            continue     # 클러스터 노드/쌍노드 간 참조는 내부(흡수·제거 판단은 별도)
         t = c.text
         if ".execute" not in t:
             continue
@@ -277,12 +350,13 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
             if fid is not None:
                 ext_ref.add(fid)
     # tick/load 태그 + 데이터팩 함수 태그
+    _refables = all_node_fids | set(nbs_pairs) | nbs_children
     for k in ("tick", "load"):
         for fid in (tags or {}).get(k, []):
-            if fid in all_node_fids:
+            if fid in _refables:
                 ext_ref.add(fid)
     for fid in _tag_fids(dp_src):
-        if fid in all_node_fids:
+        if fid in _refables:
             ext_ref.add(fid)
 
     # ── 4) 클러스터별 코드 생성 ──
@@ -301,6 +375,7 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
             return True
 
     removed_fids = set()
+    nbs_abs_children = {}   # notes child fid -> [pair fid ...] (흡수된 것만)
     tree_idx = 0
     for _root, comp in sorted(comps.items(), key=lambda kv: sorted(kv[1])[0]):
         comp = sorted(comp)
@@ -374,6 +449,42 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
             stats["skipped"] += 1
             continue
 
+        # ── [NBS 흡수] 쌍노드 터미널(+notes 리프) → 데이터 테이블 분류 ──
+        # fail-closed: 패턴 불일치/objt 불일치/매크로/ops 상한 초과 → 그 터미널은 메서드 호출 유지.
+        abs_set = {}     # term fid -> (objt, [(lo,hi,tlo,thi,ops,child), ...])
+        objt = None
+        for ch in terminals:
+            pa = _pair_lines(lines_map.get(ch), obj)
+            if pa is None:
+                continue
+            o2, pl = pa
+            if objt is None:
+                objt = o2
+            elif o2 != objt:
+                continue
+            tc2 = by_fid.get(ch)
+            if tc2 is not None and tc2.is_macro:
+                continue
+            ents = []
+            bad = False
+            for (plo, phi, tlo, thi, child) in pl:
+                cc = by_fid.get(child)
+                if cc is not None and cc.is_macro:
+                    bad = True; break
+                ops = _notes_ops(lines_map.get(child), o2)
+                if ops is None:
+                    bad = True; break
+                ents.append((plo, phi, tlo, thi, ops, child))
+            if bad or not ents:
+                continue
+            abs_set[ch] = ents
+        if sum(len(e[4]) for v in abs_set.values() for e in v) > MAX_ABS_OPS:
+            abs_set = {}
+        if abs_set:
+            terminals = [t for t in terminals if t in abs_set] + [t for t in terminals if t not in abs_set]
+            term_id = {t: i for i, t in enumerate(terminals)}
+        n_abs = sum(1 for t in terminals if t in abs_set)
+
         # 노드 인덱싱 + 평탄 에지 배열
         nid = {f: i for i, f in enumerate(comp)}
         lo_arr, hi_arr, tgt_arr = [], [], []
@@ -414,12 +525,99 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
         tree_idx += 1
         tree_fqcn = f"{group}.generated.{cls_name}"
 
+        # ── [NBS] 흡수 테이블 + absTerm 코드 생성 ──
+        abs_code = ""
+        if n_abs:
+            pes, pee = [], []                       # 터미널 → 엔트리 슬라이스
+            tlo_a, thi_a, ttlo_a, tthi_a, aops, aope = [], [], [], [], [], []
+            osnd, oa, ob, oc = [], [], [], []
+            snd_key = {}
+            snd_ids, snd_cats = [], []
+            for t in terminals[:n_abs]:
+                pes.append(len(tlo_a))
+                for (plo, phi, tlo, thi, ops, _child) in abs_set[t]:
+                    tlo_a.append(plo); thi_a.append(phi); ttlo_a.append(tlo); tthi_a.append(thi)
+                    aops.append(len(osnd))
+                    for op in ops:
+                        if op[0] == 'note':
+                            _k, snd, cat, vol, pitch, minvol = op
+                            key = (snd, cat)
+                            if key not in snd_key:
+                                snd_key[key] = len(snd_ids)
+                                snd_ids.append(snd); snd_cats.append(cat)
+                            osnd.append(snd_key[key]); oa.append(_fbits(pitch))
+                            ob.append(_fbits(vol)); oc.append(_fbits(minvol))
+                        else:
+                            osnd.append(-1); oa.append(op[1]); ob.append(0); oc.append(0)
+                    aope.append(len(osnd))
+                pee.append(len(tlo_a))
+            _sid = ", ".join(f'"{x}"' for x in snd_ids)
+            _sct = ", ".join(f'"{x}"' for x in snd_cats)
+            abs_code = f"""
+    // ── [NBS 흡수] 쌍노드 가드 + notes 를 데이터 테이블로 — 부 objective `{objt}` ──
+    // 원본: 쌍노드 줄들(execute as @s[scores={{{obj}=A..B,{objt}=C..D}}] run notes/N) +
+    //       notes 리프(playsound@s 상수 × K, set @s {objt} N). 줄 순서 그대로 해석 실행.
+    //       부 objective 는 엔트리(원본 줄)마다 재읽기 — 선행 notes 의 set 이 후행 가드에
+    //       관측되는 원본 시맨틱 그대로. playsound 는 플레이어 실행자만(라인 동일).
+    private static final int[] PES = KfcGen.decodeInts("{_encode_ints(pes)}");
+    private static final int[] PEE = KfcGen.decodeInts("{_encode_ints(pee)}");
+    private static final int[] ATLO = KfcGen.decodeInts("{_encode_ints(tlo_a)}");
+    private static final int[] ATHI = KfcGen.decodeInts("{_encode_ints(thi_a)}");
+    private static final int[] ATTLO = KfcGen.decodeInts("{_encode_ints(ttlo_a)}");
+    private static final int[] ATTHI = KfcGen.decodeInts("{_encode_ints(tthi_a)}");
+    private static final int[] AOPS = KfcGen.decodeInts("{_encode_ints(aops)}");
+    private static final int[] AOPE = KfcGen.decodeInts("{_encode_ints(aope)}");
+    private static final int[] OSND = KfcGen.decodeInts("{_encode_ints(osnd)}");
+    private static final int[] OA = KfcGen.decodeInts("{_encode_ints(oa)}");
+    private static final int[] OB = KfcGen.decodeInts("{_encode_ints(ob)}");
+    private static final int[] OC = KfcGen.decodeInts("{_encode_ints(oc)}");
+    private static final String[] SND_ID = {{ {_sid} }};
+    private static final String[] SND_CAT = {{ {_sct} }};
+    private static net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>[] SNDS;
+    private static net.minecraft.sound.SoundCategory[] SCATS;
+
+    @SuppressWarnings("unchecked")
+    private static void initSnds() {{
+        net.minecraft.registry.entry.RegistryEntry<net.minecraft.sound.SoundEvent>[] a =
+                new net.minecraft.registry.entry.RegistryEntry[SND_ID.length];
+        net.minecraft.sound.SoundCategory[] b = new net.minecraft.sound.SoundCategory[SND_ID.length];
+        for (int i = 0; i < SND_ID.length; i++) {{ a[i] = KfcGen.soundEvent(SND_ID[i]); b[i] = KfcGen.soundCat(SND_CAT[i]); }}
+        SNDS = a; SCATS = b;
+    }}
+
+    private static void absTerm(int t, ServerCommandSource source,
+                                net.minecraft.entity.Entity e, ServerScoreboard sb, int s) {{
+        boolean inited = false;
+        net.minecraft.server.network.ServerPlayerEntity ps =
+                (e instanceof net.minecraft.server.network.ServerPlayerEntity _p) ? _p : null;
+        for (int pe = PES[t]; pe < PEE[t]; pe++) {{
+            if (s < ATLO[pe] || s > ATHI[pe]) continue;
+            Integer tv = KfcGen.readScoreEnt(sb, e, "{objt}");   // 엔트리마다 재읽기(원본 줄별 평가)
+            if (tv == null) continue;
+            int tvv = tv;
+            if (tvv < ATTLO[pe] || tvv > ATTHI[pe]) continue;
+            if (!inited) {{ if (SNDS == null) initSnds(); inited = true; }}
+            for (int i = AOPS[pe]; i < AOPE[pe]; i++) {{
+                int sd = OSND[i];
+                if (sd >= 0) {{
+                    if (ps != null) KfcGen.playSound(ps, SNDS[sd], SCATS[sd], source.getPosition(),
+                            Float.intBitsToFloat(OB[i]), Float.intBitsToFloat(OA[i]), Float.intBitsToFloat(OC[i]));
+                }} else {{
+                    KfcGen.setScore(sb, e, "{objt}", OA[i]);
+                }}
+            }}
+        }}
+    }}
+"""
+
         # ── 터미널 스위치(세그먼트) ──
         term_methods = []
         n_seg = (len(terminals) + TERM_SWITCH_SEG - 1) // TERM_SWITCH_SEG
         for si in range(n_seg):
             cases = []
             for t in range(si * TERM_SWITCH_SEG, min((si + 1) * TERM_SWITCH_SEG, len(terminals))):
+                if t < n_abs:
+                    continue          # [NBS] 흡수 터미널 — absTerm 이 처리(케이스 불필요)
                 ch = terminals[t]
                 tc = by_fid.get(ch)
                 fq = tc.fqcn if tc is not None else fid_to_fqcn(ch, group)
@@ -427,9 +625,12 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
             term_methods.append(
                 f"    private static void term{si}(int t, ServerCommandSource source) {{\n"
                 f"        switch (t) {{\n" + "\n".join(cases) + "\n        }\n    }")
+        _sig = ("    private static void term(int t, ServerCommandSource source, "
+                "net.minecraft.entity.Entity e, ServerScoreboard sb, int s) {\n")
+        _abs_br = (f"        if (t < {n_abs}) {{ absTerm(t, source, e, sb, s); return; }}\n"
+                   if n_abs else "")
         if n_seg <= 1:
-            term_disp = ("    private static void term(int t, ServerCommandSource source) {\n"
-                         "        term0(t, source);\n    }")
+            term_disp = (_sig + _abs_br + "        term0(t, source);\n    }")
         else:
             branches = []
             for si in range(n_seg):
@@ -437,8 +638,7 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
                 call = f"term{si}(t, source)"
                 branches.append(f"        if ({cond}) {{ {call}; return; }}" if cond
                                 else f"        {call};")
-            term_disp = ("    private static void term(int t, ServerCommandSource source) {\n"
-                         + "\n".join(branches) + "\n    }")
+            term_disp = (_sig + _abs_br + "\n".join(branches) + "\n    }")
 
         # ── 엔트리 run 메서드 ──
         run_methods = []
@@ -467,7 +667,7 @@ public final class {cls_name} {{
     private static final int[] ES = KfcGen.decodeInts("{_encode_ints(es_arr)}");
     private static final int[] EE = KfcGen.decodeInts("{_encode_ints(ee_arr)}");
     private static final int MAX_STACK = {max_stack};
-
+{abs_code}
 {chr(10).join(run_methods)}
 
     private static void walk(ServerCommandSource source, int node) {{
@@ -487,7 +687,7 @@ public final class {cls_name} {{
             if (tg >= 0) {{
                 for (int i = EE[tg] - 1; i >= ES[tg]; i--) st[sp++] = i;
             }} else {{
-                term(-tg - 1, source);
+                term(-tg - 1, source, e, sb, s);
                 // 터미널만이 OBJ 를 변경할 수 있다 — 원본의 노드별 재읽기와 동일 관측.
                 Integer r = KfcGen.readScoreEnt(sb, e, "{obj}");
                 if (r == null) return;
@@ -533,12 +733,27 @@ public final class {c.cls} {{
             if f not in entries and f in by_fid:
                 removed_fids.add(f)
 
+        # [NBS] 흡수 쌍노드 레코드 제거(외부 미참조) + notes 자식 추적
+        for t in terminals[:n_abs]:
+            for ent in abs_set[t]:
+                nbs_abs_children.setdefault(ent[5], []).append(t)
+            if t not in ext_ref and t in by_fid:
+                removed_fids.add(t)
+
         stats["clusters"] += 1
         stats["nodes"] += len(comp)
         stats["entries"] += len(entries)
         if verbose:
             print(f"  [tree-flatten] {obj}: {len(comp)} nodes → {cls_name} "
-                  f"({len(terminals)} terminals, {len(entries)} entries)")
+                  f"({len(terminals)} terminals, {n_abs} absorbed, {len(entries)} entries)")
+
+    # [NBS] notes 레코드 제거 — 모든 쌍노드 부모가 제거됐고 외부 미참조인 경우만(fail-closed)
+    for child, parents in nbs_abs_children.items():
+        if child in ext_ref or child not in by_fid:
+            continue
+        if all(p in removed_fids for p in parents):
+            if not by_fid[child].is_macro:
+                removed_fids.add(child)
 
     # records 제자리 축소
     if removed_fids:

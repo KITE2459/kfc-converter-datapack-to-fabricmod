@@ -1002,6 +1002,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
             _lines_map = _prep_result.get("lines")
             _pre_consts = _prep_result.get("consts")
             if _lines_map is not None:
+                emit.set_datapack_lines(_lines_map)   # [속도] bridge_mask 가 zip 재읽기 없이 분석
                 print(f"[generate] pass-2.7: lines_map ready via {_prep_result.get('src')} (prepared concurrently with pass-2)")
             if _lines_map is None:
                 _lines_map = _tf_mod.collect_function_lines(dp_src)

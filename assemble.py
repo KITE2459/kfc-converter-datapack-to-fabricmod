@@ -1110,6 +1110,12 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     # 꼬리재귀면 브릿지 대신 루프(TCO)로 네이티브화한다(아래 조립부에서 분기).
     _has_macro_line = any(o.get("macro") for o in parse_trees)
     tco = _tco_eligible(emitted, _self_fqcn, _has_macro_line)
+    # [selfrec-native] 비꼬리 자기재귀라도 '재귀 외 브릿지 사유가 전혀 없으면' 깊이 가드
+    # 네이티브 재귀로 변환(브릿지 탈피). 바닐라도 chain-length 예산으로 재귀를 컷오프하므로
+    # 깊이 상한(2048, 실사용 깊이는 플레이어/랩 수 규모) 초과 시 해당 호출 무시 = 동일 방향.
+    _rec_native = (is_self_recursive and not tco and not _has_macro_line
+                   and not _is_force_bridged(fid)
+                   and not any(em.kind in ("bridge", "dispatch") for em in emitted))
     # 함수 단위 파싱 거부: 한 줄이라도 무효 명령이면 mcfunction 은 함수 전체를 로드 거부.
     for obj, em in zip(parse_trees, emitted):
         if em.rejects_function:
@@ -1120,7 +1126,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     # ── 세그먼트 분할 사전 판정(JIT HugeMethodLimit 대응) ──
     # 폴백/거부/TCO/trace 함수는 기존 경로 그대로(분할 없음). 경계는 조립 '전'에 확정해
     # CSE(_selN/_eset) 재사용이 조각 경계를 넘지 않도록 루프에서 캐시를 끊는다.
-    _will_fallback = (rejected or (is_self_recursive and not tco) or _is_force_bridged(fid)
+    _will_fallback = (rejected or (is_self_recursive and not tco and not _rec_native) or _is_force_bridged(fid)
                       or any(_em.kind in ("bridge", "dispatch") for _em in emitted))
     _total_code = sum(_code_chars(_em.java) for _em in emitted)
     cse_cache: dict[str, str] = {}   # scan_expr -> _selN  (현재 유효한 바인딩)
@@ -1411,7 +1417,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         n_native = n_gated = 0
         n_bridge = len(parse_trees)
         fully_converted = False
-    elif (is_self_recursive and not tco) or _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
+    elif (is_self_recursive and not tco and not _rec_native) or _is_force_bridged(fid) or any(em.kind in ("bridge", "dispatch") for em in emitted):
         # ── 함수 단위 폴백 ──  (강제 브릿지 prefix 매칭 시에도 이 경로)
         # 정책: instantExecuteCommand(자바->바닐라 디스패처)는 최적화 이득이 없어 최종 산출에서
         # 금지. 그런 줄(dispatch)이 하나라도 있으면 함수 전체를 원본 mcfunction 실행으로 폴백한다.
@@ -1450,6 +1456,12 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         if tco:
             # 꼬리 self-call 을 `source = ARG; continue;` 로 치환(루프 본문).
             body = _tco_rewrite(body, _self_fqcn)
+        elif _rec_native:
+            body = ("// [selfrec-native] 비꼬리 자기재귀 — 브릿지 대신 깊이 가드 네이티브 재귀.\n"
+                    "        // 바닐라 재귀도 maxCommandChainLength 예산으로 컷오프된다 — 상한 초과 시\n"
+                    "        // 해당 호출만 무시(0 반환)해 같은 방향의 안전 컷오프를 재현한다.\n"
+                    "        if (++KfcGen.REC_DEPTH > 2048) { --KfcGen.REC_DEPTH; return 0; }\n"
+                    "        try {\n" + body + "\n        } finally { --KfcGen.REC_DEPTH; }")
         fully_converted = True
 
     if _is_traced(fid):

@@ -353,8 +353,10 @@ public final class KfcGen {
     // [P1] 주기 안전망 간격(틱). 기본 100(현행). 명령 경로(플레이어/커맨드블럭/콘솔/사인)는
     // FuncCoherence 훅이, /schedule 지연 함수는 SchedCoherence 훅(CommandFunctionManager.execute)이
     // 즉시 dirty-flag 화해를 보장하므로, 안전망이 커버할 잔여는 '타 모드의 API 직접 쓰기'뿐.
-    // -Dkfc.reconticks=1200(60s) 권장 A/B — 5초마다 전 핸들/스냅샷 폐기가 유발하던 재해소 churn 제거.
-    private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 100);
+    // 기본 1200(60s) — A/B 실측으로 승격. 명령/스케줄 경로는 훅이 즉시 화해하므로 이 주기는
+    // '비명령 API 직접 쓰기'(타 모드)와 memoize 된 마스크의 /reload 후 진부화만 수렴시키면 된다.
+    // 더 키우면 이득은 ~0(회당 비용이 이미 분당 1회 수준)이고 그 엣지의 최악 지연만 길어진다.
+    private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 1200);
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
         // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브
@@ -382,6 +384,7 @@ public final class KfcGen {
                 invalidateScoreHandles();
                 ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
                 INTERP_ID_MAPS.clear();   // [P2] interp identity 층 — API 직접 쓰기 수렴(안전망 동일 축)
+                EXT_MASK_CACHE.clear(); FN_MASK_CACHE.clear();   // [v2] /reload 후 마스크 진부화 수렴
             }
             snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
@@ -4268,9 +4271,19 @@ public final class KfcGen {
     // ── [P3 브릿지 선별 화해] 변환 시점 정적 분석 마스크 — 런타임 파싱 비용 0 ──
     // emit.bridge_mask(fid)가 브릿지 함수(+정적 호출 그래프)의 raw 명령을 분류해 상수 마스크를
     // 산출, 생성 코드가 리터럴로 전달한다. 분류 불가/외부 ns → BR_ALL(구 blanket 동일, fail-closed).
-    public static final int BR_ENTITY = 1, BR_OBJ = 2, BR_SCORE = 4, BR_NAME = 8, BR_ALL = 15;
+    // BR_ENTITY(=POP): 개체군/전면 무효화(스폰·킬·미상) — 컨버터(P3)가 emit 하는 coarse 비트와 호환.
+    // 세분 비트(TAG/NBT/STORAGE)는 런타임 분류기(v2)가 emit — POP 이 켜지면 세분 비트는 무의미(superset).
+    public static final int BR_ENTITY = 1, BR_OBJ = 2, BR_SCORE = 4, BR_NAME = 8;
+    public static final int BR_TAG = 16, BR_NBT = 32, BR_STORAGE = 64;
+    public static final int BR_ALL = 127;
     private static void bridgeReconcile(int mask) {
-        if ((mask & BR_ENTITY) != 0) { ENTITY_GEN++; INTERP_ID_MAPS.clear(); }
+        if ((mask & BR_ENTITY) != 0) {          // POP: 전면(스냅샷·버킷·NBT 전부 GEN 연쇄) + interp
+            ENTITY_GEN++; INTERP_ID_MAPS.clear();
+        } else {                                 // 세분: 필요한 축만
+            if ((mask & BR_TAG) != 0) { TAG_BUCKETS.clear(); TB_EPOCH++; }
+            if ((mask & BR_NBT) != 0) ENTITY_NBT_SNAP.clear();
+            if ((mask & BR_STORAGE) != 0) INTERP_ID_MAPS.clear();
+        }
         if ((mask & BR_OBJ) != 0) OBJ_GEN++;
         if ((mask & BR_SCORE) != 0) invalidateScoreHandles();
         if ((mask & BR_NAME) != 0) NAME_GEN++;
@@ -4653,12 +4666,54 @@ public final class KfcGen {
     private static final java.util.Map<String, Integer> EXT_MASK_CACHE = boundedMap(4096);
     private static int EXTERNAL_MASK = 0;
 
+    // ── [v2 확장] /function 타겟 마스크 — 로드된 데이터팩의 mcfunction 원문을 ResourceManager 로
+    // 1회 읽어 같은 분류기로 전이 분석(P3 bridge_mask 의 런타임판). 자원 부재/예외/서버 미준비 →
+    // BR_ALL(fail-closed). 사이클은 상위 순회가 집계(기여 0). memoize 로 fid 당 1회 비용.
+    private static final java.util.Map<String, Integer> FN_MASK_CACHE = boundedMap(4096);
+    private static final java.util.HashSet<String> FN_MASK_BUSY = new java.util.HashSet<>();
+    private static boolean EXT_NOCACHE;   // 서버 준비 전 임시 BR_ALL — 상위 memo 억제(재시도 허용)
+
+    private static int fnMask(String fid) {
+        if (fid == null || fid.contains("$(") || fid.startsWith("#")) return BR_ALL;
+        String fq = fid.indexOf(':') >= 0 ? fid : "minecraft:" + fid;
+        Integer c = FN_MASK_CACHE.get(fq);
+        if (c != null) return c;
+        GameContext gc = CTX_CACHE;
+        if (gc == null) { EXT_NOCACHE = true; return BR_ALL; }   // 부팅 초기 — 미캐시 재시도
+        if (!FN_MASK_BUSY.add(fq)) return 0;                     // 사이클: 상위가 집계 중
+        int v = BR_ALL;
+        try {
+            int ci2 = fq.indexOf(':');
+            net.minecraft.util.Identifier rid = net.minecraft.util.Identifier.of(
+                    fq.substring(0, ci2), "function/" + fq.substring(ci2 + 1) + ".mcfunction");
+            java.util.Optional<net.minecraft.resource.Resource> r =
+                    gc.server.getResourceManager().getResource(rid);
+            if (r.isPresent()) {
+                v = 0;
+                try (java.io.BufferedReader br2 = r.get().getReader()) {
+                    String ln;
+                    while ((ln = br2.readLine()) != null) {
+                        v |= extMaskUncached(ln);
+                        if (v == BR_ALL) break;
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            v = BR_ALL;                                          // fail-closed
+        } finally {
+            FN_MASK_BUSY.remove(fq);
+        }
+        if (FN_MASK_BUSY.isEmpty()) FN_MASK_CACHE.put(fq, v);    // top-level 완결시에만 캐시
+        return v;
+    }
+
     static int extMask(String cmd) {
         if (cmd == null) return BR_ALL;
         Integer c = EXT_MASK_CACHE.get(cmd);
         if (c != null) return c;
+        EXT_NOCACHE = false;
         int v = extMaskUncached(cmd);
-        EXT_MASK_CACHE.put(cmd, v);
+        if (!EXT_NOCACHE) EXT_MASK_CACHE.put(cmd, v);
         if (DEBUG_COHERENCE) System.out.println("[KFC] extMask=" + v + " : /" + cmd);
         return v;
     }
@@ -4682,17 +4737,35 @@ public final class KfcGen {
             case "defaultgamemode": case "recipe": case "forceload": case "help": case "seed":
             case "spawnpoint": case "setworldspawn": case "schedule":
                 return 0;
-            // 엔티티 상태/NBT/태그/인벤토리/위치 변이 가능
-            case "tag": case "tp": case "teleport": case "rotate": case "effect": case "give":
-            case "clear": case "item": case "attribute": case "enchant": case "xp":
-            case "experience": case "damage": case "ride": case "spreadplayers": case "summon":
-            case "kill": case "loot": case "place": case "setblock": case "fill": case "clone":
-            case "gamemode":
+            // [세분] 개체군 변화(스폰/킬/탑승) — 전면 무효화(POP)
+            case "summon": case "kill": case "loot": case "place": case "ride":
                 return BR_ENTITY;
-            case "data":
-                return (toks.length > 1 && toks[1].equals("get")) ? 0 : BR_ENTITY;
+            // [세분] 엔티티 NBT/상태만(위치·효과·인벤토리·게임모드) — 스냅샷 리스트/버킷 불변
+            case "tp": case "teleport": case "rotate": case "effect": case "give":
+            case "clear": case "item": case "attribute": case "enchant": case "xp":
+            case "experience": case "damage": case "spreadplayers": case "gamemode":
+                return BR_NBT;
+            // [세분] 블록만 — 엔티티 캐시 무관(낙하블록류 스폰은 popDrift 지문이 ≤1틱 수렴)
+            case "setblock": case "fill": case "clone":
+                return 0;
+            case "tag":
+                return BR_TAG | BR_NBT;         // Tags 는 NBT 덤프에도 포함
+            case "data": {
+                if (toks.length > 1 && toks[1].equals("get")) return 0;   // 읽기 전용
+                String tgt = toks.length > 2 ? toks[2] : "";
+                if (tgt.equals("storage")) return BR_STORAGE;
+                if (tgt.equals("block")) return 0;                        // 블록엔티티 — 라이브 조회
+                if (tgt.equals("entity")) {
+                    // Tags 경로 변이만 버킷에 영향. merge 는 compound 전체 검색(보수적).
+                    boolean tagsTouch = toks.length > 1 && toks[1].equals("merge")
+                            ? t.contains("Tags")
+                            : (toks.length > 4 && toks[4].startsWith("Tags"));
+                    return tagsTouch ? (BR_TAG | BR_NBT) : BR_NBT;
+                }
+                return BR_ALL;                                            // 미상 대상
+            }
             case "team":
-                return BR_NAME | BR_ENTITY;
+                return BR_NAME;                 // team= 셀렉터는 라이브 조회, NBT 덤프 무관
             case "scoreboard": {
                 if (toks.length >= 3 && toks[1].equals("players")) {
                     switch (toks[2]) {
@@ -4711,8 +4784,15 @@ public final class KfcGen {
                 int ri = t.indexOf(" run ");
                 String head = ri < 0 ? t : t.substring(0, ri);
                 String[] ht = head.split("\\s+");
-                for (int i2 = 0; i2 + 2 < ht.length; i2++)   // store 절: score 외 대상 = 기록
-                    if (ht[i2].equals("store") && !ht[i2 + 2].equals("score")) m |= BR_ENTITY;
+                for (int i2 = 0; i2 + 2 < ht.length; i2++) {  // store 절: score 외 대상 = 기록
+                    if (!ht[i2].equals("store")) continue;
+                    String st = ht[i2 + 2];
+                    if (st.equals("score")) continue;            // 점수 값 기록 — 무효화 불요
+                    else if (st.equals("storage")) m |= BR_STORAGE;
+                    else if (st.equals("entity")) m |= BR_NBT;   // 수치 경로 기록(Tags 불가 — 리스트형)
+                    else if (st.equals("block")) { }             // 블록엔티티 — 라이브 조회
+                    else m |= BR_ALL;
+                }
                 if (ri < 0) return m;                        // run 없음 = 순수 조건부
                 return m | extMaskUncached(t.substring(ri + 5));
             }
@@ -4723,8 +4803,13 @@ public final class KfcGen {
                 }
                 return 0;
             }
+            case "function":
+                return fnMask(toks.length > 1 ? toks[1] : null);   // [v2 확장] 타겟 원문 정적 분석
+            case "reload": case "datapack":
+                FN_MASK_CACHE.clear(); EXT_MASK_CACHE.clear();     // 함수 내용 변경 가능 — 마스크 재계산
+                return BR_ALL;
             default:
-                return BR_ALL;   // function/trigger/advancement/reload/미상 — fail-closed
+                return BR_ALL;   // trigger/advancement/미상 — fail-closed
         }
     }
 

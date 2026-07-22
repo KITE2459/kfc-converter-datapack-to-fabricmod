@@ -361,7 +361,7 @@ public final class KfcGen {
         // 접근인 이 지점에서 캐시를 화해한다. KfcFuncCoherenceMixin 이 CommandManager.executeWithPrefix
         // 에서 EXTERNAL_DIRTY 를 세팅 → 명령 실행 자체엔 부하 0, 화해는 여기로 지연(coalesce).
         // 외부 명령 실행 중 네이티브는 재진입하지 않으므로, 여기 도달 시점엔 변이가 이미 반영돼 있다.
-        if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; onExternalFunctionExecuted(); }
+        if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; int _m = EXTERNAL_MASK; EXTERNAL_MASK = 0; onExternalFunctionExecuted(_m); }
         GameContext c = CTX_CACHE;
         net.minecraft.server.MinecraftServer s = src.getServer();
         if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
@@ -4642,13 +4642,100 @@ public final class KfcGen {
     // 활성 로그는 부팅 초기 load-tag 명령/내부 runCommand 가 이미 소비해 이후 안 보일 수 있음).
     // 미설정 시 per-call 비용은 static final boolean 분기 1회(무시 가능).
     private static final boolean DEBUG_COHERENCE = Boolean.getBoolean("kfc.debug.coherence");
+    // ── [선별 화해 v2 — 메모이즈판] ──
+    // v1(롤백됨)의 +0.1mspt 회귀 원인은 '매 호출 문자열 파싱'이었다. 커맨드블럭 명령은 상수
+    // 문자열이므로 String→mask 를 memoize 하면 정상상태 비용 = HashMap.get 1회(runCommand 의
+    // CMD_CLASS 와 동일 패턴). 실측(1200 A/B): 반복 커맨드블럭(class_2593 상시 틱)이 매 틱 blanket
+    // 무효화를 유발 → score 재해소(readHandle+scoreHandle ~6%)·ND 렌더·태그버킷 churn 의 주범.
+    // 분류 자체는 P3 bridge_mask 와 동일 표(파이썬 20+13케이스 검증)의 자바 포팅. 미상/함수 → BR_ALL.
+    // -Dkfc.extsel=off 로 즉시 blanket 원복(escape hatch).
+    private static final boolean EXT_SEL = !"off".equalsIgnoreCase(System.getProperty("kfc.extsel", "on"));
+    private static final java.util.Map<String, Integer> EXT_MASK_CACHE = boundedMap(4096);
+    private static int EXTERNAL_MASK = 0;
+
+    static int extMask(String cmd) {
+        if (cmd == null) return BR_ALL;
+        Integer c = EXT_MASK_CACHE.get(cmd);
+        if (c != null) return c;
+        int v = extMaskUncached(cmd);
+        EXT_MASK_CACHE.put(cmd, v);
+        if (DEBUG_COHERENCE) System.out.println("[KFC] extMask=" + v + " : /" + cmd);
+        return v;
+    }
+
+    private static int extMaskUncached(String line) {
+        String t = line.trim();
+        while (t.startsWith("/")) t = t.substring(1);
+        if (t.isEmpty() || t.startsWith("#")) return 0;
+        if (t.startsWith("$")) t = t.substring(1).trim();   // 매크로 줄: 명령 첫 토큰은 정적
+        String[] toks = t.split("\\s+");
+        if (toks.length == 0 || toks[0].isEmpty()) return 0;
+        String root = toks[0];
+        if (root.contains("$(")) return BR_ALL;
+        switch (root) {
+            // 캐시 무효화가 전혀 불필요(출력/사운드/월드시각 등). schedule 은 발화 시점에
+            // KfcSchedCoherenceMixin 이 잡으므로 예약 자체는 무효화 불요.
+            case "say": case "tellraw": case "title": case "subtitle": case "actionbar":
+            case "msg": case "tell": case "w": case "me": case "teammsg": case "tm":
+            case "playsound": case "stopsound": case "music": case "particle": case "weather":
+            case "time": case "difficulty": case "gamerule": case "worldborder": case "bossbar":
+            case "defaultgamemode": case "recipe": case "forceload": case "help": case "seed":
+            case "spawnpoint": case "setworldspawn": case "schedule":
+                return 0;
+            // 엔티티 상태/NBT/태그/인벤토리/위치 변이 가능
+            case "tag": case "tp": case "teleport": case "rotate": case "effect": case "give":
+            case "clear": case "item": case "attribute": case "enchant": case "xp":
+            case "experience": case "damage": case "ride": case "spreadplayers": case "summon":
+            case "kill": case "loot": case "place": case "setblock": case "fill": case "clone":
+            case "gamemode":
+                return BR_ENTITY;
+            case "data":
+                return (toks.length > 1 && toks[1].equals("get")) ? 0 : BR_ENTITY;
+            case "team":
+                return BR_NAME | BR_ENTITY;
+            case "scoreboard": {
+                if (toks.length >= 3 && toks[1].equals("players")) {
+                    switch (toks[2]) {
+                        case "set": case "add": case "remove": case "operation":
+                        case "enable": case "get": case "list": case "display":
+                            return 0;                       // 값 변경 — 핸들은 live 값 조회라 무효화 불요
+                        default:
+                            return BR_SCORE;                // reset(엔트리 제거)/미상 sub
+                    }
+                }
+                if (toks.length >= 2 && toks[1].equals("objectives")) return BR_SCORE | BR_OBJ;
+                return BR_ALL;
+            }
+            case "execute": {
+                int m = 0;
+                int ri = t.indexOf(" run ");
+                String head = ri < 0 ? t : t.substring(0, ri);
+                String[] ht = head.split("\\s+");
+                for (int i2 = 0; i2 + 2 < ht.length; i2++)   // store 절: score 외 대상 = 기록
+                    if (ht[i2].equals("store") && !ht[i2 + 2].equals("score")) m |= BR_ENTITY;
+                if (ri < 0) return m;                        // run 없음 = 순수 조건부
+                return m | extMaskUncached(t.substring(ri + 5));
+            }
+            case "return": {
+                if (toks.length >= 2 && toks[1].equals("run")) {
+                    int ri = t.indexOf(" run ");
+                    return extMaskUncached(t.substring(ri + 5));
+                }
+                return 0;
+            }
+            default:
+                return BR_ALL;   // function/trigger/advancement/reload/미상 — fail-closed
+        }
+    }
+
     public static void markExternalCommand(String command) {
         if (!COHERENCE_LOGGED) {
             COHERENCE_LOGGED = true;
             System.out.println("[KFC] external-command coherence mixin active (CommandManager.executeWithPrefix)");
         }
         if (DEBUG_COHERENCE) System.out.println("[KFC] executeWithPrefix fired: /" + command);
-        EXTERNAL_DIRTY = true;
+        int m = EXT_SEL ? extMask(command) : BR_ALL;
+        if (m != 0) { EXTERNAL_MASK |= m; EXTERNAL_DIRTY = true; }
     }
     // /schedule 지연 함수는 CommandManager.execute 를 안 탄다(바닐라 타이머 → CommandFunctionManager.execute
     // 직행 — FunctionTimerCallback/FunctionTagTimerCallback 상수풀 확인). KfcSchedCoherenceMixin 이 그
@@ -4659,14 +4746,12 @@ public final class KfcGen {
             SCHED_LOGGED = true;
             System.out.println("[KFC] scheduled-function coherence mixin active (CommandFunctionManager.execute)");
         }
+        EXTERNAL_MASK |= BR_ALL;   // 지연 함수 내용 미상 — 전체(fail-closed)
         EXTERNAL_DIRTY = true;
     }
-    public static void onExternalFunctionExecuted() {
-        ENTITY_GEN++;
-        OBJ_GEN++;
-        invalidateScoreHandles();
-        NAME_GEN++;
-        INTERP_ID_MAPS.clear();   // [P2] 외부 명령이 storage 를 변이했을 수 있음
+    public static void onExternalFunctionExecuted() { onExternalFunctionExecuted(BR_ALL); }
+    public static void onExternalFunctionExecuted(int mask) {
+        bridgeReconcile(mask);   // ENTITY→ENTITY_GEN+INTERP_ID / OBJ / SCORE→핸들폐기 / NAME (v2 선별)
     }
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.

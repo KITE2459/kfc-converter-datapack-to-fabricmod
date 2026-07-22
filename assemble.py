@@ -26,6 +26,7 @@ from dataclasses import dataclass
 
 # A/B 토글: 흐름분석 주석제거의 정규식 가속 대신 레퍼런스 상태기계 사용(회귀 이분탐색용)
 _KFC_SLOW_STRIP = _os.environ.get("KFC_SLOW_STRIP") == "1"
+import emit   # [P3] bridge_mask 모듈 참조(from-import 는 모듈명을 바인딩하지 않음)
 from emit import emit_line, fqcn, sanitize, pascal, Emitted, set_group, reset_var_counter
 
 
@@ -1419,6 +1420,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         has_macro_line = any(o.get("macro") for o in parse_trees)
         macro_arg_expr = ", macroArgs" if has_macro_line else ""
         ns_id, path_id = fid.split(":", 1)
+        br_mask = emit.bridge_mask(fid)   # [P3] 변환 시점 정적 분석 — 브릿지 선별 화해 마스크
         commented = "\n".join("        // " + l for l in "\n".join(body_lines).rstrip().split("\n"))
         n_br = sum(1 for em in emitted if em.kind in ("bridge", "dispatch"))
         tag = ("자기재귀 → 브릿지(스택오버플로 방지)" if is_self_recursive
@@ -1428,7 +1430,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             # 매크로 함수: void 시그니처 - 반환 전파 없이 실행만.
             body = (f'// {tag} - 함수 단위 폴백.\n'
                     f'        KfcGen.instantExecuteFunction(source, '
-                    f'net.minecraft.util.Identifier.of("{ns_id}", "{path_id}"){macro_arg_expr});\n'
+                    f'net.minecraft.util.Identifier.of("{ns_id}", "{path_id}"){macro_arg_expr}, {br_mask});\n'
                     f'        // 아래는 줄 단위 변환 시도 결과(참고용 주석):\n'
                     f'{commented}')
         else:
@@ -1436,7 +1438,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             # 네이티브 호출자의 `if function` / `store result ... run function` 이 올바로 동작한다.
             body = (f'// {tag} - 함수 단위 폴백 (반환값 전파).\n'
                     f'        int kfcBridgeRet = KfcGen.instantExecuteFunctionReturn(source, '
-                    f'net.minecraft.util.Identifier.of("{ns_id}", "{path_id}"));\n'
+                    f'net.minecraft.util.Identifier.of("{ns_id}", "{path_id}"), {br_mask});\n'
                     f'        // 아래는 줄 단위 변환 시도 결과(참고용 주석):\n'
                     f'{commented}\n'
                     f'        return kfcBridgeRet;')

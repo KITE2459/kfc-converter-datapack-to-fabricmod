@@ -137,6 +137,125 @@ def set_macro_fns(s):
     MACRO_FNS = set(s)
 
 
+# ───────── [P3 브릿지 선별 화해] 변환 시점 정적 분석 (런타임 파싱 비용 0) ─────────
+# 브릿지 함수(원본 mcfunction 통째 실행)의 raw 명령을 첫 토큰 기반으로 분류해, 그 함수가
+# (정적 호출 그래프 포함) 무효화해야 하는 KfcGen 캐시 카테고리 마스크를 변환 시점에 산출한다.
+# 생성 코드는 이 상수를 instantExecuteFunction*(…, mask) 로 전달 → KfcGen.bridgeReconcile 이
+# 필요한 것만 무효화. 분류 불가/외부 ns/미상 명령 → BR_ALL(구 blanket 동일, fail-closed).
+BR_ENTITY, BR_OBJ, BR_SCORE, BR_NAME = 1, 2, 4, 8
+BR_ALL = 15
+_DP_SRC = None
+_BR_MASK_CACHE = {}
+
+def set_datapack_source(src):
+    """브릿지 정적 분석용 데이터팩 소스 주입(open_datapack 결과 또는 경로). 미주입 시 BR_ALL."""
+    global _DP_SRC, _BR_MASK_CACHE
+    _DP_SRC = src if (src is None or hasattr(src, "read_text")) else open_datapack(src)
+    _BR_MASK_CACHE = {}
+
+# 캐시 무효화가 전혀 불필요한 명령(출력/사운드/파티클/월드시각 등).
+# schedule: 지연 실행 변이는 KfcSchedCoherenceMixin(CommandFunctionManager.execute HEAD)이 발화
+# 시점에 dirty 로 잡으므로 예약 자체는 무효화 불요.
+_BR_SAFE = {
+    "say", "tellraw", "title", "subtitle", "actionbar", "msg", "tell", "w", "me", "teammsg", "tm",
+    "playsound", "stopsound", "music", "particle", "weather", "time", "difficulty", "gamerule",
+    "worldborder", "bossbar", "defaultgamemode", "recipe", "forceload", "help", "seed",
+    "spawnpoint", "setworldspawn", "schedule",
+}
+# 엔티티 상태/NBT/태그/인벤토리/위치 변이 가능 → BR_ENTITY (ENTITY_GEN + interp identity 층).
+_BR_ENTITY_ROOTS = {
+    "tag", "data", "tp", "teleport", "rotate", "effect", "give", "clear", "item", "attribute",
+    "enchant", "xp", "experience", "damage", "ride", "spreadplayers", "summon", "kill", "loot",
+    "place", "setblock", "fill", "clone", "gamemode",
+}
+
+def _br_line_mask(line: str, _seen) -> int:
+    if not line or line.startswith("#"):
+        return 0
+    if line.startswith("$"):           # 매크로 줄: 명령 첫 토큰은 정적 — $ 만 벗겨 분류
+        line = line[1:].lstrip()
+    toks = line.split()
+    if not toks:
+        return 0
+    root = toks[0].lstrip("/")
+    if "$(" in root:
+        return BR_ALL                  # 명령어 자체가 매크로 — 분류 불가
+    if root in _BR_SAFE:
+        return 0
+    if root in _BR_ENTITY_ROOTS:
+        if root == "data" and len(toks) > 1 and toks[1] == "get":
+            return 0                   # data get = 읽기 전용
+        return BR_ENTITY
+    if root == "team":
+        return BR_NAME | BR_ENTITY
+    if root == "scoreboard":
+        if len(toks) >= 3 and toks[1] == "players":
+            if toks[2] in ("set", "add", "remove", "operation", "enable", "get", "list", "display"):
+                return 0               # 값 변경 — 핸들은 live 값을 읽으므로 무효화 불요
+            return BR_SCORE            # reset(엔트리 제거)/미상 sub
+        if len(toks) >= 2 and toks[1] == "objectives":
+            return BR_SCORE | BR_OBJ
+        return BR_ALL
+    if root == "execute":
+        m = 0
+        ri = line.find(" run ")
+        head = line if ri < 0 else line[:ri]
+        ht = head.split()
+        for i2, t in enumerate(ht):    # store 절: score 외 대상(entity/block/storage) = 기록
+            if t == "store" and i2 + 2 < len(ht) and ht[i2 + 2] != "score":
+                m |= BR_ENTITY
+        if ri < 0:
+            return m                   # run 없음 = 순수 조건부(무부작용)
+        return m | _br_line_mask(line[ri + 5:].strip(), _seen)
+    if root == "return":
+        if len(toks) >= 2 and toks[1] == "run":
+            sp = line.split(None, 2)
+            return _br_line_mask(sp[2] if len(sp) > 2 else "", _seen)
+        return 0
+    if root == "function":
+        if len(toks) < 2:
+            return BR_ALL
+        tgt = toks[1]
+        if "$(" in tgt or tgt.startswith("#"):
+            return BR_ALL              # 동적 대상/함수태그 — 미상
+        return bridge_mask(tgt, _seen)
+    return BR_ALL                      # 미상 명령(advancement/trigger/reload/…) — fail-closed
+
+def bridge_mask(fid: str, _seen=None) -> int:
+    """브릿지 함수 fid 의 무효화 마스크(정적 호출 그래프 전이 폐포). 미상이면 BR_ALL."""
+    if _DP_SRC is None:
+        return BR_ALL
+    top = _seen is None
+    if top and fid in _BR_MASK_CACHE:
+        return _BR_MASK_CACHE[fid]
+    if _seen is None:
+        _seen = set()
+    if fid in _seen:
+        return 0                       # 사이클: 구성원 기여는 상위 순회가 이미 집계
+    _seen.add(fid)
+    fq = fid if ":" in fid else "minecraft:" + fid
+    ns, path = fq.split(":", 1)
+    txt = None
+    for folder in ("function", "functions"):   # 1.21 단수형 우선, 구포맷 호환
+        try:
+            txt = _DP_SRC.read_text(f"data/{ns}/{folder}/{path}.mcfunction")
+            break
+        except Exception:
+            continue
+    if txt is None:
+        m = BR_ALL                     # 데이터팩 밖(외부 ns)/부재 — 내용 미상
+    else:
+        m = 0
+        for raw in txt.split("\n"):
+            m |= _br_line_mask(raw.strip(), _seen)
+            if m == BR_ALL:
+                break
+    if top:
+        _BR_MASK_CACHE[fid] = m        # 완전 폐포로 계산된 top-level 만 캐시(사이클 부분값 오염 방지)
+    return m
+
+
+
 # ───────────────────────── 결과 구조 ─────────────────────────
 @dataclass
 class Emitted:

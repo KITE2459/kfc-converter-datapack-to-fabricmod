@@ -149,6 +149,7 @@ def _mp_init(datapack_root, macro_fns, group, all_fids=(),
     _emit.load_entity_type_tags(datapack_root)
     _emit.load_block_tags(datapack_root)
     _emit.load_predicates(datapack_root)
+    _emit.set_datapack_source(datapack_root)   # [P3] 브릿지 정적 분석용
     _emit.set_macro_fns(set(macro_fns))
     _emit.set_all_fids(set(all_fids))
     import assemble as _asm
@@ -645,6 +646,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         emit.load_entity_type_tags(dp_src)
         emit.load_block_tags(dp_src)
         emit.load_predicates(dp_src)
+        emit.set_datapack_source(dp_src)   # [P3] 브릿지 정적 분석용
     _tlog("setup (datapack tags/predicates)")
 
     out_root = Path(out_dir)
@@ -1376,33 +1378,34 @@ def make_stub_class(fid: str, group: str) -> JavaClass:
     segs = path.split("/")
     package = ".".join([group] + [emit.sanitize(ns)] + [emit.sanitize(s) for s in segs[:-1]])
     cls = emit.pascal(segs[-1])
+    _brm = emit.bridge_mask(fid)   # [P3] 변환 시점 정적 마스크(미주입/외부 ns → 15=BR_ALL)
     code = f"""package {package};
 
 import {group}.generated.KfcGen;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.util.Identifier;
 
-/** Auto-generated bridge stub for datapack function `{fid}`
+/** Auto-generated bridge stub for datapack function `{fid}` (invalidation mask {_brm})
  *  (매크로/미파싱 함수 - 원본 mcfunction 함수 단위 실행으로 폴백). */
 public final class {cls} {{
     private {cls}() {{ throw new UnsupportedOperationException(); }}
 
     public static void execute(ServerCommandSource source) {{
-        KfcGen.instantExecuteFunction(source, Identifier.of("{ns}", "{path}"));
+        KfcGen.instantExecuteFunction(source, Identifier.of("{ns}", "{path}"), {_brm});
     }}
 
     /** mcfunction return 값 전파 - if function / store result 호출용. */
     public static int executeReturn(ServerCommandSource source) {{
-        return KfcGen.instantExecuteFunctionReturn(source, Identifier.of("{ns}", "{path}"));
+        return KfcGen.instantExecuteFunctionReturn(source, Identifier.of("{ns}", "{path}"), {_brm});
     }}
 
     public static void execute(ServerCommandSource source, java.util.Map<String, String> macroArgs) {{
-        KfcGen.instantExecuteFunction(source, Identifier.of("{ns}", "{path}"), macroArgs);
+        KfcGen.instantExecuteFunction(source, Identifier.of("{ns}", "{path}"), macroArgs, {_brm});
     }}
 
     /** 매크로 호출의 return 값 전파(bare 호출도 executeReturn 직접 호출로 통일 — 래퍼 프레임 제거). */
     public static int executeReturn(ServerCommandSource source, java.util.Map<String, String> macroArgs) {{
-        return KfcGen.instantExecuteFunctionReturn(source, Identifier.of("{ns}", "{path}"), macroArgs);
+        return KfcGen.instantExecuteFunctionReturn(source, Identifier.of("{ns}", "{path}"), macroArgs, {_brm});
     }}
 }}
 """

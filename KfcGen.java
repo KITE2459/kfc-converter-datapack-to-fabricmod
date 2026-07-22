@@ -92,6 +92,18 @@ public final class KfcGen {
     // 차단된다(잘못된 값 반환 불가; 최악은 미스 후 재디코드 = 멱등).
     private static final java.util.Map<net.minecraft.nbt.NbtElement, net.minecraft.text.Text>
             INTERP_CACHE_NBT = boundedMap(8192);
+    // [P2 identity 1차] storage 소스 게이지 조각은 DataCommandStorage.get 이 라이브 compound 를
+    // 반환(1.21.5 바이트코드 확인: copy 없음)하므로 storage 미변이 동안 요소 identity 가 안정.
+    // 값 키(deep hashCode) 조회 전에 identity 로 즉시 히트 — 실측 716ms(LinkedHashMap.get) 제거 대상.
+    // 무효화: storageSave(우리 변이)·bridgeReconcile(BR_ENTITY)·runCommand 비안전·외부명령 화해·주기 안전망.
+    // 값 키 2차 층은 항상 정확하므로 identity 층은 순수 가속 — -Dkfc.itpid=off 로 비활성 가능.
+    // [정밀화] 이 팩은 storage append 를 상시 수행(storagePutSnbt 실측 2.3s/창)해 단일 맵이면
+    // storageSave 마다 전체 무효화 → identity 층 무력화. 게이지 '템플릿' storage 와 append 되는
+    // storage 는 별개이므로 storage-id 별 맵으로 분리 — storageSave(id) 는 그 id 맵만 제거한다.
+    private static final java.util.HashMap<String,
+            java.util.IdentityHashMap<net.minecraft.nbt.NbtElement, net.minecraft.text.Text>>
+            INTERP_ID_MAPS = new java.util.HashMap<>();
+    private static final boolean ITP_ID = !"off".equalsIgnoreCase(System.getProperty("kfc.itpid", "on"));
     private static final java.util.Map<String, CachedText>
             TEXT_CACHE = boundedMap(8192);
 
@@ -163,6 +175,13 @@ public final class KfcGen {
         net.minecraft.text.NbtTextContent nc = ct.itpNc;
         net.minecraft.command.argument.NbtPathArgumentType.NbtPath p = nbtPath(nc.getPath());
         if (p == null) return null;
+        // identity 캐시는 storage 소스만(라이브 참조 안정). entity/block 소스는 매 호출 fresh 객체라
+        // identity 미스만 쌓여 무의미 — 아예 우회해 맵 오염 방지. storage-id 별 맵(위 선언 참조).
+        java.util.IdentityHashMap<net.minecraft.nbt.NbtElement, net.minecraft.text.Text> idMap = null;
+        if (ITP_ID && nc.getDataSource() instanceof net.minecraft.text.StorageNbtDataSource sds) {
+            idMap = INTERP_ID_MAPS.computeIfAbsent(sds.id().toString(),
+                    k2 -> new java.util.IdentityHashMap<>());
+        }
         net.minecraft.text.MutableText out = null;
         java.util.Iterator<net.minecraft.nbt.NbtCompound> roots =
                 nc.getDataSource().get(source).iterator();
@@ -184,11 +203,16 @@ public final class KfcGen {
                     if (base == INTERP_INVALID || base == null) continue;
                 } else {
                     // 비문자열 요소(NbtList/NbtCompound) — 실측상 게이지 조각의 전부.
-                    base = INTERP_CACHE_NBT.get(el);
+                    base = idMap != null ? idMap.get(el) : null;   // identity 1차: deep hashCode 회피
                     if (base == null) {
-                        base = _itpDecode(source, el);
-                        INTERP_CACHE_NBT.put(el.copy(),
-                                base == null ? INTERP_INVALID : base);
+                        base = INTERP_CACHE_NBT.get(el);            // 값 기준 2차(종전 경로 그대로)
+                        if (base == null) {
+                            base = _itpDecode(source, el);
+                            INTERP_CACHE_NBT.put(el.copy(),
+                                    base == null ? INTERP_INVALID : base);
+                        }
+                        if (base == null) base = INTERP_INVALID;
+                        if (idMap != null && idMap.size() < 4096) idMap.put(el, base);
                     }
                     if (base == INTERP_INVALID || base == null) continue;
                 }
@@ -326,6 +350,11 @@ public final class KfcGen {
     // 서버당 1개 캐시 — 필드 전부 라이브 참조(world/scoreboard 불변, allPlayers 는 PlayerManager
     // 의 라이브 리스트)라 매 호출 재생성과 시맨틱 동일. 벽충돌 핫패스에서 executeReturn 마다
     // 컨텍스트를 새로 만들던 비용(getOverworld/getScoreboard/getPlayerList 게터 체인) 제거.
+    // [P1] 주기 안전망 간격(틱). 기본 100(현행). 명령 경로(플레이어/커맨드블럭/콘솔/사인)는
+    // FuncCoherence 훅이, /schedule 지연 함수는 SchedCoherence 훅(CommandFunctionManager.execute)이
+    // 즉시 dirty-flag 화해를 보장하므로, 안전망이 커버할 잔여는 '타 모드의 API 직접 쓰기'뿐.
+    // -Dkfc.reconticks=1200(60s) 권장 A/B — 5초마다 전 핸들/스냅샷 폐기가 유발하던 재해소 churn 제거.
+    private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 100);
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
         // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브
@@ -348,10 +377,11 @@ public final class KfcGen {
             // (믹스인이 미적용된 환경에서도 이 안전망이 최종 정합을 보장 — fail-safe.)
             // coherence 믹스인 발동이 확인돼(1회 활성 로그) 상시 dirty-flag 즉시 화해로 동작한다.
             // 여기는 함수를 거치지 않는 bare 커맨드블럭/콘솔 개입만 100틱(5초) 주기로 수렴시키는 안전망.
-            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= 100) {
+            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= RECON_TICKS) {
                 HANDLE_RECON_TICK = t;
                 invalidateScoreHandles();
                 ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
+                INTERP_ID_MAPS.clear();   // [P2] interp identity 층 — API 직접 쓰기 수렴(안전망 동일 축)
             }
             snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
@@ -373,6 +403,7 @@ public final class KfcGen {
     // 루프에서 공짜로 계산되고, snapAdd/snapRemove 가 ± 증분 유지한다. 훅 밖 유입/제거
     // (청크 로드/언로드, 바닐라 스폰/사망)는 이 지문으로만 드러난다 — tagBucket 드리프트 감지용.
     private static long SNAP_FP = 0;
+    private static long SNAP_TAG_FP = 0;   // 태그 보유 엔티티만의 지문(popDrift 빈도 감소용, kfc.tagfp)
     private static long _entFp(net.minecraft.entity.Entity e) {
         long h = System.identityHashCode(e);
         h *= 0x9E3779B97F4A7C15L;                 // 혼합(합 충돌 완화) — 순서무관 합산용
@@ -382,13 +413,15 @@ public final class KfcGen {
         int t = ctx.server.getTicks();
         if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
             java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>();
-            long fp = 0;
+            long fp = 0, tfp = 0;
             for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
                 if (e == null) continue;
                 list.add(e);
-                fp += _entFp(e);
+                long f = _entFp(e);
+                fp += f;
+                if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) tfp += f;   // 태그 보유만(off 면 호출조차 안 됨)
             }
-            SNAP_ENTITIES = list; SNAP_FP = fp;
+            SNAP_ENTITIES = list; SNAP_FP = fp; SNAP_TAG_FP = tfp;
             SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
         }
         return SNAP_ENTITIES;
@@ -648,6 +681,12 @@ public final class KfcGen {
     private static int  TB_PLN = -1, TB_PLH = 0;            // 플레이어 목록 지문(수 + identity 합)
     private static int  TB_RECON_TICK = Integer.MIN_VALUE;  // 주기 화해 스탬프
     private static long TB_FP = Long.MIN_VALUE;             // 17차: 버킷이 마지막으로 본 개체군 지문
+    private static long TB_TAG_FP = Long.MIN_VALUE;        // 태그 보유 엔티티 지문(popDrift 판정용)
+    // [빈도 감소 토글] -Dkfc.tagfp=on 이면 popDrift 를 '태그 보유 엔티티 지문'으로만 판정한다.
+    // 태그 없는 엔티티(아이템/XP/투사체/미태그 이펙트)의 스폰·디스폰은 버킷에 영향이 없으므로
+    // 재구축을 건너뛴다. 재구축 방식(전체 스냅샷 순서)은 불변 → 버킷 내용/순서/셀렉터 고증 불변.
+    // 태그 엔티티 변화·태그 경계 교차(tagless↔tagged)는 지문이 바뀌어 정상 재구축(≤1틱, 현행 동등).
+    private static final boolean TAG_FP_OPT = "on".equalsIgnoreCase(System.getProperty("kfc.tagfp","off"));
     // TAG_BUCKETS 가 clear 될 때마다(=틱/gen/서버 변화 rebuild, NBT 리로드 태그변경) 증가.
     // 정적 승격된 Tags 핸들(pass-4)이 (서버,틱,gen,epoch) 4-스탬프가 모두 일치할 때만
     // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
@@ -672,14 +711,14 @@ public final class KfcGen {
             // 누락 → 트랙 선택룸 UI 가 다음 ENTITY_GEN 범프까지(1~2초) 무반응이었다.
             // 훅 경유 변화(경주 중 스폰/킬)는 지문이 동기 유지되어 재구축을 유발하지 않는다.
             entitiesSnapshot(ctx);                    // 이 틱 스냅샷/지문 확정(첫 접근 시 재구축)
-            boolean popDrift = (SNAP_FP != TB_FP);
-            TB_FP = SNAP_FP;
+            boolean popDrift = TAG_FP_OPT ? (SNAP_TAG_FP != TB_TAG_FP) : (SNAP_FP != TB_FP);
+            TB_FP = SNAP_FP; TB_TAG_FP = SNAP_TAG_FP;
             // 25차[무결성·성능 양립]: 외부 태그 변이의 즉시 화해는 KfcFuncCoherenceMixin 이
             // 담당한다(외부 함수 실행 직후 onExternalFunctionExecuted()→ENTITY_GEN++ 가 아래
             // TB_GEN 검사로 버킷을 무효화). 여기는 종전 안전망(플레이어 드리프트 즉시 + 개체군
             // 지문 드리프트 즉시 + 100틱 주기)만 유지 — 함수 밖 bare /tag·콘솔 개입 수렴용.
             // (24차의 매 틱 무조건 clear 는 성능 회복 위해 철회.)
-            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= 100) {
+            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= RECON_TICKS) {
                 TB_RECON_TICK = tk;
                 TAG_BUCKETS.clear(); TB_EPOCH++;
             }
@@ -2571,7 +2610,7 @@ public final class KfcGen {
             // 콘솔/OP 의 훅 밖 개입은 100틱(5초) 주기 화해로 수렴 — 13/14차와 동일한 편차 축.
             if (ND_TICK != tk) {
                 ND_TICK = tk;
-                if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= 100) {
+                if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= RECON_TICKS) {
                     ND_RECON_TICK = tk;
                     ND_MAP.clear();
                 }
@@ -4191,6 +4230,7 @@ public final class KfcGen {
                 OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
                 invalidateScoreHandles();   // 13차: 바닐라가 scoreboard reset/remove 했을 수 있음
                 NAME_GEN++;                 // 22차: 바닐라가 /team·CustomName 을 바꿨을 수 있음
+                INTERP_ID_MAPS.clear();    // [P2] storage 변이 가능성
             }
             if ((cls & CMD_RELOADS) != 0) FN_CACHE.clear();   // reload/datapack — 함수 핸들 재해소
         } catch (Exception ex) {
@@ -4225,11 +4265,31 @@ public final class KfcGen {
         return v;
     }
 
+    // ── [P3 브릿지 선별 화해] 변환 시점 정적 분석 마스크 — 런타임 파싱 비용 0 ──
+    // emit.bridge_mask(fid)가 브릿지 함수(+정적 호출 그래프)의 raw 명령을 분류해 상수 마스크를
+    // 산출, 생성 코드가 리터럴로 전달한다. 분류 불가/외부 ns → BR_ALL(구 blanket 동일, fail-closed).
+    public static final int BR_ENTITY = 1, BR_OBJ = 2, BR_SCORE = 4, BR_NAME = 8, BR_ALL = 15;
+    private static void bridgeReconcile(int mask) {
+        if ((mask & BR_ENTITY) != 0) { ENTITY_GEN++; INTERP_ID_MAPS.clear(); }
+        if ((mask & BR_OBJ) != 0) OBJ_GEN++;
+        if ((mask & BR_SCORE) != 0) invalidateScoreHandles();
+        if ((mask & BR_NAME) != 0) NAME_GEN++;
+    }
+
     /** 함수 폴백 + 반환값 캡처 — 폴백 함수의 executeReturn 이 mcfunction return 값을
      *  if function 분기에 전달할 수 있게 한다. 실패/미실행 시 0. */
     public static int instantExecuteFunctionReturn(net.minecraft.server.command.ServerCommandSource source,
                                                    net.minecraft.util.Identifier functionId,
                                                    java.util.Map<String, String> macroArgs) {
+        return instantExecuteFunctionReturn(source, functionId, macroArgs, BR_ALL);
+    }
+    public static int instantExecuteFunctionReturn(net.minecraft.server.command.ServerCommandSource source,
+                                                   net.minecraft.util.Identifier functionId, int kfcMask) {
+        return instantExecuteFunctionReturn(source, functionId, null, kfcMask);
+    }
+    public static int instantExecuteFunctionReturn(net.minecraft.server.command.ServerCommandSource source,
+                                                   net.minecraft.util.Identifier functionId,
+                                                   java.util.Map<String, String> macroArgs, int kfcMask) {
         final int[] ret = {0};
         try {
             net.minecraft.server.MinecraftServer server = source.getServer();
@@ -4258,9 +4318,7 @@ public final class KfcGen {
             // 거치지 않는다. 이후 스냅샷 기반 셀렉터(@e 루프/태그 제거 등)가 그 엔티티를 놓치면
             // (예: 브릿지로 소환된 모델의 임시태그 제거 실패 → 다음 소환이 이전 모델 간섭) 고증이 깨진다.
             // 따라서 브릿지 직후 스냅샷/타입버킷을 무효화해 다음 접근 때 live 월드에서 재빌드시킨다.
-            ENTITY_GEN++;
-            invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
-            NAME_GEN++;                 // 22차: 브릿지가 /team·CustomName 을 바꿨을 수 있음
+            bridgeReconcile(kfcMask);   // [P3] 정적 마스크 선별 화해(BR_ALL=구 blanket, OBJ 포함 확대)
         } catch (Exception ex) {
             // 폴백 실행 실패는 조용히 삼키지 않는다 — 원본이라면 함수가 '실행'됐을 상황이므로
             // 실패는 변환기/환경 문제다. 진단 가능하도록 로그를 남긴다.
@@ -4279,6 +4337,15 @@ public final class KfcGen {
     public static void instantExecuteFunction(net.minecraft.server.command.ServerCommandSource source,
                                               net.minecraft.util.Identifier functionId,
                                               java.util.Map<String, String> macroArgs) {
+        instantExecuteFunction(source, functionId, macroArgs, BR_ALL);
+    }
+    public static void instantExecuteFunction(net.minecraft.server.command.ServerCommandSource source,
+                                              net.minecraft.util.Identifier functionId, int kfcMask) {
+        instantExecuteFunction(source, functionId, null, kfcMask);
+    }
+    public static void instantExecuteFunction(net.minecraft.server.command.ServerCommandSource source,
+                                              net.minecraft.util.Identifier functionId,
+                                              java.util.Map<String, String> macroArgs, int kfcMask) {
         try {
             net.minecraft.server.MinecraftServer server = source.getServer();
             net.minecraft.server.function.CommandFunctionManager manager = server.getCommandFunctionManager();
@@ -4301,10 +4368,7 @@ public final class KfcGen {
                         net.minecraft.command.ReturnValueConsumer.EMPTY);
                 context.run();
             });
-            ENTITY_GEN++;   // 브릿지가 summon/kill 했을 수 있으므로 스냅샷/타입버킷 무효화(위 설명 참조)
-            OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
-            invalidateScoreHandles();   // 13차: 브릿지가 scoreboard reset/remove 했을 수 있음
-            NAME_GEN++;                 // 22차: 브릿지가 /team·CustomName 을 바꿨을 수 있음
+            bridgeReconcile(kfcMask);   // [P3] 정적 마스크 선별 화해(BR_ALL=구 blanket 동일)
         } catch (Exception ex) {
             System.err.println("[KFC-BRIDGE-ERROR] " + functionId + ": " + ex);
         }
@@ -4586,11 +4650,23 @@ public final class KfcGen {
         if (DEBUG_COHERENCE) System.out.println("[KFC] executeWithPrefix fired: /" + command);
         EXTERNAL_DIRTY = true;
     }
+    // /schedule 지연 함수는 CommandManager.execute 를 안 탄다(바닐라 타이머 → CommandFunctionManager.execute
+    // 직행 — FunctionTimerCallback/FunctionTagTimerCallback 상수풀 확인). KfcSchedCoherenceMixin 이 그
+    // 관문 HEAD 에서 이 메서드를 호출해 지연 실행 변이도 즉시 화해에 잡는다(안전망 주기 완화의 전제).
+    private static boolean SCHED_LOGGED = false;
+    public static void markExternalFunction() {
+        if (!SCHED_LOGGED) {
+            SCHED_LOGGED = true;
+            System.out.println("[KFC] scheduled-function coherence mixin active (CommandFunctionManager.execute)");
+        }
+        EXTERNAL_DIRTY = true;
+    }
     public static void onExternalFunctionExecuted() {
         ENTITY_GEN++;
         OBJ_GEN++;
         invalidateScoreHandles();
         NAME_GEN++;
+        INTERP_ID_MAPS.clear();   // [P2] 외부 명령이 storage 를 변이했을 수 있음
     }
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.
@@ -6282,6 +6358,7 @@ public static net.minecraft.entity.Entity firstEntity(
     private static void storageSave(net.minecraft.server.MinecraftServer server, String id,
                                     net.minecraft.nbt.NbtCompound root) {
         net.minecraft.util.Identifier sid = idOf(id.contains(":") ? id : "minecraft:" + id);
+        INTERP_ID_MAPS.remove(sid.toString());   // [P2] 이 storage 만 identity 무효(타 storage 캐시 보존)
         server.getDataCommandStorage().set(sid, root);
     }
 

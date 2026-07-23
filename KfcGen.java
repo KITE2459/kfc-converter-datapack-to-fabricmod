@@ -1,4 +1,4 @@
-package kartriderpack.generated;
+package __KFC_GROUP__.generated;
 
 import net.minecraft.scoreboard.ReadableScoreboardScore;
 import net.minecraft.scoreboard.ScoreHolder;
@@ -305,7 +305,7 @@ public final class KfcGen {
 
     // ──────────────── objective 핸들 캐시 (ObjRef) ────────────────
     // 모든 점수 헬퍼는 호출마다 sb.getNullableObjective(이름)(문자열 해시+맵 조회)을 탔다
-    // (kartall 실측 점수 호출부 18만+). objective 는 사실상 load 때 만들고 이후 불변이므로,
+    // (__KFC_GROUP__ 실측 점수 호출부 18만+). objective 는 사실상 load 때 만들고 이후 불변이므로,
     // 상수 objective 이름을 클래스 static final ObjRef 로 승격(merge_pass pass-4)하고
     // 세대(OBJ_GEN) 검사 한 번으로 재사용한다.
     // 무효화(OBJ_GEN++) 지점 — objective 집합이 바뀔 수 있는 모든 경로:
@@ -1484,13 +1484,11 @@ public final class KfcGen {
         return world.getBlockState(bp).isIn(key);
     }
 
-    /** if loaded <pos> — 청크 로드 여부. 바닐라 ExecuteCommand.isLoaded 는 isChunkLoaded 만
-     *  보지만, 네이티브 변환에선 "청크 loaded" 와 "그 청크 엔티티 유입 완료" 사이에 틈이 생긴다
-     *  (바닐라는 둘이 거의 동시). 그 틈에 로드 직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를
-     *  놓쳐, forceload+tick 으로 UI 를 재생성하는 팩에서 옛 엔티티 잔존→겹침이 났다(마스터 모드
-     *  타이틀/패널 이중 표시). getChunk(x,z) 로 FULL 상태 청크를 확보하면 그 청크의 엔티티 유입까지
-     *  완료되므로, if loaded 통과 시점의 엔티티 가시성이 바닐라와 일치한다. 이미 로드된 청크는
-     *  즉시 반환이라 비용이 없다(핫패스 영향 없음 — 실측). */
+    /** if loaded <pos> — 청크 로드 여부. 바닐라 isLoaded 는 isChunkLoaded 만 보지만, 네이티브
+     *  변환에선 청크 loaded 와 그 청크 엔티티 유입 완료 사이 틈이 생겨(바닐라는 거의 동시), 로드
+     *  직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를 놓쳤다(forceload+tick 으로 UI 재생성하는
+     *  팩에서 옛 엔티티 잔존→겹침). getChunk(x,z) 로 FULL 청크를 확보하면 엔티티 유입까지 완료돼
+     *  if loaded 통과 시점 가시성이 바닐라와 일치한다. 이미 로드된 청크는 즉시 반환(핫패스 무해). */
     public static boolean posLoaded(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);
@@ -3419,7 +3417,7 @@ public final class KfcGen {
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
     /** tp <targets> $(dest) — 매크로 목적지 런타임 파싱. 바닐라는 치환 후 재파싱하므로
-     *  `x y z`(3토큰) 또는 `x y z yaw pitch`(5토큰) 를 지원한다(kartall 트랙 pos 는 5토큰:
+     *  `x y z`(3토큰) 또는 `x y z yaw pitch`(5토큰) 를 지원한다(__KFC_GROUP__ 트랙 pos 는 5토큰:
      *  "-1000 31 1000 0 0"). 좌표는 절대/~상대, 절대 x/z 가 소수점 없는 정수면 바닐라 좌표
      *  파서의 블록 센터링(+0.5). 회전은 절대/~상대(source 회전 기준 — 바닐라 RotationArgument).
      *  파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등). */
@@ -4111,20 +4109,19 @@ public final class KfcGen {
      *  이터레이터 할당이 사라진다. 이동 순서/결과는 종전과 완전 동일(동일 리스트, 동일 순번). */
     private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
                                                double dx, double dy, double dz) {
-        java.util.List<net.minecraft.entity.Entity> lst = vehicle.getPassengerList();
-        int n = lst.size();
-        for (int i = 0; i < n; i++) {
-            net.minecraft.entity.Entity ps = lst.get(i);
+        // [실측] 종전 재귀(depth 마다 getPassengerList + 프레임)가 self 의 최상위였다(카트 모델은
+        // 수백 파츠의 깊은 승객 트리 — 재귀 오버헤드 > 실이동). getPassengersDeep() 는 직접+모든
+        // 중첩 승객을 한 번에 평탄 순회하므로 재귀 프레임·반복 getPassengerList 를 제거한다.
+        // [정합] delta 는 절대 평행이동(newpos = oldpos + delta)이라 순서 무관 — updatePosition/
+        // requestTeleport 는 승객을 자동 동반하지 않으므로(그래서 이 함수가 필요) 각 엔티티의
+        // oldpos 가 서로 독립. 프리오더 재귀든 평탄 순회든 결과 위치 완전 동일(관측 동등).
+        for (net.minecraft.entity.Entity ps : vehicle.getPassengersDeep()) {
             if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
                 sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
                         sp.getYaw(), sp.getPitch());
             } else {
                 ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
             }
-            // 잎 승객(모델 파츠 대다수 — 승객 없음)은 빈 재귀 진입(getPassengerList+빈 루프+프레임)을
-            // 생략한다. hasPassengers()=passengerList.isEmpty() 필드검사 1회로 재귀 method-call 을 없앤다.
-            // 관측 동등: 승객 없는 엔티티의 재귀는 원래도 무동작이었다.
-            if (ps.hasPassengers()) _movePassengersByDelta(ps, dx, dy, dz);
         }
     }
 
@@ -4850,6 +4847,7 @@ public final class KfcGen {
     public static void onExternalFunctionExecuted(int mask) {
         bridgeReconcile(mask);   // ENTITY→ENTITY_GEN+INTERP_ID / OBJ / SCORE→핸들폐기 / NAME (v2 선별)
     }
+
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.
      *  [실측 19차] 종전 (ObjRef→홀더) 키잉에선 리셋마다 전 맵 Entity-키 스캔(dropHolderKey)이

@@ -73,15 +73,19 @@ _FID = r'[a-z0-9_.-]+:[a-z0-9_./-]+'
 _RANGE = r'(?:-?\d+\.\.-?\d+|-?\d+\.\.|\.\.-?\d+|-?\d+)'
 _P1 = re.compile(rf'^execute as @s\[scores=\{{({_OBJ})=({_RANGE})\}}\] run function ({_FID})$')
 _P2 = re.compile(rf'^execute if score @s ({_OBJ}) matches ({_RANGE}) run function ({_FID})$')
+# [범용 노드] scores 키 N개(순서 임의) → function. 주키(정렬탐색 축) + 부가 상수 가드 K개.
+_PN = re.compile(rf'^execute as @s\[scores=\{{([^{{}}\]]+)\}}\] run function ({_FID})$')
 
-# ── [NBS 흡수] 쌍노드 터미널 + notes 리프 패턴 ──────────────────────────────
-# 쌍노드: 본문 1줄, 주 objective 범위 + 부 objective(재생 마커) 범위 → notes 호출.
-_PAIRT = re.compile(rf'^execute as @s\[scores=\{{({_OBJ})=({_RANGE}),({_OBJ})=({_RANGE})\}}\] run function ({_FID})$')
+# ── [가드 흡수 — 범용] 스코어 가드 터미널 + 상수 리프 패턴 ──────────────────
+# 가드 줄: scores 키 1..N개(순서 임의, objective 임의) → 리프 호출. 시분할 팩 공통 형태.
+_PAIRT = re.compile(rf'^execute as @s\[scores=\{{([^{{}}\]]+)\}}\] run function ({_FID})$')
+_KV = re.compile(rf'^({_OBJ})=({_RANGE})$')
 # notes 줄: playsound <snd> <cat> @s ~ ~ ~ <vol> <pitch> [minVol]  (전부 상수)
 _NOTE = re.compile(r'^playsound ([a-z0-9_.:/-]+) '
                    r'(master|music|record|weather|block|hostile|neutral|player|ambient|voice) '
                    r'@s ~ ~ ~ ([0-9]*\.?[0-9]+) ([0-9]*\.?[0-9]+)(?: ([0-9]*\.?[0-9]+))?$')
-_SETT = re.compile(rf'^scoreboard players set @s ({_OBJ}) (-?\d+)$')
+_SETT = re.compile(rf'^scoreboard players (set|add|remove) @s ({_OBJ}) (-?\d+)$')
+_TAGL = re.compile(r'^tag @s (add|remove) ([A-Za-z0-9_.+-]+)$')
 MAX_ABS_OPS = 12000    # ops 인코딩 상한(엣지 상한과 동일 근거)
 
 
@@ -91,33 +95,35 @@ def _fbits(v: float) -> int:
 
 
 def _pair_lines(lines, obj):
-    """모든 줄이 쌍노드 패턴(주=obj, 부=동일 objt)이면 (objt, [(lo,hi,tlo,thi,child),...]).
-       다중줄 지원 — 원본은 줄마다 부 objective 를 재읽으므로(선행 notes 가 t 를 올리면
-       후행 줄 가드가 그 값을 관측) 해석기도 엔트리마다 재읽는다. 아니면 None."""
+    """[범용] 모든 줄이 '스코어 가드 → 리프 호출'이면 [([(gobj,lo,hi),...], child), ...].
+       키 개수/순서/objective 임의. 원본은 줄 평가 시점에 각 objective 를 읽으므로
+       해석기도 엔트리마다 가드 objective 를 재읽는다. 아니면 None."""
     if not lines:
         return None
-    objt = None
     out = []
     for ln in lines:
         m = _PAIRT.match(ln)
         if not m:
             return None
-        o1, r1, o2, r2, child = m.groups()
-        if o1 != obj or o2 == obj:
+        body, child = m.groups()
+        guards = []
+        for kv in body.split(","):
+            mk = _KV.match(kv.strip())
+            if not mk:
+                return None            # 형식 밖(공백/중첩 등) — fail-closed
+            lo, hi = _parse_range(mk.group(2))
+            guards.append((mk.group(1), lo, hi))
+        if not guards:
             return None
-        if objt is None:
-            objt = o2
-        elif o2 != objt:
-            return None
-        lo, hi = _parse_range(r1)
-        tlo, thi = _parse_range(r2)
-        out.append((lo, hi, tlo, thi, child))
-    return objt, out
+        out.append((guards, child))
+    return out
 
 
-def _notes_ops(lines, objt):
-    """notes 리프면 순서 보존 ops 리스트, 아니면 None.
-       op = ('note', snd, cat, vol, pitch, minvol) | ('sett', n)"""
+def _notes_ops(lines):
+    """[범용] 상수 리프면 순서 보존 ops, 아니면 None.
+       op = ('note', snd,cat,vol,pitch,minvol) | ('set'|'add', obj, n) | ('tagadd'|'tagrm', name)
+       set/add/remove 는 KfcGen.setScore/addScore(Entity 판), tag 는 addTag/removeTag —
+       모두 기존 네이티브 emit 과 동일 헬퍼라 캐시 무효화 규약도 동일하다."""
     if lines is None:
         return None
     ops = []
@@ -128,8 +134,16 @@ def _notes_ops(lines, objt):
                         float(m.group(3)), float(m.group(4)), float(m.group(5) or 0.0)))
             continue
         m = _SETT.match(ln)
-        if m and m.group(1) == objt:
-            ops.append(('sett', int(m.group(2))))
+        if m:
+            verb, o, n = m.group(1), m.group(2), int(m.group(3))
+            if verb == 'set':
+                ops.append(('set', o, n))
+            else:
+                ops.append(('add', o, n if verb == 'add' else -n))
+            continue
+        m = _TAGL.match(ln)
+        if m:
+            ops.append(('tagadd' if m.group(1) == 'add' else 'tagrm', m.group(2)))
             continue
         return None
     return ops
@@ -148,22 +162,45 @@ def _parse_range(r: str) -> tuple[int, int]:
 
 
 def _node_lines(lines: list[str]):
-    """함수의 줄들이 전부 노드 패턴이면 (obj, [(lo,hi,child), ...]) 반환, 아니면 None."""
-    obj = None
-    edges = []
+    """함수의 줄들이 전부 노드 패턴이면 (obj, [(lo,hi,child,extra), ...]) 반환, 아니면 None.
+       [범용] 각 줄은 scores 가드 N키(순서 임의). 클러스터 전체에서 등장한 objective 중
+       '가장 넓은 범위를 갖는 하나'를 주키(obj, 정렬탐색 축)로 잡고, 나머지 키는 부가 상수
+       가드 extra=[(gobj,lo,hi),...] 로 노드에 부착한다. 워커가 자식 전개 전에 extra 를 재읽어
+       검사 — 원본 줄 평가 시점 재읽기와 동일. 주키가 없는 줄(부가만)은 노드 아님(None)."""
     if not lines:
         return None
+    # 1차: 각 줄 파싱 → [(obj별 범위 dict, child)]
+    parsed = []
     for ln in lines:
         m = _P1.match(ln) or _P2.match(ln)
+        if m:
+            parsed.append(({m.group(1): _parse_range(m.group(2))}, m.group(3)))
+            continue
+        m = _PN.match(ln)
         if not m:
             return None
-        o, rng, child = m.group(1), m.group(2), m.group(3)
-        if obj is None:
-            obj = o
-        elif o != obj:
-            return None
-        lo, hi = _parse_range(rng)
-        edges.append((lo, hi, child))
+        gmap = {}
+        for kv in m.group(1).split(","):
+            mk = _KV.match(kv.strip())
+            if not mk:
+                return None
+            if mk.group(1) in gmap:
+                return None            # 동일 objective 중복 키 — 미지원(fail-closed)
+            gmap[mk.group(1)] = _parse_range(mk.group(2))
+        parsed.append((gmap, m.group(2)))   # _PN 은 그룹 2개(scores body, child)
+    # 2차: 주키 선정 — 모든 줄에 공통 등장하는 objective 중 (전 노드 통일 위해) 이름 최소.
+    common = None
+    for gmap, _c in parsed:
+        ks = set(gmap)
+        common = ks if common is None else (common & ks)
+    if not common:
+        return None                    # 공통 주키 없음 — 노드 아님
+    obj = min(common)                  # 결정적 선택(클러스터 통일은 flatten 쪽에서 obj 일치로 강제)
+    edges = []
+    for gmap, child in parsed:
+        lo, hi = gmap[obj]
+        extra = [(o, r[0], r[1]) for o, r in gmap.items() if o != obj]
+        edges.append((lo, hi, child, extra))
     return obj, edges
 
 
@@ -285,7 +322,7 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
     # ── 2) 클러스터(약연결 성분, 동일 obj 에지만) ──
     adj = {f: [] for f in nodes}
     for f, (obj, edges) in nodes.items():
-        for (_lo, _hi, ch) in edges:
+        for (_lo, _hi, ch, _ex) in edges:
             if ch in nodes and nodes[ch][0] == obj:
                 adj[f].append(ch)
     parent = {f: f for f in nodes}
@@ -309,14 +346,13 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
     # 자바 측: 비클러스터 레코드 + on-disk 파일(ModEntry/stub 등)이 부르는 FQCN.
     all_node_fids = set(nodes)
     # [NBS] 쌍노드/notes 후보 사전 감지 — 외부참조 스캔·레코드 제거 판단에 포함
-    cluster_objs = {o for (o, _e) in nodes.values()}
-    nbs_pairs = {}     # pair_fid -> [child_fid ...]
+    nbs_pairs = {}     # guard-terminal fid -> [child_fid ...]
     for _f, _ls in lines_map.items():
         if _f in nodes or not _ls:
             continue
-        _ms = [_PAIRT.match(_l) for _l in _ls]
-        if all(_ms) and all(_m.group(1) in cluster_objs and _m.group(3) != _m.group(1) for _m in _ms):
-            nbs_pairs[_f] = [_m.group(5) for _m in _ms]
+        _pl = _pair_lines(_ls, None)
+        if _pl is not None:
+            nbs_pairs[_f] = [c for (_g, c) in _pl]
     nbs_children = set()
     for _cs in nbs_pairs.values():
         nbs_children.update(_cs)
@@ -433,7 +469,7 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
         term_id = {}
         macro_bail = False
         for f in comp:
-            for (_lo, _hi, ch) in nodes[f][1]:
+            for (_lo, _hi, ch, _ex) in nodes[f][1]:
                 if ch in nodes and nodes[ch][0] == obj:
                     continue
                 if ch not in term_id:
@@ -451,49 +487,56 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
 
         # ── [NBS 흡수] 쌍노드 터미널(+notes 리프) → 데이터 테이블 분류 ──
         # fail-closed: 패턴 불일치/objt 불일치/매크로/ops 상한 초과 → 그 터미널은 메서드 호출 유지.
-        abs_set = {}     # term fid -> (objt, [(lo,hi,tlo,thi,ops,child), ...])
-        objt = None
+        abs_set = {}     # term fid -> [(guards, ops, child), ...]  (guards=[(gobj,lo,hi),...])
         for ch in terminals:
-            pa = _pair_lines(lines_map.get(ch), obj)
-            if pa is None:
-                continue
-            o2, pl = pa
-            if objt is None:
-                objt = o2
-            elif o2 != objt:
+            pl = _pair_lines(lines_map.get(ch), None)
+            if pl is None:
                 continue
             tc2 = by_fid.get(ch)
             if tc2 is not None and tc2.is_macro:
                 continue
             ents = []
             bad = False
-            for (plo, phi, tlo, thi, child) in pl:
+            for (guards, child) in pl:
                 cc = by_fid.get(child)
                 if cc is not None and cc.is_macro:
                     bad = True; break
-                ops = _notes_ops(lines_map.get(child), o2)
+                ops = _notes_ops(lines_map.get(child))
                 if ops is None:
                     bad = True; break
-                ents.append((plo, phi, tlo, thi, ops, child))
+                ents.append((guards, ops, child))
             if bad or not ents:
                 continue
             abs_set[ch] = ents
-        if sum(len(e[4]) for v in abs_set.values() for e in v) > MAX_ABS_OPS:
+        if sum(len(e[1]) for v in abs_set.values() for e in v) > MAX_ABS_OPS:
             abs_set = {}
         if abs_set:
             terminals = [t for t in terminals if t in abs_set] + [t for t in terminals if t not in abs_set]
             term_id = {t: i for i, t in enumerate(terminals)}
         n_abs = sum(1 for t in terminals if t in abs_set)
 
-        # 노드 인덱싱 + 평탄 에지 배열
+        # 노드 인덱싱 + 평탄 에지 배열 (+ 부가 상수 가드 게이트)
         nid = {f: i for i, f in enumerate(comp)}
         lo_arr, hi_arr, tgt_arr = [], [], []
         es_arr, ee_arr = [], []
+        xs_arr, xe_arr = [], []          # 에지 → 부가가드 슬라이스
+        xobj, xlo, xhi = [], [], []      # 부가가드: objective idx, 범위
+        _nobj_key, _nobj_names = {}, []
+        def _noid(o):
+            if o not in _nobj_key:
+                _nobj_key[o] = len(_nobj_names); _nobj_names.append(o)
+            return _nobj_key[o]
+        has_extra = False
         for f in comp:
             es_arr.append(len(lo_arr))
-            for (lo, hi, ch) in nodes[f][1]:
+            for (lo, hi, ch, extra) in nodes[f][1]:
                 lo_arr.append(lo)
                 hi_arr.append(hi)
+                xs_arr.append(len(xobj))
+                for (go, glo2, ghi2) in extra:
+                    xobj.append(_noid(go)); xlo.append(glo2); xhi.append(ghi2)
+                    has_extra = True
+                xe_arr.append(len(xobj))
                 if ch in nid:
                     tgt_arr.append(nid[ch])
                 else:
@@ -521,6 +564,28 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
         for f in entries:
             max_stack = max(max_stack, _g(nid[f]) + 2)
 
+        # 부가 상수 가드(다중키 노드) 게이트 — 없으면 배열/검사 생략(NBS 등 단일키는 코드 불변).
+        if has_extra:
+            _xdecl = (
+                f'    private static final int[] XS = KfcGen.decodeInts("{_encode_ints(xs_arr)}");\n'
+                f'    private static final int[] XE = KfcGen.decodeInts("{_encode_ints(xe_arr)}");\n'
+                f'    private static final int[] XOBJ = KfcGen.decodeInts("{_encode_ints(xobj)}");\n'
+                f'    private static final int[] XLO = KfcGen.decodeInts("{_encode_ints(xlo)}");\n'
+                f'    private static final int[] XHI = KfcGen.decodeInts("{_encode_ints(xhi)}");\n'
+                f'    private static final String[] NOBJ = {{ {", ".join(chr(34)+x+chr(34) for x in _nobj_names)} }};\n')
+            _xgate = (
+                "            if (XS[ed] < XE[ed]) {\n"
+                "                boolean _xp = true;\n"
+                "                for (int g = XS[ed]; g < XE[ed]; g++) {   // 부가 상수 가드 재읽기(원본 줄 평가 시점)\n"
+                "                    Integer xv = KfcGen.readScoreEnt(sb, e, NOBJ[XOBJ[g]]);\n"
+                "                    if (xv == null || xv < XLO[g] || xv > XHI[g]) { _xp = false; break; }\n"
+                "                }\n"
+                "                if (!_xp) continue;\n"
+                "            }\n")
+        else:
+            _xdecl = ""
+            _xgate = ""
+
         cls_name = f"KfcTree{tree_idx}"
         tree_idx += 1
         tree_fqcn = f"{group}.generated.{cls_name}"
@@ -529,14 +594,31 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
         abs_code = ""
         if n_abs:
             pes, pee = [], []                       # 터미널 → 엔트리 슬라이스
-            tlo_a, thi_a, ttlo_a, tthi_a, aops, aope = [], [], [], [], [], []
+            gs_a, ge_a = [], []                     # 엔트리 → 가드 슬라이스
+            gobj, glo, ghi = [], [], []             # 가드: objective idx + 범위
+            aops, aope = [], []
             osnd, oa, ob, oc = [], [], [], []
             snd_key = {}
             snd_ids, snd_cats = [], []
+            obj_key = {}
+            obj_names = []
+            tag_key = {}
+            tag_names = []
+            def _oid(o):
+                if o not in obj_key:
+                    obj_key[o] = len(obj_names); obj_names.append(o)
+                return obj_key[o]
+            def _tid2(x):
+                if x not in tag_key:
+                    tag_key[x] = len(tag_names); tag_names.append(x)
+                return tag_key[x]
             for t in terminals[:n_abs]:
-                pes.append(len(tlo_a))
-                for (plo, phi, tlo, thi, ops, _child) in abs_set[t]:
-                    tlo_a.append(plo); thi_a.append(phi); ttlo_a.append(tlo); tthi_a.append(thi)
+                pes.append(len(gs_a))
+                for (guards, ops, _child) in abs_set[t]:
+                    gs_a.append(len(gobj))
+                    for (go, lo2, hi2) in guards:
+                        gobj.append(_oid(go)); glo.append(lo2); ghi.append(hi2)
+                    ge_a.append(len(gobj))
                     aops.append(len(osnd))
                     for op in ops:
                         if op[0] == 'note':
@@ -547,26 +629,35 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
                                 snd_ids.append(snd); snd_cats.append(cat)
                             osnd.append(snd_key[key]); oa.append(_fbits(pitch))
                             ob.append(_fbits(vol)); oc.append(_fbits(minvol))
-                        else:
-                            osnd.append(-1); oa.append(op[1]); ob.append(0); oc.append(0)
+                        elif op[0] == 'set':
+                            osnd.append(-1); oa.append(op[2]); ob.append(_oid(op[1])); oc.append(0)
+                        elif op[0] == 'add':
+                            osnd.append(-2); oa.append(op[2]); ob.append(_oid(op[1])); oc.append(0)
+                        elif op[0] == 'tagadd':
+                            osnd.append(-3); oa.append(_tid2(op[1])); ob.append(0); oc.append(0)
+                        else:   # tagrm
+                            osnd.append(-4); oa.append(_tid2(op[1])); ob.append(0); oc.append(0)
                     aope.append(len(osnd))
-                pee.append(len(tlo_a))
+                pee.append(len(gs_a))
             _sid = ", ".join(f'"{x}"' for x in snd_ids)
             _sct = ", ".join(f'"{x}"' for x in snd_cats)
             abs_code = f"""
-    // ── [NBS 흡수] 쌍노드 가드 + notes 를 데이터 테이블로 — 부 objective `{objt}` ──
-    // 원본: 쌍노드 줄들(execute as @s[scores={{{obj}=A..B,{objt}=C..D}}] run notes/N) +
-    //       notes 리프(playsound@s 상수 × K, set @s {objt} N). 줄 순서 그대로 해석 실행.
-    //       부 objective 는 엔트리(원본 줄)마다 재읽기 — 선행 notes 의 set 이 후행 가드에
-    //       관측되는 원본 시맨틱 그대로. playsound 는 플레이어 실행자만(라인 동일).
+    // ── [가드 흡수 — 범용] 스코어 가드 터미널 + 상수 리프를 데이터 테이블로 ──
+    // 원본: 가드 줄들(execute as @s[scores={{k1=..,k2=..,...}}] run function LEAF) +
+    //       상수 리프(playsound@s / scoreboard set|add|remove @s / tag @s add|remove).
+    //       줄 순서 그대로 해석 실행. 가드 objective 는 엔트리(원본 줄) 평가 시점마다 재읽기 —
+    //       선행 리프의 쓰기가 후행 가드에 관측되는 원본 시맨틱 그대로.
     private static final int[] PES = KfcGen.decodeInts("{_encode_ints(pes)}");
     private static final int[] PEE = KfcGen.decodeInts("{_encode_ints(pee)}");
-    private static final int[] ATLO = KfcGen.decodeInts("{_encode_ints(tlo_a)}");
-    private static final int[] ATHI = KfcGen.decodeInts("{_encode_ints(thi_a)}");
-    private static final int[] ATTLO = KfcGen.decodeInts("{_encode_ints(ttlo_a)}");
-    private static final int[] ATTHI = KfcGen.decodeInts("{_encode_ints(tthi_a)}");
+    private static final int[] GS = KfcGen.decodeInts("{_encode_ints(gs_a)}");
+    private static final int[] GE = KfcGen.decodeInts("{_encode_ints(ge_a)}");
+    private static final int[] GOBJ = KfcGen.decodeInts("{_encode_ints(gobj)}");
+    private static final int[] GLO = KfcGen.decodeInts("{_encode_ints(glo)}");
+    private static final int[] GHI = KfcGen.decodeInts("{_encode_ints(ghi)}");
     private static final int[] AOPS = KfcGen.decodeInts("{_encode_ints(aops)}");
     private static final int[] AOPE = KfcGen.decodeInts("{_encode_ints(aope)}");
+    private static final String[] OBJ_NAMES = {{ {", ".join(f'"{x}"' for x in obj_names)} }};
+    private static final String[] TAG_NAMES = {{ {", ".join(f'"{x}"' for x in tag_names)} }};
     private static final int[] OSND = KfcGen.decodeInts("{_encode_ints(osnd)}");
     private static final int[] OA = KfcGen.decodeInts("{_encode_ints(oa)}");
     private static final int[] OB = KfcGen.decodeInts("{_encode_ints(ob)}");
@@ -591,19 +682,26 @@ def flatten_trees(records: list, src_root: Path, group: str, dp_src,
         net.minecraft.server.network.ServerPlayerEntity ps =
                 (e instanceof net.minecraft.server.network.ServerPlayerEntity _p) ? _p : null;
         for (int pe = PES[t]; pe < PEE[t]; pe++) {{
-            if (s < ATLO[pe] || s > ATHI[pe]) continue;
-            Integer tv = KfcGen.readScoreEnt(sb, e, "{objt}");   // 엔트리마다 재읽기(원본 줄별 평가)
-            if (tv == null) continue;
-            int tvv = tv;
-            if (tvv < ATTLO[pe] || tvv > ATTHI[pe]) continue;
+            boolean pass = true;
+            for (int g = GS[pe]; g < GE[pe]; g++) {{   // 가드 objective 는 평가 시점 재읽기(원본 동일)
+                Integer gv = KfcGen.readScoreEnt(sb, e, OBJ_NAMES[GOBJ[g]]);
+                if (gv == null || gv < GLO[g] || gv > GHI[g]) {{ pass = false; break; }}
+            }}
+            if (!pass) continue;
             if (!inited) {{ if (SNDS == null) initSnds(); inited = true; }}
             for (int i = AOPS[pe]; i < AOPE[pe]; i++) {{
                 int sd = OSND[i];
                 if (sd >= 0) {{
                     if (ps != null) KfcGen.playSound(ps, SNDS[sd], SCATS[sd], source.getPosition(),
                             Float.intBitsToFloat(OB[i]), Float.intBitsToFloat(OA[i]), Float.intBitsToFloat(OC[i]));
+                }} else if (sd == -1) {{
+                    KfcGen.setScore(sb, e, OBJ_NAMES[OB[i]], OA[i]);
+                }} else if (sd == -2) {{
+                    KfcGen.addScore(sb, e, OBJ_NAMES[OB[i]], OA[i]);
+                }} else if (sd == -3) {{
+                    KfcGen.addTag(e, TAG_NAMES[OA[i]]);
                 }} else {{
-                    KfcGen.setScore(sb, e, "{objt}", OA[i]);
+                    KfcGen.removeTag(e, TAG_NAMES[OA[i]]);
                 }}
             }}
         }}
@@ -666,7 +764,7 @@ public final class {cls_name} {{
     private static final int[] TGT = KfcGen.decodeInts("{_encode_ints(tgt_arr)}");
     private static final int[] ES = KfcGen.decodeInts("{_encode_ints(es_arr)}");
     private static final int[] EE = KfcGen.decodeInts("{_encode_ints(ee_arr)}");
-    private static final int MAX_STACK = {max_stack};
+{_xdecl}    private static final int MAX_STACK = {max_stack};
 {abs_code}
 {chr(10).join(run_methods)}
 
@@ -683,7 +781,7 @@ public final class {cls_name} {{
         while (sp > 0) {{
             int ed = st[--sp];
             if (s < LO[ed] || s > HI[ed]) continue;
-            int tg = TGT[ed];
+{_xgate}            int tg = TGT[ed];
             if (tg >= 0) {{
                 for (int i = EE[tg] - 1; i >= ES[tg]; i--) st[sp++] = i;
             }} else {{
@@ -736,7 +834,7 @@ public final class {c.cls} {{
         # [NBS] 흡수 쌍노드 레코드 제거(외부 미참조) + notes 자식 추적
         for t in terminals[:n_abs]:
             for ent in abs_set[t]:
-                nbs_abs_children.setdefault(ent[5], []).append(t)
+                nbs_abs_children.setdefault(ent[2], []).append(t)
             if t not in ext_ref and t in by_fid:
                 removed_fids.add(t)
 

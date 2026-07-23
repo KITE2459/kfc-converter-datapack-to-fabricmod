@@ -1484,11 +1484,17 @@ public final class KfcGen {
         return world.getBlockState(bp).isIn(key);
     }
 
-    /** if loaded <pos> — 청크 로드 여부. */
+    /** if loaded <pos> — 청크 로드 여부. 바닐라 ExecuteCommand.isLoaded 는 isChunkLoaded 만
+     *  보지만, 네이티브 변환에선 "청크 loaded" 와 "그 청크 엔티티 유입 완료" 사이에 틈이 생긴다
+     *  (바닐라는 둘이 거의 동시). 그 틈에 로드 직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를
+     *  놓쳐, forceload+tick 으로 UI 를 재생성하는 팩에서 옛 엔티티 잔존→겹침이 났다(마스터 모드
+     *  타이틀/패널 이중 표시). getChunk(x,z) 로 FULL 상태 청크를 확보하면 그 청크의 엔티티 유입까지
+     *  완료되므로, if loaded 통과 시점의 엔티티 가시성이 바닐라와 일치한다. 이미 로드된 청크는
+     *  즉시 반환이라 비용이 없다(핫패스 영향 없음 — 실측). */
     public static boolean posLoaded(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);
-        return world.isChunkLoaded(bp.getX() >> 4, bp.getZ() >> 4);
+        return world.getChunk(bp.getX() >> 4, bp.getZ() >> 4) != null;
     }
 
     /** distance 상한이 있을 때 섹션 스캔을 한정하는 AABB.

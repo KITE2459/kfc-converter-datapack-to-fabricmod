@@ -1494,7 +1494,11 @@ public final class KfcGen {
     public static boolean posLoaded(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);
-        return world.getChunk(bp.getX() >> 4, bp.getZ() >> 4) != null;
+        // create=false: 로드된 청크만 반환(강제 로드 안 함) → 바닐라 if loaded '로드 안 됨=false'
+        // 시맨틱을 정확히 보존한다(hot 루프에서 미로드 청크 로드 시도도 방지). ChunkStatus.FULL:
+        // 엔티티 유입까지 완료된 청크만 통과 → forceload 후 UI 재생성(마스터 타이틀 등) 정합성 확보.
+        return world.getChunk(bp.getX() >> 4, bp.getZ() >> 4,
+                              net.minecraft.world.chunk.ChunkStatus.FULL, false) != null;
     }
 
     /** distance 상한이 있을 때 섹션 스캔을 한정하는 AABB.

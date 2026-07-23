@@ -142,10 +142,26 @@ _INT = r'-?\d+|Integer\.MIN_VALUE|Integer\.MAX_VALUE'
 def _compile_key(h: str, o: str, v: int) -> list:
     """키 하나의 (패턴, 치환) 6종 사전 컴파일 — 레코드 루프 밖에서 1회."""
     hq, oq = re.escape(f'"{h}"'), re.escape(f'"{o}"')
+
+    def _lit(s: str) -> int:
+        # _INT 토큰(정수 리터럴 / Integer.MIN_VALUE / MAX_VALUE)을 정수로.
+        if s == "Integer.MIN_VALUE":
+            return -2147483648
+        if s == "Integer.MAX_VALUE":
+            return 2147483647
+        return int(s)
+
+    def _sm(m, _v=v):
+        # scoreMatches(sb,"H","O",lo,hi) — H·O 상수화 후 lo·hi 도 리터럴이면 값이 상수라
+        # (lo <= v <= hi) 를 컴파일타임 평가해 true/false 리터럴로 접는다(scoreCmpL _both 와 동형).
+        # 접힌 조건은 if (true)/(false) → JIT 이 죽은 분기를 제거(런타임 비교 0). 관측 동등.
+        lo, hi = _lit(m.group(1)), _lit(m.group(2))
+        return "true" if (lo <= _v <= hi) else "false"
+
     out = [
-        # scoreMatches → 순수 범위비교
+        # scoreMatches → 순수 범위비교(양측 상수면 true/false 리터럴로 폴딩)
         (re.compile(rf'KfcGen\.scoreMatches\(sb, {hq}, {oq}, ({_INT}), ({_INT})\)'),
-         rf'({v} >= \1 && {v} <= \2)'),
+         _sm),
         # getScore → 리터럴
         (re.compile(rf'KfcGen\.getScore\(sb, {hq}, {oq}\)'), f'{v}'),
         # readScore(CSE 선언) → 박싱 리터럴

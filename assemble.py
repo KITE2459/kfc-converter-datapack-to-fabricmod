@@ -1078,6 +1078,24 @@ def _seg_params(seg_body: str) -> tuple[str, str]:
     return ", " + ", ".join(sig), ", " + ", ".join(args)
 
 
+def _range_and(v: str, lo: str, hi: str, nullable: bool) -> str:
+    """스코어 범위검사 식을 조립하되 항상-참인 개구간 항(>= Integer.MIN_VALUE, <= Integer.MAX_VALUE)은
+       생략한다. matches N.. / matches ..N 이 만든 센티널 비교(int 는 MIN..MAX 를 벗어날 수 없음)를
+       제거 — 결과 boolean 동일(순수 상수 항 소거), hot 조건의 불필요 비교 1회씩 제거."""
+    terms = []
+    if nullable:
+        terms.append(f"{v} != null")
+    if lo != "Integer.MIN_VALUE":
+        terms.append(f"{v} >= {lo}")
+    if hi != "Integer.MAX_VALUE":
+        terms.append(f"{v} <= {hi}")
+    if not terms:
+        return "true"                 # 양쪽 개구간 + non-null = 항상 참
+    if len(terms) == 1:
+        return f"({terms[0]})"
+    return "(" + " && ".join(terms) + ")"
+
+
 def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartriderpack") -> JavaClass:
     """한 함수의 파스트리 줄들 -> 자바 클래스 코드."""
     reset_var_counter()   # 함수 단위 결정적 변수 번호(같은 입력 = 같은 출력 바이트)
@@ -1260,7 +1278,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 v = scr_lit.get(k)
                 if v is None or _fwd_written(k):
                     return m.group(0)
-                return f"({v} >= {m.group(3)} && {v} <= {m.group(4)})"
+                return _range_and(v, m.group(3), m.group(4), False)
             def _fwd_sg(m):
                 k = (m.group(1), m.group(2))
                 v = scr_lit.get(k)
@@ -1309,7 +1327,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                     return m.group(0)
                 v = _scr_var(k)
                 # scoreMatches 시맨틱 복제: 미설정(null)=false, 이후 [min,max] 검사(센티널 동일)
-                return f"({v} != null && {v} >= {m.group(3)} && {v} <= {m.group(4)})"
+                return _range_and(v, m.group(3), m.group(4), True)
             def _repl_sg(m):
                 k = (m.group(1), m.group(2))
                 if k not in reused_scores or _scr_key_written(k):
@@ -1326,7 +1344,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                 if k not in reused_scores or _scr_key_written(k):
                     return m.group(0)
                 v = _scr_var(k)
-                return f"({v} != null && {v} >= {m.group(4)} && {v} <= {m.group(5)})"
+                return _range_and(v, m.group(4), m.group(5), True)
             def _repl_sg_ent(m):
                 var = m.group(1) or m.group(2)
                 if var not in _exec_aliases:

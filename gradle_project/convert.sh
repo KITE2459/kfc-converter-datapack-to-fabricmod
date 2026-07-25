@@ -1,0 +1,1 @@
+./gradlew convert -Pdatapack=../kartall.zip -Pout=../testkartall

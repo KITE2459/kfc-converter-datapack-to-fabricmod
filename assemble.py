@@ -1475,11 +1475,23 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             # 꼬리 self-call 을 `source = ARG; continue;` 로 치환(루프 본문).
             body = _tco_rewrite(body, _self_fqcn)
         elif _rec_native:
-            body = ("// [selfrec-native] 비꼬리 자기재귀 — 브릿지 대신 깊이 가드 네이티브 재귀.\n"
-                    "        // 바닐라 재귀도 maxCommandChainLength 예산으로 컷오프된다 — 상한 초과 시\n"
-                    "        // 해당 호출만 무시(0 반환)해 같은 방향의 안전 컷오프를 재현한다.\n"
-                    "        if (++KfcGen.REC_DEPTH > 2048) { --KfcGen.REC_DEPTH; return 0; }\n"
-                    "        try {\n" + body + "\n        } finally { --KfcGen.REC_DEPTH; }")
+            # [selfrec-native + 깊이초과 브릿지 폴백]
+            #  · 얕은 재귀(카트 전진 등 — 대다수)는 네이티브 직행: 스택 몇 프레임으로 끝나 최고 성능.
+            #  · 깊이/틱예산 한도에 닿으면 그 호출부터 바닐라 인터프리터에 위임한다. 바닐라는 명령
+            #    재귀를 Java 스택이 아니라 '명시적 큐'로 돌리므로(CommandExecutionContext: Deque
+            #    commandQueue + run() 루프 — 바이트코드 확인) 깊이 제한이 없고 chain 예산만 본다.
+            #    → 인원수에 비례해 깊어지는 재귀(auto-mount 마커 배치)도 바닐라와 동일하게 완주한다.
+            #  [철회 이력] 종전엔 한도 초과 시 return 0 으로 잘라, 8인 배치가 중간에 끊기는
+            #  '바닐라에 없던' 오작동이 났다. 컷오프가 아니라 위임이어야 관측 동등이다.
+            _rn_ns, _rn_path = fid.split(":", 1)
+            _rn_mask = emit.bridge_mask(fid)
+            body = ("// [selfrec-native] 비꼬리 자기재귀 — 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.\n"
+                    "        // 바닐라는 재귀를 큐(Deque)로 처리해 깊이 무제한 — 한도 도달 시 그 엔진에 넘긴다.\n"
+                    "        if (!KfcGen.recEnter()) {\n"
+                    f'            return KfcGen.instantExecuteFunctionReturn(source, '
+                    f'net.minecraft.util.Identifier.of("{_rn_ns}", "{_rn_path}"), {_rn_mask});\n'
+                    "        }\n"
+                    "        try {\n" + body + "\n        } finally { KfcGen.recExit(); }")
         fully_converted = True
 
     if _is_traced(fid):

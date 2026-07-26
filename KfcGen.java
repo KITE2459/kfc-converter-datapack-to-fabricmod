@@ -1,4 +1,4 @@
-package __KFC_GROUP__.generated;
+package kartriderpack.generated;
 
 import net.minecraft.scoreboard.ReadableScoreboardScore;
 import net.minecraft.scoreboard.ScoreHolder;
@@ -305,7 +305,7 @@ public final class KfcGen {
 
     // ──────────────── objective 핸들 캐시 (ObjRef) ────────────────
     // 모든 점수 헬퍼는 호출마다 sb.getNullableObjective(이름)(문자열 해시+맵 조회)을 탔다
-    // (__KFC_GROUP__ 실측 점수 호출부 18만+). objective 는 사실상 load 때 만들고 이후 불변이므로,
+    // (kartall 실측 점수 호출부 18만+). objective 는 사실상 load 때 만들고 이후 불변이므로,
     // 상수 objective 이름을 클래스 static final ObjRef 로 승격(merge_pass pass-4)하고
     // 세대(OBJ_GEN) 검사 한 번으로 재사용한다.
     // 무효화(OBJ_GEN++) 지점 — objective 집합이 바뀔 수 있는 모든 경로:
@@ -357,8 +357,22 @@ public final class KfcGen {
     // '비명령 API 직접 쓰기'(타 모드)와 memoize 된 마스크의 /reload 후 진부화만 수렴시키면 된다.
     // 더 키우면 이득은 ~0(회당 비용이 이미 분당 1회 수준)이고 그 엣지의 최악 지연만 길어진다.
     private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 1200);
-    // [selfrec-native] 비꼬리 자기재귀 함수의 깊이 가드(전역 — 바닐라 chain 예산이 전역인 것과 동형).
+    // [selfrec-native/B-1] 비꼬리 자기재귀: 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.
     public static int REC_DEPTH;
+    /** 네이티브 재귀로 처리할 최대 깊이. 초과분은 브릿지(바닐라 큐 엔진)로 위임된다.
+     *  목적은 오직 Java 스택 보호 — 값이 커도 동작은 같고(위임 시점만 늦어짐) 스택만 위험해진다. */
+    private static final int REC_DEPTH_MAX = Integer.getInteger("kfc.recdepth", 512);
+    /** [selfrec/B-1] 자기재귀 진입 가드. true=네이티브 재귀 계속, false=호출측이 브릿지로 위임.
+     *  바닐라는 명령 재귀를 Java 스택이 아니라 명시적 큐(CommandExecutionContext: Deque
+     *  commandQueue + run() 루프 — 바이트코드 확인)로 돌려 깊이 제한이 없다. 네이티브 재귀는
+     *  스택을 쓰므로 깊이가 인원수에 비례하는 재귀(마커 배치)에서 터졌다. 얕은 재귀(카트 전진
+     *  등 대다수)는 네이티브로 최고 성능을 유지하고, 깊어지면 그 지점부터 바닐라 엔진에 넘겨
+     *  깊이 무제한을 얻는다 — 컷오프가 아니라 위임이라 관측 동등(8/16인 배치 정상 완주). */
+    public static boolean recEnter() {
+        if (++REC_DEPTH > REC_DEPTH_MAX) { --REC_DEPTH; return false; }
+        return true;
+    }
+    public static void recExit() { --REC_DEPTH; }
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
         // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브
@@ -1484,11 +1498,13 @@ public final class KfcGen {
         return world.getBlockState(bp).isIn(key);
     }
 
-    /** if loaded <pos> — 청크 로드 여부. 바닐라 isLoaded 는 isChunkLoaded 만 보지만, 네이티브
-     *  변환에선 청크 loaded 와 그 청크 엔티티 유입 완료 사이 틈이 생겨(바닐라는 거의 동시), 로드
-     *  직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를 놓쳤다(forceload+tick 으로 UI 재생성하는
-     *  팩에서 옛 엔티티 잔존→겹침). getChunk(x,z) 로 FULL 청크를 확보하면 엔티티 유입까지 완료돼
-     *  if loaded 통과 시점 가시성이 바닐라와 일치한다. 이미 로드된 청크는 즉시 반환(핫패스 무해). */
+    /** if loaded <pos> — 청크 로드 여부. 바닐라 ExecuteCommand.isLoaded 는 isChunkLoaded 만
+     *  보지만, 네이티브 변환에선 "청크 loaded" 와 "그 청크 엔티티 유입 완료" 사이에 틈이 생긴다
+     *  (바닐라는 둘이 거의 동시). 그 틈에 로드 직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를
+     *  놓쳐, forceload+tick 으로 UI 를 재생성하는 팩에서 옛 엔티티 잔존→겹침이 났다(마스터 모드
+     *  타이틀/패널 이중 표시). getChunk(x,z) 로 FULL 상태 청크를 확보하면 그 청크의 엔티티 유입까지
+     *  완료되므로, if loaded 통과 시점의 엔티티 가시성이 바닐라와 일치한다. 이미 로드된 청크는
+     *  즉시 반환이라 비용이 없다(핫패스 영향 없음 — 실측). */
     public static boolean posLoaded(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);
@@ -3417,7 +3433,7 @@ public final class KfcGen {
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
     /** tp <targets> $(dest) — 매크로 목적지 런타임 파싱. 바닐라는 치환 후 재파싱하므로
-     *  `x y z`(3토큰) 또는 `x y z yaw pitch`(5토큰) 를 지원한다(__KFC_GROUP__ 트랙 pos 는 5토큰:
+     *  `x y z`(3토큰) 또는 `x y z yaw pitch`(5토큰) 를 지원한다(kartall 트랙 pos 는 5토큰:
      *  "-1000 31 1000 0 0"). 좌표는 절대/~상대, 절대 x/z 가 소수점 없는 정수면 바닐라 좌표
      *  파서의 블록 센터링(+0.5). 회전은 절대/~상대(source 회전 기준 — 바닐라 RotationArgument).
      *  파싱 불가면 그 줄만 스킵(바닐라 매크로 파싱실패 스킵 동등). */
@@ -4847,7 +4863,6 @@ public final class KfcGen {
     public static void onExternalFunctionExecuted(int mask) {
         bridgeReconcile(mask);   // ENTITY→ENTITY_GEN+INTERP_ID / OBJ / SCORE→핸들폐기 / NAME (v2 선별)
     }
-
 
     /** 13차 도입, 19차 개정: scoreboard players reset <holder> 의 선별 무효화.
      *  [실측 19차] 종전 (ObjRef→홀더) 키잉에선 리셋마다 전 맵 Entity-키 스캔(dropHolderKey)이

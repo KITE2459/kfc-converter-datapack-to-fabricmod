@@ -19,6 +19,7 @@ brigadier 의 chain 은 [노드들 + 인자들] 이 평탄하게 섞여 있다. 
 이 파일은 마인크래프트가 필요 없다 - 순수 파이썬. fixtures/trees_sample.json 으로 단위 테스트.
 """
 from __future__ import annotations
+import os as _osmod
 import json, re, sys
 from datapack_io import open_datapack
 from dataclasses import dataclass, field
@@ -171,6 +172,21 @@ _BR_SAFE = {
     "worldborder", "bossbar", "defaultgamemode", "recipe", "forceload", "help", "seed",
     "spawnpoint", "setworldspawn", "schedule",
 }
+# [커스텀 명령 등록] 타 모드가 추가한 명령(브릿지 마스크 분류 대상 외)은 기본이 fail-closed(BR_ALL)
+# 라, 그런 명령을 매 틱 부르는 함수는 브릿지마다 ENTITY_GEN++ → 태그버킷 전체 재구축을 유발한다.
+# [실측] trackselect:.../if-forceloadextend 의 `forceloadextend get`(읽기 전용 커스텀 명령)이
+# 틱당 1회 브릿지되며 재구축 100회/100틱(틱당 2.5k 엔티티 × 8.8k 태그쌍 재삽입)을 만들었다.
+# 개체군/태그/스코어를 바꾸지 않는 커스텀 명령을 아래 환경변수로 등록하면 그 낭비가 사라진다.
+#   KFC_SAFE_CMDS="forceloadextend,othercmd"   (쉼표 구분, 명령 첫 토큰)
+# 등록하지 않은 명령은 종전대로 BR_ALL(fail-closed) — 안전 기본값 불변.
+_BR_SAFE |= {c.strip() for c in _osmod.environ.get("KFC_SAFE_CMDS", "").split(",") if c.strip()}
+# [일괄·기본 ON] 바닐라 명령 목록(VANILLA_COMMANDS)에 없는 root = 타 모드가 등록한 커스텀
+# 명령으로 보고 마스크 0(SAFE)으로 둔다. 이런 명령은 대개 조회/유틸이라 개체군·태그를 바꾸지
+# 않는데, fail-closed 로 BR_ALL 을 받으면 그 함수를 부르는 매 틱마다 ENTITY_GEN++ → 태그버킷
+# 전체 재구축을 유발한다(실측: 틱당 2.5k 엔티티 × 8.8k 태그쌍 재삽입 = tagBucket self 1위).
+# 엔티티를 생성/제거하는 커스텀 명령을 쓰는 팩이라면 KFC_NONVANILLA_SAFE=0 으로 끄고,
+# 필요한 것만 KFC_SAFE_CMDS 로 개별 등록할 것.
+_NONVANILLA_SAFE = _osmod.environ.get("KFC_NONVANILLA_SAFE", "1") not in ("0", "false", "off", "no")
 # 엔티티 상태/NBT/태그/인벤토리/위치 변이 가능 → BR_ENTITY (ENTITY_GEN + interp identity 층).
 _BR_ENTITY_ROOTS = {
     "tag", "data", "tp", "teleport", "rotate", "effect", "give", "clear", "item", "attribute",
@@ -228,6 +244,16 @@ def _br_line_mask(line: str, _seen) -> int:
         if "$(" in tgt or tgt.startswith("#"):
             return BR_ALL              # 동적 대상/함수태그 — 미상
         return bridge_mask(tgt, _seen)
+    # [비-바닐라(타 모드) 명령 일괄 SAFE] KFC_NONVANILLA_SAFE=1 이면 바닐라 명령 목록
+    # (VANILLA_COMMANDS)에 없는 root = 타 모드가 등록한 커스텀 명령으로 보고 마스크 0 으로 둔다.
+    # 근거: 이런 명령은 대개 조회/유틸(forceloadextend get, 팩 전용 util 등)이라 개체군·태그를
+    # 바꾸지 않는데, fail-closed 로 BR_ALL 을 받으면 그 함수를 부르는 매 틱마다 ENTITY_GEN++ →
+    # 태그버킷 전체 재구축을 유발한다(실측: 틱당 2.5k 엔티티 × 8.8k 태그쌍 재삽입).
+    # [주의] 타 모드 명령이 엔티티를 스폰/킬/태그하면 셀렉터가 그 변화를 늦게 본다(≤1틱, 다음
+    # 지문 대조/주기 화해에서 수렴). 그런 명령을 쓰는 팩은 이 옵션을 끄고 KFC_SAFE_CMDS 로
+    # 안전한 것만 개별 등록할 것. 기본값은 종전과 동일한 fail-closed.
+    if _NONVANILLA_SAFE and root not in VANILLA_COMMANDS:
+        return 0
     return BR_ALL                      # 미상 명령(advancement/trigger/reload/…) — fail-closed
 
 def bridge_mask(fid: str, _seen=None) -> int:

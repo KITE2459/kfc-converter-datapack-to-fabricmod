@@ -335,16 +335,19 @@ public final class KfcGen {
         final String name;
         net.minecraft.scoreboard.ScoreboardObjective obj;
         long gen = -1;
-        ObjRef(String name) { this.name = name; }
+        /** [A4] 엔티티 홀더 스코어 셀 배열의 dense 슬롯 번호. 콜사이트당 1개라 유한(kartall ~1.5k). */
+        final int idx;
+        ObjRef(String name, int idx) { this.name = name; this.idx = idx; }
     }
     /** merge_pass 승격 필드 초기화용.
      *  [월드경계] 생성된 셀을 레지스트리에 등록한다 — resetAll() 이 월드 종료 시 obj 참조를
      *  끊어 이전 Scoreboard/서버 그래프가 static final 필드에 고착되는 것을 막는다. */
     public static ObjRef objRef(String name) {
-        ObjRef r = new ObjRef(name);
+        ObjRef r = new ObjRef(name, OBJ_REF_SEQ++);
         OBJ_REF_CELLS.add(r);
         return r;
     }
+    private static int OBJ_REF_SEQ = 0;
     private static ScoreboardObjective obj(ServerScoreboard sb, ObjRef r) {
         if (r.gen != OBJ_GEN) {
             r.obj = sb.getNullableObjective(r.name);
@@ -592,6 +595,7 @@ public final class KfcGen {
     static void snapRemove(net.minecraft.entity.Entity e) {
         long _prevGen = ENTITY_GEN;
         ENTITY_GEN++; GEN_SRC = 2;
+        if (e != null) ENT_CELLS.remove(e);      // [A4] 소멸 엔티티의 스코어 셀 해제(참조 보유 방지)
         if (TB_GEN == _prevGen && e != null) {   // 태그 버킷 증분 제거(snapAdd 와 동일 정합 가드)
             tagBucketsOnRemove(e);
             TB_GEN = ENTITY_GEN;
@@ -4806,6 +4810,22 @@ public final class KfcGen {
 
     private static net.minecraft.scoreboard.ScoreAccess scoreHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
         if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
+        // [A4] 엔티티 홀더 fast path. 미스 시 getOrCreateScore(엔트리 존재화 부수효과 포함) —
+        // 종전 맵 경로와 동일 순서·동일 부수효과다.
+        if (ENT_CELLS_ON && holderKey instanceof net.minecraft.entity.Entity ec) {
+            entCellsSync();
+            final int slot = (o.idx << 1) | 1;                 // 홀수 = 쓰기 슬롯
+            Object[] c = ENT_CELLS.get(ec);
+            if (c != null && slot < c.length) {
+                Object hit = c[slot];
+                if (hit != null) return (net.minecraft.scoreboard.ScoreAccess) hit;
+            }
+            ScoreboardObjective ob0 = obj(sb, o);
+            if (ob0 == null) return null;
+            net.minecraft.scoreboard.ScoreAccess a0 = sb.getOrCreateScore(ec, ob0);
+            entCellPut(ec, slot, a0);
+            return a0;
+        }
         String hn = (holderKey instanceof net.minecraft.entity.Entity e0)
                 ? nameOf(e0) : (String) holderKey;
         java.util.HashMap<ObjRef, net.minecraft.scoreboard.ScoreAccess> m = SCORE_HANDLES.get(hn);
@@ -5072,6 +5092,44 @@ public final class KfcGen {
      *  대상: (a) 정적 승격 Sch/Rch 셀(홀더별 레지스트리), (b) 두 핸들 맵의 홀더 서브트리.
      *  다른 홀더의 핸들은 그대로 유효(removeScore(s) 는 해당 홀더의 엔트리만 제거한다).
      *  objective 구분 없이 홀더 전체를 지우는 과잉 무효화는 안전(재해소는 멱등). */
+    // ──────────────── [A4] 엔티티 홀더 스코어 셀 ────────────────
+    // 종전 @s 점수 경로: nameOf(e)(WeakHashMap) → String → SCORE_HANDLES.get(String)
+    //                  → m.get(ObjRef)  = 조회 3회 + 문자열 해시/비교.
+    // 실측(16인 주행): HashMap.getNode self 0.633 mspt 중 readHandle 경유가 0.171.
+    //
+    // 개선: 엔티티 identity → Object[] 셀 배열. 슬롯 = (ObjRef.idx << 1) + (읽기 0 / 쓰기 1).
+    // 조회 1회(identity 해시) + 배열 인덱스로 축약된다. 값은 항상 라이브 엔트리에서 읽으므로
+    // (getScore()) 캐시는 '엔트리 신원'만 보관 — 종전 READ_HANDLES/SCORE_HANDLES 와 동일 계약.
+    //
+    // 무효화(종전과 동일 축):
+    //   · SCORE_EPOCH 변화(핸들 전체 폐기) → 맵 통째로 clear
+    //   · dropHandlesFor(reset <holder>) → clear (핫패스 아님)
+    //   · snapRemove(엔티티 소멸) → 해당 엔트리 제거(죽은 엔티티 참조 보유 방지)
+    //   · resetAll(월드 종료)
+    // -Dkfc.entcells=off 로 종전 문자열 경로 원복.
+    private static final boolean ENT_CELLS_ON =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.entcells", "on"));
+    private static final it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<
+            net.minecraft.entity.Entity, Object[]> ENT_CELLS =
+            new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>();
+    private static long ENT_CELLS_EPOCH = Long.MIN_VALUE;
+
+    /** 에폭이 바뀌었으면 셀 전체 폐기. 호출측은 이 뒤에 ENT_CELLS 를 안전하게 쓴다. */
+    private static void entCellsSync() {
+        if (ENT_CELLS_EPOCH != SCORE_EPOCH) { ENT_CELLS.clear(); ENT_CELLS_EPOCH = SCORE_EPOCH; }
+    }
+
+    /** 슬롯에 핸들을 저장(필요 시 배열 확장). */
+    private static void entCellPut(net.minecraft.entity.Entity e, int slot, Object v) {
+        Object[] c = ENT_CELLS.get(e);
+        if (c == null || slot >= c.length) {
+            Object[] nc = new Object[Math.max(slot + 1, 16)];
+            if (c != null) System.arraycopy(c, 0, nc, 0, c.length);
+            c = nc; ENT_CELLS.put(e, c);
+        }
+        c[slot] = v;
+    }
+
     private static void dropHandlesFor(String holder) {
         java.util.ArrayList<Object> cells = CELLS_BY_HOLDER.get(holder);
         if (cells != null) {
@@ -5082,6 +5140,7 @@ public final class KfcGen {
         }
         SCORE_HANDLES.remove(holder);
         READ_HANDLES.remove(holder);
+        ENT_CELLS.clear();          // [A4] 홀더별 선별이 불가(엔티티 identity 키) — 전체 폐기(핫패스 아님)
     }
 
     // ── 읽기 엔트리 핸들 캐시 ──
@@ -5094,6 +5153,21 @@ public final class KfcGen {
 
     private static ReadableScoreboardScore readHandle(ServerScoreboard sb, Object holderKey, ObjRef o) {
         if (SH_GEN != HANDLE_GEN) { SCORE_HANDLES.clear(); READ_HANDLES.clear(); SCORE_EPOCH++; SH_GEN = HANDLE_GEN; }
+        // [A4] 엔티티 홀더: identity 셀 배열로 문자열 경로(nameOf + 이중 맵) 우회.
+        if (ENT_CELLS_ON && holderKey instanceof net.minecraft.entity.Entity ec) {
+            entCellsSync();
+            final int slot = o.idx << 1;                       // 짝수 = 읽기 슬롯
+            Object[] c = ENT_CELLS.get(ec);
+            if (c != null && slot < c.length) {
+                Object hit = c[slot];
+                if (hit != null) return (ReadableScoreboardScore) hit;
+            }
+            ScoreboardObjective ob0 = obj(sb, o);
+            if (ob0 == null) return null;
+            ReadableScoreboardScore sc0 = sb.getScore(holderOf(nameOf(ec)), ob0);
+            if (sc0 != null) entCellPut(ec, slot, sc0);        // 존재 엔트리만 캐시(종전 계약 동일)
+            return sc0;
+        }
         String hn = (holderKey instanceof net.minecraft.entity.Entity e0)
                 ? nameOf(e0) : (String) holderKey;
         java.util.HashMap<ObjRef, ReadableScoreboardScore> m = READ_HANDLES.get(hn);
@@ -8931,6 +9005,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
         // ── 3) 스코어보드 핸들 — 이전 Scoreboard 를 붙잡는 최대 지분 ──
         SCORE_HANDLES.clear(); READ_HANDLES.clear();
+        ENT_CELLS.clear(); ENT_CELLS_EPOCH = Long.MIN_VALUE;   // [A4]
         SCORE_EPOCH++; HANDLE_GEN++; SH_GEN = HANDLE_GEN; HANDLE_RECON_TICK = MIN;
 
         // ── 4) 함수 핸들·네이티브 스케줄 큐 ──

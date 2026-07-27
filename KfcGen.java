@@ -3365,13 +3365,52 @@ public final class KfcGen {
     }
 
     // ──────────────── attribute ────────────────
+    // ── [속성 해소 캐시] attrId/modId 는 생성 코드에서 전부 문자열 리터럴이다(실측: attr* 호출부
+    // 108곳 전부 상수). 그런데 종전에는 호출마다 아래를 전부 수행했다:
+    //   attrId.contains(":") 스캔 → "minecraft:" + attrId 문자열 연결(할당!) → idOf(HashMap)
+    //   → Registries.ATTRIBUTE.getEntry(id)(레지스트리 조회 + Optional 할당) → Identifier.equals
+    // spark 실측(FOV 리셋 활성 시 attrModifierRemove 0.92 mspt): idOf computeIfAbsent 0.12,
+    // StringConcatHelper→String.getBytes 0.056, Identifier.equals 0.060, Object2ObjectArrayMap
+    // findKey 0.078 이 이 경로에 몰려 있었다.
+    // 이제 문자열 → 해소 결과를 캐시해 distinct 상수당 1회로 수렴시킨다(조회 1회로 축약).
+    // ATTRIBUTE 는 내장(정적) 레지스트리라 월드와 무관하지만, 위생을 위해 resetAll 에서 비운다.
+    private static final Object ATTR_MISS = new Object();
+    private static final java.util.HashMap<String, Object> ATTR_ENTRY_CACHE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, net.minecraft.util.Identifier> ATTR_MODID_CACHE =
+            new java.util.HashMap<>();
+
+    /** attrId(상수) → 속성 레지스트리 엔트리. 미상은 센티널로 캐시해 반복 조회를 막는다. */
+    @SuppressWarnings("unchecked")
+    private static net.minecraft.registry.entry.RegistryEntry<net.minecraft.entity.attribute.EntityAttribute>
+            attrEntry(String attrId) {
+        Object v = ATTR_ENTRY_CACHE.get(attrId);
+        if (v == null) {
+            net.minecraft.util.Identifier id = idOf(
+                    attrId.indexOf(':') >= 0 ? attrId : "minecraft:" + attrId);
+            net.minecraft.registry.entry.RegistryEntry<net.minecraft.entity.attribute.EntityAttribute> re =
+                    net.minecraft.registry.Registries.ATTRIBUTE.getEntry(id).orElse(null);
+            v = (re == null) ? ATTR_MISS : re;
+            ATTR_ENTRY_CACHE.put(attrId, v);
+        }
+        return v == ATTR_MISS ? null
+                : (net.minecraft.registry.entry.RegistryEntry<net.minecraft.entity.attribute.EntityAttribute>) v;
+    }
+
+    /** modId(상수) → Identifier. 종전 `idOf(modId.contains(":") ? … : "minecraft:" + modId)` 와 동일. */
+    private static net.minecraft.util.Identifier attrModId(String modId) {
+        net.minecraft.util.Identifier m = ATTR_MODID_CACHE.get(modId);
+        if (m == null) {
+            m = idOf(modId.indexOf(':') >= 0 ? modId : "minecraft:" + modId);
+            ATTR_MODID_CACHE.put(modId, m);
+        }
+        return m;
+    }
+
     private static net.minecraft.entity.attribute.EntityAttributeInstance attrInst(
             net.minecraft.entity.Entity e, String attrId) {
-        if (!(e instanceof net.minecraft.entity.LivingEntity le)) return null;
-        net.minecraft.util.Identifier id = idOf(
-                attrId.contains(":") ? attrId : "minecraft:" + attrId);
+        if (!(e instanceof net.minecraft.entity.LivingEntity le)) return null;   // 순서 보존(비-living 은 attrId 미접근)
         net.minecraft.registry.entry.RegistryEntry<net.minecraft.entity.attribute.EntityAttribute> entry =
-                net.minecraft.registry.Registries.ATTRIBUTE.getEntry(id).orElse(null);
+                attrEntry(attrId);
         if (entry == null) return null;
         return le.getAttributeInstance(entry);
     }
@@ -3381,8 +3420,7 @@ public final class KfcGen {
                                        String modId, double value, String op) {
         net.minecraft.entity.attribute.EntityAttributeInstance inst = attrInst(e, attrId);
         if (inst == null) return;
-        net.minecraft.util.Identifier mid = idOf(
-                modId.contains(":") ? modId : "minecraft:" + modId);
+        net.minecraft.util.Identifier mid = attrModId(modId);
         net.minecraft.entity.attribute.EntityAttributeModifier.Operation o =
                 switch (op) {
                     case "add_multiplied_base", "multiply_base" ->
@@ -3399,8 +3437,7 @@ public final class KfcGen {
     public static double attrModifierValue(net.minecraft.entity.Entity e, String attrId, String modId) {
         net.minecraft.entity.attribute.EntityAttributeInstance inst = attrInst(e, attrId);
         if (inst == null) return 0;
-        net.minecraft.util.Identifier mid = idOf(
-                modId.contains(":") ? modId : "minecraft:" + modId);
+        net.minecraft.util.Identifier mid = attrModId(modId);
         net.minecraft.entity.attribute.EntityAttributeModifier m = inst.getModifier(mid);
         return m == null ? 0 : m.value();
     }
@@ -3409,8 +3446,7 @@ public final class KfcGen {
     public static void attrModifierRemove(net.minecraft.entity.Entity e, String attrId, String modId) {
         net.minecraft.entity.attribute.EntityAttributeInstance inst = attrInst(e, attrId);
         if (inst == null) return;
-        net.minecraft.util.Identifier mid = idOf(
-                modId.contains(":") ? modId : "minecraft:" + modId);
+        net.minecraft.util.Identifier mid = attrModId(modId);
         inst.removeModifier(mid);
     }
 
@@ -9018,6 +9054,7 @@ public static net.minecraft.entity.Entity firstEntity(
         // ── 5) 서버/데이터팩에 바인딩된 파싱 캐시 ──
         //     LootCondition 은 ReloadableRegistries, ItemStackArgument 는 동적 레지스트리 조회
         //     결과라 월드/리로드가 바뀌면 진부해진다 — 해제는 누수 방지이자 정합성 요건이다.
+        ATTR_ENTRY_CACHE.clear(); ATTR_MODID_CACHE.clear();
         PREDICATE_CACHE.clear();
         ITEM_ARG_CACHE.clear();
         BLOCK_ARG_CACHE.clear();

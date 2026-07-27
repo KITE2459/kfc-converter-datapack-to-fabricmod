@@ -4974,16 +4974,12 @@ public final class KfcGen {
         // 종전 맵 경로와 동일 순서·동일 부수효과다.
         if (ENT_CELLS_ON && holderKey instanceof net.minecraft.entity.Entity ec) {
             entCellsSync();
-            final int slot = (o.idx << 1) | 1;                 // 홀수 = 쓰기 슬롯
-            Object[] c = ENT_CELLS.get(ec);
-            if (c != null && slot < c.length) {
-                Object hit = c[slot];
-                if (hit != null) return (net.minecraft.scoreboard.ScoreAccess) hit;
-            }
+            Object hit = entCellGet(ec, o, 1);                 // 1 = 쓰기
+            if (hit != null) return (net.minecraft.scoreboard.ScoreAccess) hit;
             ScoreboardObjective ob0 = obj(sb, o);
             if (ob0 == null) return null;
             net.minecraft.scoreboard.ScoreAccess a0 = sb.getOrCreateScore(ec, ob0);
-            entCellPut(ec, slot, a0);
+            entCellPut(ec, o, 1, a0);
             return a0;
         }
         String hn = (holderKey instanceof net.minecraft.entity.Entity e0)
@@ -5279,15 +5275,41 @@ public final class KfcGen {
         if (ENT_CELLS_EPOCH != SCORE_EPOCH) { ENT_CELLS.clear(); ENT_CELLS_EPOCH = SCORE_EPOCH; }
     }
 
-    /** 슬롯에 핸들을 저장(필요 시 배열 확장). */
-    private static void entCellPut(net.minecraft.entity.Entity e, int slot, Object v) {
+    // [개정] 종전에는 ObjRef.idx 를 배열 인덱스로 직접 썼다. 그런데 idx 는 클래스 로드 순으로
+    // 0~1500 에 흩어져 있어 배열이 희소해지고(엔티티 하나가 idx 1200 을 만지면 1201칸 할당),
+    // 새 슬롯을 만질 때마다 재할당+arraycopy 가 났다(실측: readHandle 내부 arraycopy 0.039 +
+    // Reference2Object insert 0.018). 엔티티가 실제로 만지는 objective 는 소수(대개 1~8)이므로
+    // [ObjRef, read, write] 3개 묶음의 압축 배열 + identity 선형 스캔이 메모리·캐시 모두 낫다.
+    private static final int ENT_CELL_STRIDE = 3;      // [ObjRef, readHandle, writeHandle]
+
+    /** 압축 배열에서 (o, rw) 핸들 조회. rw: 0=읽기 1=쓰기. 없으면 null. */
+    private static Object entCellGet(net.minecraft.entity.Entity e, ObjRef o, int rw) {
         Object[] c = ENT_CELLS.get(e);
-        if (c == null || slot >= c.length) {
-            Object[] nc = new Object[Math.max(slot + 1, 16)];
-            if (c != null) System.arraycopy(c, 0, nc, 0, c.length);
-            c = nc; ENT_CELLS.put(e, c);
+        if (c == null) return null;
+        for (int i = 0; i < c.length; i += ENT_CELL_STRIDE) {
+            Object k = c[i];
+            if (k == null) return null;                // 이후는 전부 빈칸(앞에서부터 채움)
+            if (k == o) return c[i + 1 + rw];
         }
-        c[slot] = v;
+        return null;
+    }
+
+    /** 압축 배열에 (o, rw) 핸들 저장. 자리가 없으면 2배 확장(엔트리 수 기준이라 희소하지 않음). */
+    private static void entCellPut(net.minecraft.entity.Entity e, ObjRef o, int rw, Object v) {
+        Object[] c = ENT_CELLS.get(e);
+        if (c == null) { c = new Object[ENT_CELL_STRIDE * 4]; ENT_CELLS.put(e, c); }
+        int free = -1;
+        for (int i = 0; i < c.length; i += ENT_CELL_STRIDE) {
+            Object k = c[i];
+            if (k == o) { c[i + 1 + rw] = v; return; }
+            if (k == null) { free = i; break; }
+        }
+        if (free < 0) {                                 // 가득 참 — 2배 확장
+            Object[] nc = new Object[c.length * 2];
+            System.arraycopy(c, 0, nc, 0, c.length);
+            free = c.length; c = nc; ENT_CELLS.put(e, c);
+        }
+        c[free] = o; c[free + 1 + rw] = v;
     }
 
     private static void dropHandlesFor(String holder) {
@@ -5316,16 +5338,12 @@ public final class KfcGen {
         // [A4] 엔티티 홀더: identity 셀 배열로 문자열 경로(nameOf + 이중 맵) 우회.
         if (ENT_CELLS_ON && holderKey instanceof net.minecraft.entity.Entity ec) {
             entCellsSync();
-            final int slot = o.idx << 1;                       // 짝수 = 읽기 슬롯
-            Object[] c = ENT_CELLS.get(ec);
-            if (c != null && slot < c.length) {
-                Object hit = c[slot];
-                if (hit != null) return (ReadableScoreboardScore) hit;
-            }
+            Object hit = entCellGet(ec, o, 0);                 // 0 = 읽기
+            if (hit != null) return (ReadableScoreboardScore) hit;
             ScoreboardObjective ob0 = obj(sb, o);
             if (ob0 == null) return null;
             ReadableScoreboardScore sc0 = sb.getScore(holderOf(nameOf(ec)), ob0);
-            if (sc0 != null) entCellPut(ec, slot, sc0);        // 존재 엔트리만 캐시(종전 계약 동일)
+            if (sc0 != null) entCellPut(ec, o, 0, sc0);        // 존재 엔트리만 캐시(종전 계약 동일)
             return sc0;
         }
         String hn = (holderKey instanceof net.minecraft.entity.Entity e0)

@@ -281,6 +281,21 @@ public final class KfcGen {
         return ID_CACHE.computeIfAbsent(s, net.minecraft.util.Identifier::of);
     }
 
+    // ── [N1] 엔티티 섹션 색인 설정 (KfcSectionIndexMixin 전용) ──────────────
+    // 바닐라 TypeFilterableList.remove 는 List.remove(Object) = 선형 탐색이다. 엔티티가 섹션
+    // 경계를 넘을 때마다 호출되므로, 파츠 수백 개를 한 섹션에서 매 틱 움직이는 팩에서는
+    // 이것만으로 서버 틱의 상당 비중을 먹는다(16인 주행 spark 실측: 모드 틱의 14.29%).
+    // 믹스인이 리스트별 항등 색인으로 swap-remove O(1) 로 대체한다.
+    //
+    // [여기에 두는 이유] 믹스인 클래스에 '상수 아닌 static 필드'를 두면 바닐라 클래스에
+    // <clinit> 병합이 필요해진다. 설정을 KfcGen 으로 옮겨 믹스인을 상수-only 로 유지한다.
+    //   -Dkfc.sectionidx=off      전체 비활성(바닐라 원복)
+    //   -Dkfc.sectionidx.min=N    색인 적용 최소 리스트 길이(기본 16).
+    //                             이 미만은 바닐라 경로 → 섹션 내부 순회 순서까지 완전 보존.
+    public static final boolean SECTION_IDX_ON =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.sectionidx", "on"));
+    public static final int SECTION_IDX_MIN = Integer.getInteger("kfc.sectionidx.min", 16);
+
     private KfcGen() { throw new UnsupportedOperationException(); }
 
     // ── [tree_flatten] 구간 테이블 디코더 ──

@@ -5451,13 +5451,13 @@ def _v2_fanout_as(sel_raw, exe, src, depth):
         ent = _v2_subst([ent], exe, src)[0]
         opens = [f"{{ net.minecraft.entity.Entity {ne} = {ent};",
                  f"  if ({ne} != null) {{",
-                 f"    ServerCommandSource {ns} = {src}.withEntity({ne});"]
+                 f"    ServerCommandSource {ns} = KfcGen.withEntityOnly({src}, {ne});"]
         return (opens, ["} }"], ne, ns)
     loop = entity_loop_open(sel, ne)
     if loop is None:
         return None
     loop = _v2_subst(loop, exe, src)
-    opens = list(loop) + [f"    ServerCommandSource {ns} = {src}.withEntity({ne});"]
+    opens = list(loop) + [f"    ServerCommandSource {ns} = KfcGen.withEntityOnly({src}, {ne});"]
     return (opens, ["}"], ne, ns)
 
 
@@ -6785,7 +6785,7 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
     # (엔티티의 getCommandSource 로 새로 만들면 위치/회전이 엔티티 기본값으로 리셋돼 잘못됨).
     # source 는 호출 컨텍스트(on/at 등)에서 적절한 부모 소스로 치환된다.
     # as 앞 rebind(positioned 등)가 있으면 그 소스(pre_src)를 부모로 사용한다.
-    out.append(f'    ServerCommandSource {_asSrc} = {pre_src}.withEntity({_asE});')
+    out.append(f'    ServerCommandSource {_asSrc} = KfcGen.withEntityOnly({pre_src}, {_asE});')
     for b in body:
         out.append("    " + b)
     out.append("}")
@@ -6973,7 +6973,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         head_line = "for (ServerPlayerEntity e : ctx.allPlayers) {"
         src_line = (f"ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);"  # [D-10] as+at 단일 생성
                     if _fuse_at is not None else
-                    f"ServerCommandSource es = {pre_src}.withEntity(e);")  # 바닐라 as: 부모 컨텍스트 상속
+                    f"ServerCommandSource es = KfcGen.withEntityOnly({pre_src}, e);")  # 바닐라 as: 부모 컨텍스트 상속
         type_filter = None
     else:
         jtypes = resolve_entity_types(sel)
@@ -6991,7 +6991,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             type_exclude_cond = None
         src_line = (f"ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);"  # [D-10] as+at 단일 생성
                     if _fuse_at is not None else
-                    f"ServerCommandSource es = {pre_src}.withEntity(e);")  # 바닐라 as: 부모 컨텍스트 상속
+                    f"ServerCommandSource es = KfcGen.withEntityOnly({pre_src}, e);")  # 바닐라 as: 부모 컨텍스트 상속
 
     # 태그 필터 + scores 필터 (en. 기준; 플레이어 루프는 아래서 e. 로 치환)
     conds = []
@@ -7054,7 +7054,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             if _fuse_at is not None:
                 out.append(f'    ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);')
             else:
-                out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+                out.append(f'    ServerCommandSource es = KfcGen.withEntityOnly({pre_src}, e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:
@@ -7085,7 +7085,7 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
             if _fuse_at is not None:
                 out.append(f'    ServerCommandSource es = KfcGen.withEntityAt({pre_src}, e);')
             else:
-                out.append(f'    ServerCommandSource es = {pre_src}.withEntity(e);')
+                out.append(f'    ServerCommandSource es = KfcGen.withEntityOnly({pre_src}, e);')
         for s in mod_rebinds:
             out.append("    " + s)
         if mod_conds:

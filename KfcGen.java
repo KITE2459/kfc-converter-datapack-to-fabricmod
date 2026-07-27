@@ -2810,11 +2810,7 @@ public final class KfcGen {
             if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
                 ND_MAP.clear(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
             }
-            Object[] nd = ND_MAP.get(p);
-            if (nd == null) {
-                nd = new Object[] { p.getName().getString(), p.getDisplayName() };
-                ND_MAP.put(p, nd);
-            }
+            Object[] nd = ndOf(p);
             net.minecraft.server.command.ServerCommandSource fast =
                     (net.minecraft.server.command.ServerCommandSource) Wef.ctorMh.invokeExact(
                     (net.minecraft.server.command.CommandOutput) t[0],
@@ -3340,6 +3336,71 @@ public final class KfcGen {
         }
     }
 
+    /**
+     * SCS 리바인드용 (name, displayName) 캐시 조회.
+     *
+     * <p><b>바닐라 계약(1.21.5 ServerCommandSource.withEntity 바이트코드 확인)</b>:
+     * <pre>
+     *   name        = entity.getName().getString()     // ← getNameForScoreboard() 가 아니다
+     *   displayName = entity.getDisplayName()
+     * </pre>
+     * 비플레이어는 두 값이 크게 다르다 — {@code getName().getString()} 은 엔티티 타입 표시명
+     * ("Text Display" 등), {@code getNameForScoreboard()} 는 <b>UUID 문자열</b>이다.
+     *
+     * <p>{@code getDisplayName()} 은 매 호출 팀 조회(Scoreboard.getScoreHolderTeam — 문자열 맵)와
+     * Text 트리 생성을 수행하므로 리바인드마다 부르면 비싸다(실측: 팀 조회 경유 String.equals 0.034).
+     * 이름/표시명은 엔티티 수명 동안 사실상 불변이고 변경 경로는 전부 {@code NAME_GEN} 훅을 거치므로
+     * 캐시가 안전하다. 호출측은 반드시 {@code ((Text) nd[1]).copy()} 로 넘길 것 —
+     * 바닐라는 매번 새 인스턴스를 주고 소비자가 MutableText 를 제자리 변형할 수 있다.
+     */
+    private static Object[] ndOf(net.minecraft.entity.Entity p) {
+        Object[] nd = ND_MAP.get(p);
+        if (nd == null) {
+            nd = new Object[] { p.getName().getString(), p.getDisplayName() };
+            ND_MAP.put(p, nd);
+        }
+        return nd;
+    }
+
+    /** ND 캐시 유효화(틱 경계 주기 화해 + 서버/NAME_GEN 변화). withEntitySrc 와 동일 규약. */
+    private static void ndSync(net.minecraft.server.MinecraftServer sv) {
+        int tk = sv.getTicks();
+        if (ND_TICK != tk) {
+            ND_TICK = tk;
+            if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= RECON_TICKS) {
+                ND_RECON_TICK = tk; ND_MAP.clear();
+            }
+        }
+        if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
+            ND_MAP.clear(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
+        }
+    }
+
+    /**
+     * 바닐라 {@code src.withEntity(e)} 와 동등 — 단, name/displayName 을 ND 캐시에서 가져온다.
+     * 생성 코드의 {@code source.withEntity(e)} 를 대체한다(실측: 바닐라 경로 0.283 mspt,
+     * 그중 getDisplayName→팀조회가 지배적).
+     * 믹스인 미적용 시 바닐라 호출로 폴백 — 관측 동일.
+     */
+    public static net.minecraft.server.command.ServerCommandSource withEntityOnly(
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
+        if (e == null) return src;
+        if (src.getEntity() == e) return src;              // 바닐라 동일-엔티티 단락
+        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
+            scsFuseLog();
+            net.minecraft.server.MinecraftServer sv = src.getServer();
+            ndSync(sv);
+            Object[] nd = ndOf(e);
+            return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
+                    acc.kfc$output(), src.getPosition(), src.getRotation(),
+                    src.getWorld(), acc.kfc$level(),
+                    (String) nd[0], ((net.minecraft.text.Text) nd[1]).copy(),
+                    sv, e, src.isSilent(), src.getReturnValueConsumer(),
+                    src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
+        }
+        return src.withEntity(e);
+    }
+
     public static net.minecraft.server.command.ServerCommandSource atEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
         if (e == null) return src;
@@ -3365,11 +3426,20 @@ public final class KfcGen {
         if (e == null) return src;
         if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
             scsFuseLog();
+            // [버그 수정] 종전엔 name 을 e.getNameForScoreboard() 로 넣었으나, 바닐라
+            // ServerCommandSource.withEntity 는 e.getName().getString() 을 쓴다(바이트코드 확인).
+            // 비플레이어(디스플레이 파츠 등)는 전자가 UUID 문자열이라 SCS.getName() 이 어긋났다.
+            // withEntitySrc 는 Wef 자기검증 덕에 올바른 값을 쓰고 있었고, 이 경로만 검증이 없어
+            // 불일치가 방치돼 있었다. 이제 동일한 ND 캐시를 공유해 값·비용 모두 일치시킨다.
+            net.minecraft.server.MinecraftServer sv = src.getServer();
+            ndSync(sv);
+            Object[] nd = ndOf(e);
             return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
                     acc.kfc$output(), e.getPos(),
                     new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()),
-                    src.getWorld(), acc.kfc$level(), e.getNameForScoreboard(), e.getDisplayName(),
-                    src.getServer(), e, src.isSilent(), src.getReturnValueConsumer(),
+                    src.getWorld(), acc.kfc$level(),
+                    (String) nd[0], ((net.minecraft.text.Text) nd[1]).copy(),
+                    sv, e, src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
         }
         return atEntity(src.withEntity(e), e);

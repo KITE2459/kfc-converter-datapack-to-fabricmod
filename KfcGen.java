@@ -642,9 +642,39 @@ public final class KfcGen {
      *  world.getEntitiesByType(월드 인덱스 재순회 + 필터 + 리스트 생성) 대체: 집합·순서 동일
      *  (버킷 = 스냅샷(EntityIndex 순) 부분수열), isAlive 는 호출측 가드로 재현(untyped 경로와
      *  동일 방식). 본문 스폰/킬이 버킷을 증분 변형할 수 있어 복사본을 순회한다(격리). */
+    // ── [틱-세대 공유 복사본] ──────────────────────────────────────────────
+    // 종전엔 호출마다 타입버킷 전체를 새 ArrayList 로 복사했다. 그런데 콜사이트가
+    // 틱 도달 코드에만 107곳(kartmain:loop 한 함수에서 6곳)이고, TEXT_DISPLAY 처럼 원소가
+    // 수백~수천인 타입이면 복사 하나가 그 크기만큼이다.
+    //
+    // [공유 가능 근거] 같은 (서버, 틱, ENTITY_GEN) 이면 typeBucket 결과가 동일하므로
+    // 그 복사본도 동일하다. 그리고 생성 코드의 사용 형태는 전수 확인 결과
+    // `for (Entity e : typeBucketCopy(...))` <b>순수 순회 480곳뿐</b>이며(변형 0곳,
+    // KfcGen 내부 호출자도 없음) 복사본을 변형하는 경로가 존재하지 않는다.
+    // 따라서 한 번 만든 복사본을 그 틱·세대 동안 공유해도 관측 동등하다.
+    //
+    // [격리 유지] 본문이 스폰/킬을 하면 ENTITY_GEN 이 올라 다음 호출은 새 복사본을 받고,
+    // 진행 중인 순회는 옛 복사본을 계속 본다 — '선택 시점 고정 집합' 시맨틱과 CME 방지가
+    // 종전과 완전히 동일하다(각자 복사하던 때와 결과가 같다).
+    private static final it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<
+            net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>>
+            TBC_CACHE = new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>();
+    private static net.minecraft.server.MinecraftServer TBC_SERVER;
+    private static int  TBC_TICK = Integer.MIN_VALUE;
+    private static long TBC_GEN  = -1;
+
     public static java.util.List<net.minecraft.entity.Entity> typeBucketCopy(
             GameContext ctx, net.minecraft.entity.EntityType<?> t) {
-        return new java.util.ArrayList<>(typeBucket(ctx, t));
+        int tk = ctx.server.getTicks();
+        if (TBC_SERVER != ctx.server || TBC_TICK != tk || TBC_GEN != ENTITY_GEN) {
+            TBC_CACHE.clear(); TBC_SERVER = ctx.server; TBC_TICK = tk; TBC_GEN = ENTITY_GEN;
+        }
+        java.util.List<net.minecraft.entity.Entity> c = TBC_CACHE.get(t);
+        if (c == null) {
+            c = new java.util.ArrayList<>(typeBucket(ctx, t));
+            TBC_CACHE.put(t, c);
+        }
+        return c;
     }
 
     /** as @e[type=..] 루프 본문이 '엔티티 집합을 바꾸지 않음'이 변환 시점에 증명된 경우의
@@ -6210,23 +6240,54 @@ public static net.minecraft.entity.Entity nearestEntity(
     public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        return allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist, -1);
+    }
+
+    /**
+     * {@code cap >= 0} 이면 <b>매치 cap 개를 채우는 즉시 순회를 중단</b>한다.
+     *
+     * <p><b>[항등 근거]</b> {@code @e[limit=N]} 에 sort 가 없으면 바닐라는 arbitrary —
+     * 수집 순서대로 앞 N 개다(EntitySelector 의 ARBITRARY sorter 는 no-op, 이후
+     * {@code subList(0, limit)}). 우리도 같은 소스를 같은 순서로 순회하므로
+     * {@code filter(all).subList(0,N)} 와 {@code takeFirstN(filter(all))} 는 <b>항등</b>이다 —
+     * 근사가 아니라 결과·순서가 완전히 같다.
+     *
+     * <p><b>[실측 동기]</b> {@code kartmobil:sound-and-fov/pro-soundmacro} 의
+     * {@code execute as @e[limit=2]} 는 타입·태그·거리 필터가 전부 없어
+     * ({@code NO_TAGS, NO_TAGS, -1, -1}), 종전에는 엔티티 스냅샷 <b>2,504개를 전부 새 ArrayList
+     * 로 복사</b>한 뒤 앞 2개만 썼다. 그런 콜사이트가 이 함수 하나에만 5곳, 매 틱 실행된다.
+     * spark: {@code allEntitiesAnyType} self 0.194 · {@code ArrayList.add} 0.104 ·
+     * {@code Arrays.copyOf} 0.082 · {@code matchTagsAlive} 0.149.
+     *
+     * <p>박스(거리 상한) 경로는 바닐라가 리스트를 만들어 돌려주므로 상한을 적용하지 않는다
+     * — 조기종료 여지가 없고 종전과 동일 경로다.
+     */
+    public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int cap) {
+        if (cap == 0) return java.util.List.of();
         if (origin != null && maxDist >= 0) {
             java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
             if (_tbb != null) {
                 java.util.List<net.minecraft.entity.Entity> _out = new java.util.ArrayList<>();
                 for (net.minecraft.entity.Entity e : _tbb) {
-                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) _out.add(e);
+                    if (matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist)) {
+                        _out.add(e);
+                        if (cap >= 0 && _out.size() >= cap) break;
+                    }
                 }
                 return _out;
             }
             return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
-        java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        java.util.List<net.minecraft.entity.Entity> out =
+                new java.util.ArrayList<>(cap >= 0 ? cap : 10);
         for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
             if (!matchTagsAlive(e, tagsPos, tagsNeg)) continue;
             if (!inRange(origin, e, minDist, maxDist)) continue;
             out.add(e);
+            if (cap >= 0 && out.size() >= cap) break;
         }
         return out;
     }
@@ -6242,9 +6303,13 @@ public static net.minecraft.entity.Entity nearestEntity(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist, int limit,
             boolean wantNearest) {
+        // 정렬이 필요 없으면(sort 미지정 = arbitrary) 수집 자체를 limit 개에서 멈춘다 — 위 항등 근거.
+        // 정렬이 필요하면 전수 수집이 불가피하므로 종전 경로를 그대로 유지한다.
+        final boolean _sortNeeded = (wantNearest || LIMIT_SORT_NEAREST) && origin != null;
         java.util.List<net.minecraft.entity.Entity> all =
-                allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist);
-        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
+                allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist,
+                                   _sortNeeded ? -1 : limit);
+        if (_sortNeeded && all.size() > 1) {
             all.sort(java.util.Comparator.comparingDouble(e -> e.squaredDistanceTo(origin)));
         }
         if (limit >= 0 && all.size() > limit) {
@@ -9124,6 +9189,7 @@ public static net.minecraft.entity.Entity firstEntity(
         PF_CACHE = null; PF_SERVER = null; PF_TICK = MIN; PF_GEN = -1; PF_MUT = -1;
         TYPE_INDEX = null; TYPEIDX_SERVER = null; TYPEIDX_TICK = MIN; TYPEIDX_GEN = -1;
         TAG_BUCKETS.clear();
+        TBC_CACHE.clear(); TBC_SERVER = null; TBC_TICK = MIN; TBC_GEN = -1;
         TB_SERVER = null; TB_TICK = MIN; TB_GEN = -1; TB_PLN = -1; TB_PLH = 0;
         TB_RECON_TICK = MIN; TB_FP = Long.MIN_VALUE; TB_TAG_FP = Long.MIN_VALUE; TB_EPOCH++;
         ANY_MEMO.clear(); AM_SERVER = null; AM_TICK = MIN; AM_GEN = -1; AM_MUT = -1;

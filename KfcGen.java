@@ -322,8 +322,14 @@ public final class KfcGen {
         long gen = -1;
         ObjRef(String name) { this.name = name; }
     }
-    /** merge_pass 승격 필드 초기화용. */
-    public static ObjRef objRef(String name) { return new ObjRef(name); }
+    /** merge_pass 승격 필드 초기화용.
+     *  [월드경계] 생성된 셀을 레지스트리에 등록한다 — resetAll() 이 월드 종료 시 obj 참조를
+     *  끊어 이전 Scoreboard/서버 그래프가 static final 필드에 고착되는 것을 막는다. */
+    public static ObjRef objRef(String name) {
+        ObjRef r = new ObjRef(name);
+        OBJ_REF_CELLS.add(r);
+        return r;
+    }
     private static ScoreboardObjective obj(ServerScoreboard sb, ObjRef r) {
         if (r.gen != OBJ_GEN) {
             r.obj = sb.getNullableObjective(r.name);
@@ -827,7 +833,12 @@ public final class KfcGen {
         long epoch = Long.MIN_VALUE;
         Tags(String[] pos) { this.pos = pos; }
     }
-    public static Tags tags(String[] pos) { return new Tags(pos); }
+    /** [월드경계] resetAll() 이 b(엔티티 리스트)·srv 참조를 끊을 수 있게 셀을 등록한다. */
+    public static Tags tags(String[] pos) {
+        Tags t = new Tags(pos);
+        TAG_CELLS.add(t);
+        return t;
+    }
 
     static java.util.List<net.minecraft.entity.Entity> tagCandidates(GameContext ctx, Tags t) {
         int tk = ctx.server.getTicks();
@@ -8669,5 +8680,132 @@ public static net.minecraft.entity.Entity firstEntity(
         if (b == null) return;
         b.clearPlayers();
         b.addPlayers(players);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    //  [월드 수명 경계 — 전체 캐시/할당 해제]  KfcGen.resetAll()
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 문제(싱글플레이 재입장 GC 폭주): 이 클래스의 캐시는 전부 static 이라 '모드 클래스 로더'
+    //   수명(=JVM 수명)을 산다. 그러나 싱글플레이에서 월드를 나가면 통합 서버(MinecraftServer)와
+    //   그에 딸린 ServerWorld·Scoreboard·엔티티 그래프가 통째로 폐기되고, 재입장 시 전부 새로
+    //   만들어진다. 기존 화해(coherence) 훅들은 '값의 진부화'만 다루며 세대 스탬프 불일치 시
+    //   다음 접근에서 재해소할 뿐 — 참조 자체를 놓지 않는다. 그래서 재입장 시점에
+    //     · SNAP_ENTITIES / TYPE_INDEX / TAG_BUCKETS      → 이전 월드 엔티티 전량
+    //     · ND_MAP / ONP_VEH / ONP_MAP                    → 이전 월드 엔티티·SCS
+    //     · SCORE_HANDLES / READ_HANDLES / Sch.acc / Rch.sc → 이전 Scoreboard
+    //     · ObjRef.obj (생성 클래스 static final 1000+개)  → 이전 Scoreboard → 이전 서버
+    //     · Tags.b / Tags.srv (생성 클래스 static final 수천 개) → 이전 월드 엔티티 리스트
+    //     · CTX_CACHE / *_SERVER / SCHED_Q                → 이전 서버·월드
+    //   가 옛 서버 객체 그래프 전체를 강하게 붙잡아, 구세대(old gen)에서 회수 불가능한 채로
+    //   새 월드의 그래프와 공존한다 → 힙 2배 + full GC 반복 → 프리즈/OOM.
+    //   (바닐라 데이터팩은 이런 static 캐시가 없어 증상이 없다.)
+    //
+    // 해법: 서버 수명 경계(SERVER_STOPPING/STOPPED, 그리고 방어적으로 SERVER_STARTING)와
+    //   데이터팩 리로드 경계에서 모든 캐시를 비우고 모든 라이브 참조를 끊는다. ModEntry 가
+    //   ServerLifecycleEvents 로 이 메서드를 호출한다.
+    //
+    // 안전성: 모든 캐시는 '미스 시 재해소'가 멱등이므로, 어느 시점에 호출해도 관측 동작은
+    //   변하지 않는다(성능만 일시적으로 콜드 스타트). 세대/에폭 카운터를 함께 증가시켜
+    //   레지스트리에 등록되지 않은 셀이 있더라도 스탬프 불일치로 반드시 재해소되게 한다.
+    //   서버 메인 스레드에서만 호출된다(라이프사이클 이벤트 = 서버 스레드) — 스레드 규약 준수.
+
+    /** 생성 클래스에 static final 로 승격된 ObjRef 셀 레지스트리(월드 경계 참조 절단용).
+     *  콜사이트당 1개로 유한(kartall 기준 ~1.5k) — 이 리스트 자체의 메모리는 무시 가능하고,
+     *  셀은 어차피 생성 클래스의 static final 이라 항상 도달 가능하므로 새 누수를 만들지 않는다. */
+    private static final java.util.ArrayList<ObjRef> OBJ_REF_CELLS = new java.util.ArrayList<>();
+    /** 승격된 Tags 셀 레지스트리(동일 목적 — Tags 는 엔티티 리스트와 서버를 직접 붙잡는다). */
+    private static final java.util.ArrayList<Tags> TAG_CELLS = new java.util.ArrayList<>();
+    private static long RESET_COUNT = 0;
+    private static final boolean RESET_QUIET = Boolean.getBoolean("kfc.reset.quiet");
+
+    /** 지금까지의 전체 해제 횟수(진단/테스트용). */
+    public static long resetCount() { return RESET_COUNT; }
+
+    public static void resetAll() { resetAll("manual"); }
+
+    /**
+     * 모든 static 캐시를 비우고 서버/월드/엔티티/스코어보드 참조를 전부 끊는다.
+     * 호출 시점: 월드(통합 서버) 종료·시작, 데이터팩 리로드. 여러 번 호출해도 무해(멱등).
+     */
+    public static void resetAll(String reason) {
+        final long t0 = System.nanoTime();
+        final int MIN = Integer.MIN_VALUE;
+
+        // ── 1) 생성 클래스의 static final 승격 셀 — 라이브 참조 절단 ──
+        //     (셀 객체 자체는 클래스가 언로드될 때까지 살아있으므로, 안에 든 참조를 비워야 한다.)
+        for (int i = 0, n = OBJ_REF_CELLS.size(); i < n; i++) {
+            ObjRef r = OBJ_REF_CELLS.get(i);
+            r.obj = null; r.gen = -1;
+        }
+        for (int i = 0, n = TAG_CELLS.size(); i < n; i++) {
+            Tags t = TAG_CELLS.get(i);
+            t.b = null; t.srv = null; t.tick = MIN; t.gen = -1; t.epoch = Long.MIN_VALUE;
+        }
+        for (java.util.ArrayList<Object> cells : CELLS_BY_HOLDER.values()) {
+            for (int i = 0, n = cells.size(); i < n; i++) {
+                Object c = cells.get(i);
+                if (c instanceof Sch s)      { s.acc = null; s.gen = Long.MIN_VALUE; }
+                else if (c instanceof Rch r) { r.sc  = null; r.gen = Long.MIN_VALUE; }
+            }
+        }
+
+        // ── 2) 엔티티/서버/월드 참조를 보유하는 핫패스 캐시 ──
+        CTX_CACHE = null;
+        SNAP_ENTITIES = null; SNAP_SERVER = null;
+        SNAP_TICK = MIN; SNAP_GEN = -1; SNAP_FP = 0; SNAP_TAG_FP = 0;
+        PF_CACHE = null; PF_SERVER = null; PF_TICK = MIN; PF_GEN = -1; PF_MUT = -1;
+        TYPE_INDEX = null; TYPEIDX_SERVER = null; TYPEIDX_TICK = MIN; TYPEIDX_GEN = -1;
+        TAG_BUCKETS.clear();
+        TB_SERVER = null; TB_TICK = MIN; TB_GEN = -1; TB_PLN = -1; TB_PLH = 0;
+        TB_RECON_TICK = MIN; TB_FP = Long.MIN_VALUE; TB_TAG_FP = Long.MIN_VALUE; TB_EPOCH++;
+        ANY_MEMO.clear(); AM_SERVER = null; AM_TICK = MIN; AM_GEN = -1; AM_MUT = -1;
+        ONP_MAP.clear(); ONP_VEH.clear();
+        ONP_MAP_SERVER = null; ONP_MAP_TICK = MIN; ONP_MAP_GEN = -1;
+        ND_MAP.clear(); ND_SERVER = null; ND_TICK = MIN; ND_NGEN = -1; ND_RECON_TICK = MIN;
+        ENTITY_NBT_SNAP.clear();
+        NAME_CACHE.clear();          // WeakHashMap 이지만 즉시 반환(엔트리 purge 는 접근 시에만 일어남)
+
+        // ── 3) 스코어보드 핸들 — 이전 Scoreboard 를 붙잡는 최대 지분 ──
+        SCORE_HANDLES.clear(); READ_HANDLES.clear();
+        SCORE_EPOCH++; HANDLE_GEN++; SH_GEN = HANDLE_GEN; HANDLE_RECON_TICK = MIN;
+
+        // ── 4) 함수 핸들·네이티브 스케줄 큐 ──
+        //     스케줄 큐를 남기면 누수일 뿐 아니라 '이전 월드의 예약 함수가 새 월드에서 발화'하는
+        //     동작 버그가 된다(바닐라 타이머는 level.dat 에 월드별로 저장되므로 섞이지 않는다).
+        FN_CACHE.clear(); FN_SERVER = null; FN_TICK = MIN;
+        SCHED_Q.clear(); SCHED_BY_KEY.clear(); SCHED_NOW = 0; SCHED_SEQ = 0;
+        SNAP_PENDING.clear();
+
+        // ── 5) 서버/데이터팩에 바인딩된 파싱 캐시 ──
+        //     LootCondition 은 ReloadableRegistries, ItemStackArgument 는 동적 레지스트리 조회
+        //     결과라 월드/리로드가 바뀌면 진부해진다 — 해제는 누수 방지이자 정합성 요건이다.
+        PREDICATE_CACHE.clear();
+        ITEM_ARG_CACHE.clear();
+        BLOCK_ARG_CACHE.clear();
+        SOUND_CACHE.clear(); SOUND_CAT_CACHE.clear();
+        BLOCK_TAG_CACHE.clear(); ENTITY_TYPE_TAG_CACHE.clear(); ITEM_TAG_CACHE.clear();
+        _GR_KEYS = null;
+        EXT_MASK_CACHE.clear(); FN_MASK_CACHE.clear(); FN_MASK_BUSY.clear(); EXT_NOCACHE = false;
+        CMD_CLASS.clear(); NBT_DROP.clear();
+
+        // ── 6) 순수 값 캐시(서버 무관) — 재입장 시 재구축되므로 힙 반환이 이득 ──
+        HOLDER_CACHE.clear(); ID_CACHE.clear(); UUID_CACHE.clear();
+        SNBT_CACHE.clear(); NBTPATH_CACHE.clear(); NBT_EXPECT_CACHE.clear();
+        TRANSFORM_CACHE.clear(); TRANSFORM_ID_CACHE.clear();
+        INTERP_CACHE.clear(); INTERP_CACHE_NBT.clear(); INTERP_ID_MAPS.clear();
+        TEXT_CACHE.clear(); TEXT_TMPL.clear();
+        MACRO_NORM_CACHE.clear();
+
+        // ── 7) 세대/에폭/플래그 — 레지스트리 밖 셀까지 스탬프 불일치로 강제 재해소 ──
+        ENTITY_GEN++; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++;
+        OBJ_TICK = MIN;
+        REC_DEPTH = 0;                       // 월드가 중간에 내려가도 재귀 깊이가 새지 않게
+        EXTERNAL_DIRTY = false; EXTERNAL_MASK = 0;
+
+        RESET_COUNT++;
+        if (!RESET_QUIET) {
+            System.out.println("[KFC] resetAll(" + reason + ") - all native caches released ("
+                    + ((System.nanoTime() - t0) / 1000L) + " us, #" + RESET_COUNT + ")");
+        }
     }
 }

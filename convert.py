@@ -1457,6 +1457,7 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.command.CommandManager;
@@ -1468,6 +1469,8 @@ import com.mojang.brigadier.CommandDispatcher;
 {load_note} * 명령 컨텍스트는 서버 커맨드 소스(level 4, silent)를 사용한다.
  *  - `kfc-converted` 명령 등록: 데이터팩이 '이 팩이 네이티브 변환(최적화)되어 실행 중인지'를
  *    감지(execute if / return 값)해 조건부 기능을 활성화하는 용도. 부수효과 없이 1 을 반환한다.
+ *  - 서버(월드) 수명 경계 -> KfcGen.resetAll(): 싱글플레이 월드 재입장 시 이전 월드 객체
+ *    그래프가 static 캐시에 고착돼 생기던 GC 폭주를 막는다.
  */
 public final class ModEntry implements ModInitializer {{
     @Override
@@ -1488,6 +1491,30 @@ public final class ModEntry implements ModInitializer {{
         }} catch (NoSuchFieldException e) {{
             System.out.println("[KFC]   Perf(Entity) = MISSING");
         }} catch (Throwable t) {{ System.out.println("[KFC]   Perf(Entity) = ERROR " + t); }}
+        // [월드 수명 경계 — 캐시/메모리 전체 해제]
+        //   ModInitializer 는 JVM 당 1회 실행이고 KfcGen 의 캐시는 전부 static 이라 게임을
+        //   끄기 전까지 살아남는다. 반면 싱글플레이에서 '월드 나가기'를 하면 통합 서버
+        //   (MinecraftServer)와 ServerWorld·Scoreboard·엔티티 그래프가 통째로 폐기되고,
+        //   재입장 시 전부 새로 만들어진다. 화해(coherence) 훅은 값의 진부화만 다루고 참조는
+        //   놓지 않으므로, 해제 지점이 없으면 이전 월드의 엔티티/스코어보드/서버가 static
+        //   캐시와 승격 셀(ObjRef/Tags/Sch/Rch)에 고착돼 회수되지 않는다 → 재입장 시 힙 2배,
+        //   full GC 반복(프리즈/OOM). 바닐라 데이터팩엔 이런 static 캐시가 없어 증상이 없다.
+        //   => 서버(=월드) 수명 경계에서 전량 해제한다. 재해소는 전부 멱등이라 관측 동작 불변.
+        ServerLifecycleEvents.SERVER_STOPPING.register(
+                server -> {group}.generated.KfcGen.resetAll("server-stopping"));
+        // STOPPED: 저장/월드 언로드까지 끝난 최종 시점 — STOPPING 이후 잔여 틱이 다시 채운
+        //   캐시까지 확실히 비운다(멱등이므로 이중 호출 무해).
+        ServerLifecycleEvents.SERVER_STOPPED.register(
+                server -> {group}.generated.KfcGen.resetAll("server-stopped"));
+        // STARTING: 방어선 — 이전 세션이 크래시 등으로 STOPPING/STOPPED 를 못 태웠어도
+        //   새 월드는 항상 깨끗한 캐시에서 시작한다.
+        ServerLifecycleEvents.SERVER_STARTING.register(
+                server -> {group}.generated.KfcGen.resetAll("server-starting"));
+        // 데이터팩 리로드: predicate(LootCondition)·item 인자 등은 ReloadableRegistries/동적
+        //   레지스트리 산출물이라 /reload 후 진부해진다 — 누수 방지 겸 정합성 요건.
+        ServerLifecycleEvents.END_DATA_PACK_RELOAD.register(
+                (server, resourceManager, success) -> {group}.generated.KfcGen.resetAll("datapack-reload"));
+
         ServerTickEvents.START_SERVER_TICK.register(server -> {{
             ServerCommandSource src = server.getCommandSource().withSilent();
 {tick_body}

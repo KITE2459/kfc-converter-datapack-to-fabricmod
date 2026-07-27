@@ -1637,21 +1637,45 @@ public final class KfcGen {
         return world.getBlockState(bp).isIn(key);
     }
 
-    /** if loaded <pos> — 청크 로드 여부. 바닐라 ExecuteCommand.isLoaded 는 isChunkLoaded 만
-     *  보지만, 네이티브 변환에선 "청크 loaded" 와 "그 청크 엔티티 유입 완료" 사이에 틈이 생긴다
-     *  (바닐라는 둘이 거의 동시). 그 틈에 로드 직후 실행되는 kill/셀렉터가 아직 안 들어온 엔티티를
-     *  놓쳐, forceload+tick 으로 UI 를 재생성하는 팩에서 옛 엔티티 잔존→겹침이 났다(마스터 모드
-     *  타이틀/패널 이중 표시). getChunk(x,z) 로 FULL 상태 청크를 확보하면 그 청크의 엔티티 유입까지
-     *  완료되므로, if loaded 통과 시점의 엔티티 가시성이 바닐라와 일치한다. 이미 로드된 청크는
-     *  즉시 반환이라 비용이 없다(핫패스 영향 없음 — 실측). */
+    /**
+     * {@code execute if loaded <pos>} — <b>바닐라 ExecuteCommand.isLoaded 를 1:1 재현</b>한다.
+     *
+     * <p>1.21.5 바이트코드(ExecuteCommand.isLoaded) 확인 결과, 조건은 <b>3개 전부</b>다:
+     * <pre>
+     *   ChunkPos cp = new ChunkPos(pos);
+     *   WorldChunk wc = world.getChunkManager().getWorldChunk(cp.x, cp.z);
+     *   if (wc == null) return false;                                  // (1)
+     *   return wc.getLevelType() == ChunkLevelType.ENTITY_TICKING      // (2) '==' 정확 비교
+     *       &amp;&amp; world.isChunkLoaded(cp.toLong());                     // (3)
+     * </pre>
+     *
+     * <p><b>[버그 이력 — 저사양 환경 트랙 복제]</b> 종전 구현은
+     * {@code world.getChunk(x, z, ChunkStatus.FULL, false) != null} 하나만 봤다.
+     * 그런데 {@code ChunkStatus}(생성 진행도)와 {@code ChunkLevelType}(티켓 레벨=활성도)은
+     * <b>완전히 다른 축</b>이다. 청크가 FULL 까지 '생성'됐어도 레벨 타입은 아직
+     * {@code INACCESSIBLE}/{@code FULL}/{@code BLOCK_TICKING} 일 수 있고, 그 구간에서는
+     * <b>엔티티가 아직 엔티티 매니저에 편입되지 않아 셀렉터에 안 잡힌다.</b>
+     *
+     * <p>그래서 종전 구현은 그 창(window)에서 바닐라가 false 를 낼 때 <b>true 를 냈다</b>.
+     * 마스터 모드의 맵 버전 갱신 흐름(포팅 → 기존 트랙 디스플레이/인터랙션 제거 → 재선택)에서,
+     * 제거 단계가 "아직 안 잡히는" 옛 엔티티를 못 지운 채 다음 단계로 진행 → 신규 트랙과 겹쳐
+     * <b>복제</b>가 됐다. 빠른 PC 는 이 창이 짧아 드러나지 않고, <b>저사양 PC 에서만 재현</b>되던
+     * 이유가 정확히 이것이다(청크 승급이 느려 창이 넓어짐).
+     *
+     * <p>이제 (2) {@code ENTITY_TICKING} 정확 비교가 "엔티티가 실제로 틱하는 상태"를 보장하므로
+     * {@code if loaded} 통과 시점의 엔티티 가시성이 바닐라와 완전히 일치한다.
+     *
+     * <p>강제 로드는 하지 않는다({@code getWorldChunk} 는 미로드 시 null 반환) — 핫 루프에서
+     * 미로드 청크를 건드리지 않는 종전 성질도 그대로다.
+     */
     public static boolean posLoaded(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos) {
         net.minecraft.util.math.BlockPos bp = net.minecraft.util.math.BlockPos.ofFloored(pos);
-        // create=false: 로드된 청크만 반환(강제 로드 안 함) → 바닐라 if loaded '로드 안 됨=false'
-        // 시맨틱을 정확히 보존한다(hot 루프에서 미로드 청크 로드 시도도 방지). ChunkStatus.FULL:
-        // 엔티티 유입까지 완료된 청크만 통과 → forceload 후 UI 재생성(마스터 타이틀 등) 정합성 확보.
-        return world.getChunk(bp.getX() >> 4, bp.getZ() >> 4,
-                              net.minecraft.world.chunk.ChunkStatus.FULL, false) != null;
+        final int cx = bp.getX() >> 4, cz = bp.getZ() >> 4;
+        net.minecraft.world.chunk.WorldChunk wc = world.getChunkManager().getWorldChunk(cx, cz);
+        if (wc == null) return false;
+        return wc.getLevelType() == net.minecraft.server.world.ChunkLevelType.ENTITY_TICKING
+            && world.isChunkLoaded(net.minecraft.util.math.ChunkPos.toLong(cx, cz));
     }
 
     /** distance 상한이 있을 때 섹션 스캔을 한정하는 AABB.

@@ -475,7 +475,7 @@ public final class KfcGen {
     // 정확성 유지 — 기존 per-tick 스냅샷 시맨틱 그대로.)
     static void snapAdd(net.minecraft.entity.Entity e) {
         long _prevGen = ENTITY_GEN;
-        ENTITY_GEN++;                        // gen 은 단조 증가 유지(다른 캐시/판정과 일관)
+        ENTITY_GEN++; GEN_SRC = 1;           // gen 은 단조 증가 유지(다른 캐시/판정과 일관)
         // [정합 가드] 직전까지 유효(TB_GEN==prev)했던 태그 버킷만 증분 갱신·재유효화한다.
         // 이미 무효(예: 직전 브릿지의 ENTITY_GEN++)면 '유효' 표시가 브릿지 변화를 놓친 버킷을
         // 부활시키므로 그대로 무효 상태로 둔다(다음 접근 때 재수집).
@@ -591,7 +591,7 @@ public final class KfcGen {
 
     static void snapRemove(net.minecraft.entity.Entity e) {
         long _prevGen = ENTITY_GEN;
-        ENTITY_GEN++;
+        ENTITY_GEN++; GEN_SRC = 2;
         if (TB_GEN == _prevGen && e != null) {   // 태그 버킷 증분 제거(snapAdd 와 동일 정합 가드)
             tagBucketsOnRemove(e);
             TB_GEN = ENTITY_GEN;
@@ -732,6 +732,62 @@ public final class KfcGen {
     // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
     private static long TB_EPOCH = 0;
 
+    // ── [진단] 태그 버킷 재구축 사유별 카운터 ──────────────────────────
+    // -Dkfc.debug.tagbucket=true 로 켜면 100틱마다 1줄 요약을 찍는다.
+    // 2차 프로파일에서 tagBucket 이 4.79 mspt(모드 틱의 37%)로 최대 항목이 됐는데,
+    // 엔티티 수는 그대로이고 ENTITY_GEN 유발원은 오히려 줄어 원인이 확정되지 않았다.
+    // 사유별 카운트를 보면 어느 조건이 재구축을 유발하는지 즉시 판별된다:
+    //   drift  = 플레이어 목록 변화(입퇴장) — 한 명만 바뀌어도 전체 폐기
+    //   pop    = 개체군 지문 변화(훅 밖 스폰/디스폰, 청크 로드)
+    //   recon  = 주기 안전망(RECON_TICKS)
+    //   gen    = ENTITY_GEN/서버 변화(우리 스폰·킬·브릿지)
+    //   nbt    = readNbt 로 태그 집합이 바뀜
+    private static final boolean DEBUG_TAGBUCKET = Boolean.getBoolean("kfc.debug.tagbucket");
+    // [진단] ENTITY_GEN 을 마지막으로 올린 주체. 태그 버킷이 gen 불일치로 폐기될 때
+    // '누가 올렸는지'를 귀속시켜, fail-closed 마스크를 좁힐 여지가 있는지 판별한다.
+    //   1=snapAdd 2=snapRemove 3=runCommand(비-SAFE) 4=bridgeReconcile(BR_ENTITY)
+    //   5=instantExecute 디스패처  6=resetAll  0=미상
+    static int GEN_SRC = 0;
+    // bridgeReconcile 이 올린 경우, 그 마스크를 낸 주체(외부명령/스케줄함수/브릿지 폴백)
+    static String GEN_SRC_NOTE = "";
+    private static final String[] GEN_SRC_NAME =
+            {"unknown","snapAdd","snapRemove","runCommand","bridgeReconcile","dispatcher","resetAll"};
+    private static final long[] TBD_SRC = new long[7];
+    private static long TBD_BRTAG;                 // bridgeReconcile 의 BR_TAG 직접 클리어(gen 안 올림)
+    private static final java.util.HashMap<String, Long> TBD_TAGNOTE = new java.util.HashMap<>();
+    private static final java.util.HashMap<String, Long> TBD_NOTE = new java.util.HashMap<>();
+    private static long TBD_DRIFT, TBD_POP, TBD_RECON, TBD_GEN, TBD_NBT, TBD_BUILD, TBD_ENT;
+    private static int  TBD_TICK = Integer.MIN_VALUE;
+    private static void tbdReport(int tk) {
+        if (TBD_TICK == Integer.MIN_VALUE) { TBD_TICK = tk; return; }
+        if (tk - TBD_TICK < 100) return;
+        int span = tk - TBD_TICK; TBD_TICK = tk;
+        System.out.println("[KFC-TAGBUCKET] " + span + "틱: 재구축 " + TBD_BUILD
+                + " (틱당 " + String.format("%.2f", (double) TBD_BUILD / span) + ")"
+                + "  사유 drift=" + TBD_DRIFT + " pop=" + TBD_POP + " recon=" + TBD_RECON
+                + " gen=" + TBD_GEN + " nbt=" + TBD_NBT
+                + "  스캔엔티티누계=" + TBD_ENT);
+        StringBuilder sb2 = new StringBuilder("[KFC-TAGBUCKET]   brTag=" + TBD_BRTAG + "  gen 유발자: ");
+        for (int i = 0; i < TBD_SRC.length; i++)
+            if (TBD_SRC[i] > 0) sb2.append(GEN_SRC_NAME[i]).append('=').append(TBD_SRC[i]).append(' ');
+        if (!TBD_NOTE.isEmpty()) {
+            sb2.append(" | gen명령: ");
+            TBD_NOTE.entrySet().stream()
+                    .sorted((x, y) -> Long.compare(y.getValue(), x.getValue()))
+                    .limit(5).forEach(en2 -> sb2.append(en2.getKey()).append('x').append(en2.getValue()).append(' '));
+        }
+        if (!TBD_TAGNOTE.isEmpty()) {
+            sb2.append(" | brTag유발: ");
+            TBD_TAGNOTE.entrySet().stream()
+                    .sorted((x, y) -> Long.compare(y.getValue(), x.getValue()))
+                    .limit(5).forEach(en2 -> sb2.append(en2.getKey()).append('x').append(en2.getValue()).append(' '));
+        }
+        System.out.println(sb2);
+        java.util.Arrays.fill(TBD_SRC, 0L); TBD_NOTE.clear(); TBD_TAGNOTE.clear();
+        TBD_BRTAG = 0; GEN_SRC_NOTE = "";
+        TBD_DRIFT = TBD_POP = TBD_RECON = TBD_GEN = TBD_NBT = TBD_BUILD = TBD_ENT = 0;
+    }
+
     static java.util.List<net.minecraft.entity.Entity> tagBucket(GameContext ctx, String tag) {
         int tk = ctx.server.getTicks();
         // 14차: 틱 경계에서 버킷을 버리지 않는다(증분 훅이 진실 유지). 틱당 1회만
@@ -758,13 +814,23 @@ public final class KfcGen {
             // TB_GEN 검사로 버킷을 무효화). 여기는 종전 안전망(플레이어 드리프트 즉시 + 개체군
             // 지문 드리프트 즉시 + 100틱 주기)만 유지 — 함수 밖 bare /tag·콘솔 개입 수렴용.
             // (24차의 매 틱 무조건 clear 는 성능 회복 위해 철회.)
-            if (drift || popDrift || TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= RECON_TICKS) {
+            boolean reconDue = (TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= RECON_TICKS);
+            if (drift || popDrift || reconDue) {
                 TB_RECON_TICK = tk;
                 TAG_BUCKETS.clear(); TB_EPOCH++;
+                if (DEBUG_TAGBUCKET) {
+                    if (drift) TBD_DRIFT++; else if (popDrift) TBD_POP++; else TBD_RECON++;
+                }
             }
+            if (DEBUG_TAGBUCKET) tbdReport(tk);
         }
         if (TB_SERVER != ctx.server || TB_GEN != ENTITY_GEN) {
             TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_GEN = ENTITY_GEN;
+            if (DEBUG_TAGBUCKET) {
+                TBD_GEN++;
+                TBD_SRC[GEN_SRC >= 0 && GEN_SRC < TBD_SRC.length ? GEN_SRC : 0]++;
+                if (!GEN_SRC_NOTE.isEmpty()) TBD_NOTE.merge(GEN_SRC_NOTE, 1L, Long::sum);
+            }
         }
         if (TAG_BUCKETS.isEmpty()) {
             // [실측 ~4.5%p] 종전 '태그별 지연 구축'은 질의 태그마다 스냅샷 전 엔티티 ×
@@ -774,7 +840,9 @@ public final class KfcGen {
             // 구축 후 부재 키 = 그 태그 보유 엔티티 없음 → 빈 버킷(EMPTY_BUCKET) — 종전의
             // '스캔 결과 0건' 과 동일. 증분 훅(snapAdd/tagBucketsOnAdd)은 computeIfAbsent 로
             // 부재 태그 버킷을 생성하므로 이후 스폰/태그 부여도 정확히 반영된다.
+            if (DEBUG_TAGBUCKET) TBD_BUILD++;
             for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx)) {
+                if (DEBUG_TAGBUCKET) TBD_ENT++;
                 java.util.Set<String> tg0 = e.getCommandTags();
                 if (tg0.isEmpty()) continue;   // 무태그(플레이어/바닐라 몹) — 이터레이터 할당 생략
                 for (String tg : tg0) {
@@ -875,6 +943,44 @@ public final class KfcGen {
         return b != null ? b : entitiesSnapshot(ctx);
     }
 
+    // ── [B1] 커맨드 태그 변이 훅 (KfcEntityTagMixin) ──────────────────────────
+    // Entity.addCommandTag/removeCommandTag 는 커맨드 태그의 유일한 정상 변이 경로다.
+    // 여기서 버킷을 증분 유지하면 외부 명령(/tag, execute … run tag)이 태그를 바꿔도
+    // 버킷 전면 폐기가 불필요해진다 — 실측상 남은 재구축의 100% 가 이 경로였다.
+    //
+    // [자기 부트스트랩] 훅이 실제로 도는 것이 확인되기 전에는 분류기가 종전대로 BR_TAG 를
+    // 유지한다. 첫 발동에서 플래그를 켜고 마스크 memo 를 비워, 이후 tag 명령이 BR_NBT 만
+    // 내도록 재계산되게 한다. 믹스인 미적용 시 플래그는 영원히 false → 종전 동작 그대로.
+    static boolean TAG_HOOK_ACTIVE = false;
+    private static final boolean TAG_HOOK_ENABLED =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.taghook", "on"));
+
+    private static void kfcTagHookSeen() {
+        if (TAG_HOOK_ACTIVE || !TAG_HOOK_ENABLED) return;
+        TAG_HOOK_ACTIVE = true;
+        EXT_MASK_CACHE.clear(); FN_MASK_CACHE.clear();   // 'tag' 분류 재계산(BR_TAG 제거)
+        System.out.println("[KFC] entity command-tag hook active - tag buckets now maintained incrementally");
+    }
+
+    /** 커맨드 태그가 실제로 추가됐을 때(반환 true) 호출된다. 버킷 O(1) 증분. */
+    public static void onCommandTagAdded(net.minecraft.entity.Entity e, String tag) {
+        kfcTagHookSeen();
+        QUERY_MUT++;                       // 존재검사 메모 무효화(태그 변화)
+        if (e == null || TAG_BUCKETS.isEmpty()) return;   // 미구축이면 다음 구축 때 반영
+        java.util.ArrayList<net.minecraft.entity.Entity> b =
+                TAG_BUCKETS.computeIfAbsent(tag, k -> new java.util.ArrayList<>());
+        if (!b.contains(e)) b.add(e);
+    }
+
+    /** 커맨드 태그가 실제로 제거됐을 때(반환 true) 호출된다. */
+    public static void onCommandTagRemoved(net.minecraft.entity.Entity e, String tag) {
+        kfcTagHookSeen();
+        QUERY_MUT++;
+        if (e == null) return;
+        java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(tag);
+        if (b != null) b.remove(e);
+    }
+
     /** 생성 코드의 `tag <sel> add` 는 전부 이 헬퍼를 경유한다(엔티티 직접 호출 금지 — 버킷 증분 유지). */
     public static void addTag(net.minecraft.entity.Entity e, String tag) {
         if (e == null) return;
@@ -920,7 +1026,10 @@ public final class KfcGen {
         if (TAG_BUCKETS.isEmpty()) { e.readNbt(n); return; }
         java.util.HashSet<String> before = new java.util.HashSet<>(e.getCommandTags());
         e.readNbt(n);
-        if (!before.equals(e.getCommandTags())) { TAG_BUCKETS.clear(); TB_EPOCH++; }
+        if (!before.equals(e.getCommandTags())) {
+            TAG_BUCKETS.clear(); TB_EPOCH++;
+            if (DEBUG_TAGBUCKET) TBD_NBT++;
+        }
     }
 
     // ── Sepals(Catheter) 호환 타입-박스 질의 ──
@@ -4280,7 +4389,7 @@ public final class KfcGen {
             // 분류 불가/미지 명령은 종전대로 전체 무효화(fail-closed).
             int cls = classifyCommand(command);
             if ((cls & CMD_SAFE) == 0) {
-                ENTITY_GEN++;   // 디스패처 실행이 summon/kill/tag/ride 했을 수 있으므로 무효화
+                ENTITY_GEN++; GEN_SRC = 3; if (DEBUG_TAGBUCKET) GEN_SRC_NOTE = "cmd:" + firstToken(command);   // 디스패처 실행이 summon/kill/tag/ride 했을 수 있으므로 무효화
                 OBJ_GEN++;      // 바닐라가 objectives add/remove 했을 수 있음
                 invalidateScoreHandles();   // 13차: 바닐라가 scoreboard reset/remove 했을 수 있음
                 NAME_GEN++;                 // 22차: 바닐라가 /team·CustomName 을 바꿨을 수 있음
@@ -4303,6 +4412,14 @@ public final class KfcGen {
             "bossbar", "worldborder", "gamemode", "defaultgamemode", "xp", "experience",
             "clear", "item", "recipe", "fill", "setblock", "clone", "forceload",
             "effect", "enchant", "spawnpoint", "setworldspawn");
+
+    /** [진단] 명령 문자열의 첫 토큰(귀속 로그용). */
+    private static String firstToken(String c) {
+        if (c == null) return "?";
+        int sp = c.indexOf(' ');
+        String t = sp > 0 ? c.substring(0, sp) : c;
+        return t.startsWith("/") ? t.substring(1) : t;
+    }
 
     private static int classifyCommand(String command) {
         Integer c = CMD_CLASS.get(command);
@@ -4356,9 +4473,15 @@ public final class KfcGen {
     public static final int BR_ALL = 127;
     private static void bridgeReconcile(int mask) {
         if ((mask & BR_ENTITY) != 0) {          // POP: 전면(스냅샷·버킷·NBT 전부 GEN 연쇄) + interp
-            ENTITY_GEN++; INTERP_ID_MAPS.clear();
+            ENTITY_GEN++; GEN_SRC = 4; INTERP_ID_MAPS.clear();
         } else {                                 // 세분: 필요한 축만
-            if ((mask & BR_TAG) != 0) { TAG_BUCKETS.clear(); TB_EPOCH++; }
+            if ((mask & BR_TAG) != 0) {
+                TAG_BUCKETS.clear(); TB_EPOCH++;
+                if (DEBUG_TAGBUCKET) {
+                    TBD_BRTAG++;
+                    if (!GEN_SRC_NOTE.isEmpty()) TBD_TAGNOTE.merge(GEN_SRC_NOTE, 1L, Long::sum);
+                }
+            }
             if ((mask & BR_NBT) != 0) ENTITY_NBT_SNAP.clear();
             if ((mask & BR_STORAGE) != 0) INTERP_ID_MAPS.clear();
         }
@@ -4827,7 +4950,10 @@ public final class KfcGen {
             case "setblock": case "fill": case "clone":
                 return 0;
             case "tag":
-                return BR_TAG | BR_NBT;         // Tags 는 NBT 덤프에도 포함
+                // Tags 는 NBT 덤프에도 포함되므로 BR_NBT 는 항상 필요.
+                // BR_TAG(버킷 전면 폐기)는 KfcEntityTagMixin 훅이 살아 있으면 불필요하다 —
+                // /tag 도 Entity.addCommandTag/removeCommandTag 를 타므로 버킷이 증분 유지된다.
+                return TAG_HOOK_ACTIVE ? BR_NBT : (BR_TAG | BR_NBT);
             case "data": {
                 if (toks.length > 1 && toks[1].equals("get")) return 0;   // 읽기 전용
                 String tgt = toks.length > 2 ? toks[2] : "";
@@ -4898,18 +5024,41 @@ public final class KfcGen {
         }
         if (DEBUG_COHERENCE) System.out.println("[KFC] executeWithPrefix fired: /" + command);
         int m = EXT_SEL ? extMask(command) : BR_ALL;
-        if (m != 0) { EXTERNAL_MASK |= m; EXTERNAL_DIRTY = true; }
+        if (m != 0) {
+            EXTERNAL_MASK |= m; EXTERNAL_DIRTY = true;
+            if (DEBUG_TAGBUCKET && (m & (BR_ENTITY | BR_TAG)) != 0) GEN_SRC_NOTE = "cmd:" + firstToken(command) + ":mask" + m;
+        }
     }
     // /schedule 지연 함수는 CommandManager.execute 를 안 탄다(바닐라 타이머 → CommandFunctionManager.execute
     // 직행 — FunctionTimerCallback/FunctionTagTimerCallback 상수풀 확인). KfcSchedCoherenceMixin 이 그
     // 관문 HEAD 에서 이 메서드를 호출해 지연 실행 변이도 즉시 화해에 잡는다(안전망 주기 완화의 전제).
     private static boolean SCHED_LOGGED = false;
-    public static void markExternalFunction() {
+    /** 구 시그니처(함수 id 미상) — 항상 전체 무효화. 하위호환용으로만 남긴다. */
+    public static void markExternalFunction() { markExternalFunction(null); }
+
+    /**
+     * [개정] 실행되는 함수의 id 로 필요한 축만 무효화한다.
+     *
+     * <p>종전에는 무조건 {@code BR_ALL} 이었다. 그런데 이 관문은 <b>매 틱</b> 지나간다
+     * (바닐라 타이머의 /schedule 함수 등) — 실측 로그상 틱당 1회, 그때마다 태그 버킷·스냅샷·
+     * 타입 인덱스가 전부 폐기되어 엔티티 2,500여 개를 매 틱 전수 재스캔했다. 태그 버킷
+     * 재구축의 <b>단일 원인</b>이었다.
+     *
+     * <p>{@code fnMask(fid)} 는 로드된 mcfunction 원문을 ResourceManager 로 1회 읽어
+     * 명령별로 분류하고 memoize 하는 기존 분석기다({@code /function} 경로에서 이미 사용 중).
+     * 함수 본문이 전부 개체군-불변 명령이면 마스크 0 → <b>무효화 없음</b>.
+     * id 가 null 이거나 자원 부재·예외·서버 미준비면 {@code BR_ALL}(fail-closed) — 관측 동등.
+     */
+    public static void markExternalFunction(net.minecraft.util.Identifier fnId) {
         if (!SCHED_LOGGED) {
             SCHED_LOGGED = true;
             System.out.println("[KFC] scheduled-function coherence mixin active (CommandFunctionManager.execute)");
         }
-        EXTERNAL_MASK |= BR_ALL;   // 지연 함수 내용 미상 — 전체(fail-closed)
+        int m = (EXT_SEL && fnId != null) ? fnMask(fnId.toString()) : BR_ALL;
+        if (m == 0) return;                       // 개체군·태그·점수 어느 축도 못 바꿈 → 화해 불필요
+        EXTERNAL_MASK |= m;
+        if (DEBUG_TAGBUCKET && (m & (BR_ENTITY | BR_TAG)) != 0)
+            GEN_SRC_NOTE = "schedfn:" + (fnId == null ? "?" : fnId.toString()) + ":mask" + m;
         EXTERNAL_DIRTY = true;
     }
     public static void onExternalFunctionExecuted() { onExternalFunctionExecuted(BR_ALL); }
@@ -8812,7 +8961,7 @@ public static net.minecraft.entity.Entity firstEntity(
         MACRO_NORM_CACHE.clear();
 
         // ── 7) 세대/에폭/플래그 — 레지스트리 밖 셀까지 스탬프 불일치로 강제 재해소 ──
-        ENTITY_GEN++; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++;
+        ENTITY_GEN++; GEN_SRC = 6; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++;
         OBJ_TICK = MIN;
         REC_DEPTH = 0;                       // 월드가 중간에 내려가도 재귀 깊이가 새지 않게
         EXTERNAL_DIRTY = false; EXTERNAL_MASK = 0;

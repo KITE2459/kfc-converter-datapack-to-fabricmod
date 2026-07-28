@@ -1222,7 +1222,8 @@ public final class KfcGen {
     }
 
     /** @e[predicate=ns:id] / if predicate — 런타임 술어 평가(컴파일타임 JSON 부재 시).
-     *  바닐라 SELECTOR 컨텍스트(THIS_ENTITY+ORIGIN)로 LootCondition.test 호출. */
+     *  바닐라 EntitySelectorOptions 와 동일: SELECTOR 컨텍스트(THIS_ENTITY=엔티티, ORIGIN=entity.getPos()).
+     *  `execute if predicate` 는 COMMAND 컨텍스트라 testPredicateCmd 를 쓸 것. */
     private static final java.util.HashMap<String, net.minecraft.loot.condition.LootCondition>
             PREDICATE_CACHE = new java.util.HashMap<>();
 
@@ -1251,8 +1252,67 @@ public final class KfcGen {
                             .build(net.minecraft.loot.context.LootContextTypes.SELECTOR);
             net.minecraft.loot.context.LootContext lc =
                     new net.minecraft.loot.context.LootContext.Builder(wc).build(java.util.Optional.empty());
+            // 바닐라 EntitySelectorOptions 와 동일하게 재귀 가드를 등록한다(자기참조 술어 무한재귀 방지).
+            lc.markActive(net.minecraft.loot.context.LootContext.predicate(cond));
             return cond.test(lc);
         } catch (Exception ex) { return false; }
+    }
+
+    /**
+     * {@code execute if predicate <id>} 전용 — <b>바닐라 ExecuteCommand.testLootCondition 1:1 재현</b>.
+     *
+     * <p><b>[무결성 감사에서 발견]</b> 바닐라는 술어를 <b>두 가지 다른 컨텍스트</b>로 평가한다
+     * (1.21.5 바이트코드 확인):
+     * <pre>
+     *   @e[predicate=]        EntitySelectorOptions : SELECTOR, THIS_ENTITY=엔티티(require),
+     *                                                  ORIGIN=entity.getPos(), world=entity.getWorld()
+     *   execute if predicate  ExecuteCommand        : COMMAND,  THIS_ENTITY=source.getEntity()(allow),
+     *                                                  ORIGIN=source.getPosition(), world=source.getWorld()
+     * </pre>
+     * 종전에는 {@code testPredicate}(SELECTOR 판) 하나로 둘 다 처리해, {@code execute if predicate} 가
+     * <ul>
+     *   <li>컨텍스트 타입이 달랐고(COMMAND 는 THIS_ENTITY 가 <b>선택</b>, SELECTOR 는 <b>필수</b>),</li>
+     *   <li>ORIGIN 을 소스가 아니라 <b>실행자 위치</b>로 봤으며
+     *       ({@code execute as @s at <다른곳> if predicate <위치술어>} 에서 어긋남),</li>
+     *   <li>world 를 소스가 아니라 실행자 기준으로 봤고({@code execute in <차원>} 에서 어긋남),</li>
+     *   <li><b>실행자가 없는 소스</b>(커맨드블럭·콘솔·{@code as} 없는 {@code positioned})에서
+     *       무조건 {@code false} 를 반환했다 — 바닐라는 THIS_ENTITY 없이 정상 평가한다.</li>
+     * </ul>
+     */
+    public static boolean testPredicateCmd(net.minecraft.server.command.ServerCommandSource src,
+                                           String predId) {
+        if (src == null) return false;
+        net.minecraft.loot.condition.LootCondition cond = predicateOf(src, predId);
+        if (cond == null) return false;
+        try {
+            net.minecraft.loot.context.LootWorldContext wc =
+                    new net.minecraft.loot.context.LootWorldContext.Builder(src.getWorld())
+                            .add(net.minecraft.loot.context.LootContextParameters.ORIGIN, src.getPosition())
+                            .addOptional(net.minecraft.loot.context.LootContextParameters.THIS_ENTITY, src.getEntity())
+                            .build(net.minecraft.loot.context.LootContextTypes.COMMAND);
+            net.minecraft.loot.context.LootContext lc =
+                    new net.minecraft.loot.context.LootContext.Builder(wc).build(java.util.Optional.empty());
+            lc.markActive(net.minecraft.loot.context.LootContext.predicate(cond));
+            return cond.test(lc);
+        } catch (Exception ex) { return false; }
+    }
+
+    /** predId → LootCondition 해소(캐시 공용). 미해소는 null. */
+    private static net.minecraft.loot.condition.LootCondition predicateOf(
+            net.minecraft.server.command.ServerCommandSource src, String predId) {
+        net.minecraft.loot.condition.LootCondition c = PREDICATE_CACHE.get(predId);
+        if (c != null) return c;
+        try {
+            net.minecraft.util.Identifier id = idOf(predId);
+            java.util.Optional<net.minecraft.registry.entry.RegistryEntry.Reference<net.minecraft.loot.condition.LootCondition>> opt =
+                    src.getServer().getReloadableRegistries().createRegistryLookup()
+                            .getOptionalEntry(net.minecraft.registry.RegistryKey.of(
+                                    net.minecraft.registry.RegistryKeys.PREDICATE, id));
+            if (opt.isEmpty()) return null;
+            c = opt.get().value();
+            PREDICATE_CACHE.put(predId, c);
+            return c;
+        } catch (Exception ex) { return null; }
     }
 
     /** setblock <pos> <block> [replace|destroy|keep].
@@ -2345,13 +2405,13 @@ public final class KfcGen {
         return ctx.world.getOtherEntities(null, box,
                 en -> matchTagsAlive(en, tagsPos, tagsNeg) && kfcTypeIn(en, types));
     }
-    public static boolean posInBox(net.minecraft.util.math.Vec3d o, double dx, double dy, double dz,
-                                   net.minecraft.util.math.Vec3d p) {
-        double x1 = Math.min(o.x, o.x + dx), x2 = Math.max(o.x, o.x + dx) + 1;
-        double y1 = Math.min(o.y, o.y + dy), y2 = Math.max(o.y, o.y + dy) + 1;
-        double z1 = Math.min(o.z, o.z + dz), z2 = Math.max(o.z, o.z + dz) + 1;
-        return p.x >= x1 && p.x < x2 && p.y >= y1 && p.y < y2 && p.z >= z1 && p.z < z2;
-    }
+    // [무결성 감사] 점(Vec3d) 기반 posInBox 오버로드는 제거했다.
+    // 바닐라 볼륨 셀렉터(@x[x,y,z,dx,dy,dz])는 <b>엔티티 바운딩박스와 볼륨 박스의 교차</b>로
+    // 판정한다(EntitySelectorReader.createBox + box.intersects(getBoundingBox) — 바이트코드 확인).
+    // 점 기준은 발 좌표가 박스 하한 아래로 살짝 내려갈 때 오탈락한다(과거 '방장 인식' 버그의 원인).
+    // 현재 emit 의 6개 방출 지점은 전부 엔티티를 넘기므로 이 오버로드는 사용되지 않았고,
+    // 남겨두면 향후 좌표를 넘기는 경로가 생겼을 때 <b>조용히 비-바닐라</b>로 동작한다.
+    // 제거해서 그런 경로가 생기면 컴파일 에러로 즉시 드러나게 한다.
     /** x,y,z,dx,dy,dz 볼륨 셀렉터 매칭. 바닐라는 발 좌표(점)가 아니라 **엔티티 히트박스가
      *  볼륨 박스와 교차**하는지로 판정한다(EntitySelectorReader: box.intersects(getBoundingBox)).
      *  점 기준이면 카트 탑승 등으로 발 y 가 박스 하한 아래로 살짝 내려갈 때 오탈락한다(방장 인식 버그).

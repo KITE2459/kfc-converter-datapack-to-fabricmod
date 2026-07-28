@@ -267,7 +267,7 @@ def defer_passenger_sources(records: list, verbose: bool = True) -> dict:
                                f'KfcGen.passengersOf({srcv})) {{')
                     out.append(body[0])
                     out.append(f'{mg.group(1)}    ServerCommandSource {ns} = '
-                               f'{srcv}.withEntity({ne});')
+                               f'KfcGen.withEntityOnly({srcv}, {ne});')
                     out.extend(body[1:])
                     out.append(lines[close])
                     i = close + 1

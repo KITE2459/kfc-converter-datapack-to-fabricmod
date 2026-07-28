@@ -381,6 +381,25 @@ public final class KfcGen {
     // '비명령 API 직접 쓰기'(타 모드)와 memoize 된 마스크의 /reload 후 진부화만 수렴시키면 된다.
     // 더 키우면 이득은 ~0(회당 비용이 이미 분당 1회 수준)이고 그 엣지의 최악 지연만 길어진다.
     private static final int RECON_TICKS = Integer.getInteger("kfc.reconticks", 1200);
+    // ── [주기 화해 위상 분산] ────────────────────────────────────────────────
+    // 주기 안전망은 세 축(핸들/태그/이름)이 모두 RECON_TICKS 주기인데, 스탬프가 월드 시작
+    // 직후 함께 초기화되고 각자 '자기 발화 틱'에 재스탬프하므로 <b>영원히 같은 위상</b>이 된다.
+    // 결과: 60초마다 한 틱이 아래를 전부 몰아서 지불한다.
+    //   핸들 : invalidateScoreHandles(승격 Sch/Rch 947개 + 엔티티 셀 전량 재해소)
+    //          + ENTITY_NBT_SNAP.clear + INTERP_ID_MAPS.clear + EXT/FN_MASK_CACHE.clear
+    //          (마스크 캐시가 비면 다음 외부 함수 실행이 mcfunction 을 디스크에서 재독)
+    //   태그 : TAG_BUCKETS 전체 재구축 — 엔티티 2,500여 개 × 각자의 태그
+    //   이름 : ND_MAP 전량 폐기 — 팀 조회 + Text 트리 재생성
+    // '가끔 1 mspt 치솟는' 현상의 정체다(주기 60초, GC 무관).
+    //
+    // 축마다 위상을 어긋나게 주어 한 틱의 부담을 1/3 로 나눈다. 각 축은 여전히 정확히
+    // RECON_TICKS 마다 1회 발화하므로 <b>수렴 보장(최대 지연)은 종전과 동일</b>하다.
+    // -Dkfc.reconphase=off 로 종전(동일 위상) 동작 원복.
+    private static final boolean RECON_PHASE_ON =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.reconphase", "on"));
+    private static final int RECON_PHASE_HANDLE = 0;
+    private static final int RECON_PHASE_TAG    = RECON_PHASE_ON ? RECON_TICKS / 3 : 0;
+    private static final int RECON_PHASE_ND     = RECON_PHASE_ON ? (RECON_TICKS * 2) / 3 : 0;
     // [selfrec-native/B-1] 비꼬리 자기재귀: 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.
     public static int REC_DEPTH;
     /** 네이티브 재귀로 처리할 최대 깊이. 초과분은 브릿지(바닐라 큐 엔진)로 위임된다.
@@ -419,7 +438,9 @@ public final class KfcGen {
             // (믹스인이 미적용된 환경에서도 이 안전망이 최종 정합을 보장 — fail-safe.)
             // coherence 믹스인 발동이 확인돼(1회 활성 로그) 상시 dirty-flag 즉시 화해로 동작한다.
             // 여기는 함수를 거치지 않는 bare 커맨드블럭/콘솔 개입만 100틱(5초) 주기로 수렴시키는 안전망.
-            if (HANDLE_RECON_TICK == Integer.MIN_VALUE || t - HANDLE_RECON_TICK >= RECON_TICKS) {
+            if (HANDLE_RECON_TICK == Integer.MIN_VALUE) {
+                HANDLE_RECON_TICK = t - RECON_PHASE_HANDLE;   // 위상만 설정(월드 시작 직후엔 화해 불요)
+            } else if (t - HANDLE_RECON_TICK >= RECON_TICKS) {
                 HANDLE_RECON_TICK = t;
                 invalidateScoreHandles();
                 ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
@@ -851,7 +872,12 @@ public final class KfcGen {
             // TB_GEN 검사로 버킷을 무효화). 여기는 종전 안전망(플레이어 드리프트 즉시 + 개체군
             // 지문 드리프트 즉시 + 100틱 주기)만 유지 — 함수 밖 bare /tag·콘솔 개입 수렴용.
             // (24차의 매 틱 무조건 clear 는 성능 회복 위해 철회.)
-            boolean reconDue = (TB_RECON_TICK == Integer.MIN_VALUE || tk - TB_RECON_TICK >= RECON_TICKS);
+            boolean reconDue;
+            if (TB_RECON_TICK == Integer.MIN_VALUE) {
+                TB_RECON_TICK = tk - RECON_PHASE_TAG; reconDue = false;   // 위상 분산
+            } else {
+                reconDue = (tk - TB_RECON_TICK >= RECON_TICKS);
+            }
             if (drift || popDrift || reconDue) {
                 TB_RECON_TICK = tk;
                 TAG_BUCKETS.clear(); TB_EPOCH++;
@@ -2858,9 +2884,10 @@ public final class KfcGen {
             // 콘솔/OP 의 훅 밖 개입은 100틱(5초) 주기 화해로 수렴 — 13/14차와 동일한 편차 축.
             if (ND_TICK != tk) {
                 ND_TICK = tk;
-                if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= RECON_TICKS) {
-                    ND_RECON_TICK = tk;
-                    ND_MAP.clear();
+                if (ND_RECON_TICK == Integer.MIN_VALUE) {
+                    ND_RECON_TICK = tk - RECON_PHASE_ND;      // 위상 분산
+                } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
+                    ND_RECON_TICK = tk; ND_MAP.clear();
                 }
             }
             if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
@@ -3443,7 +3470,9 @@ public final class KfcGen {
         int tk = sv.getTicks();
         if (ND_TICK != tk) {
             ND_TICK = tk;
-            if (ND_RECON_TICK == Integer.MIN_VALUE || tk - ND_RECON_TICK >= RECON_TICKS) {
+            if (ND_RECON_TICK == Integer.MIN_VALUE) {
+                ND_RECON_TICK = tk - RECON_PHASE_ND;          // 위상 분산
+            } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
                 ND_RECON_TICK = tk; ND_MAP.clear();
             }
         }
@@ -5255,8 +5284,12 @@ public final class KfcGen {
     // 직행 — FunctionTimerCallback/FunctionTagTimerCallback 상수풀 확인). KfcSchedCoherenceMixin 이 그
     // 관문 HEAD 에서 이 메서드를 호출해 지연 실행 변이도 즉시 화해에 잡는다(안전망 주기 완화의 전제).
     private static boolean SCHED_LOGGED = false;
-    /** 구 시그니처(함수 id 미상) — 항상 전체 무효화. 하위호환용으로만 남긴다. */
+    /** @deprecated 구 시그니처(함수 id 미상) — 항상 전체 무효화(BR_ALL). 하위호환용.
+     *  이 오버로드가 실제로 호출되면 B1(태그 버킷 증분)이 무력화되므로 1회 경고를 남긴다. */
+    @Deprecated
     public static void markExternalFunction() { markExternalFunction(null); }
+
+    private static boolean SCHED_NULLID_WARNED = false;
 
     /**
      * [개정] 실행되는 함수의 id 로 필요한 축만 무효화한다.
@@ -5275,6 +5308,13 @@ public final class KfcGen {
         if (!SCHED_LOGGED) {
             SCHED_LOGGED = true;
             System.out.println("[KFC] scheduled-function coherence mixin active (CommandFunctionManager.execute)");
+        }
+        if (fnId == null && !SCHED_NULLID_WARNED) {
+            SCHED_NULLID_WARNED = true;
+            System.out.println("[KFC] *** 경고: markExternalFunction(null) — 함수 id 가 전달되지 않았습니다.");
+            System.out.println("[KFC]     원인: 빌드에 포함된 KfcSchedCoherenceMixin 이 구버전(무인자 호출)입니다.");
+            System.out.println("[KFC]     결과: 매 틱 BR_ALL 무효화 → 태그 버킷/스냅샷/타입인덱스 전체 재구축(B1 무력화).");
+            System.out.println("[KFC]     조치: 빌드 소스의 KfcSchedCoherenceMixin.java 가 function.id() 를 넘기는지 확인하세요.");
         }
         int m = (EXT_SEL && fnId != null) ? fnMask(fnId.toString()) : BR_ALL;
         if (m == 0) return;                       // 개체군·태그·점수 어느 축도 못 바꿈 → 화해 불필요

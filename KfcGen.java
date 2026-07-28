@@ -404,6 +404,41 @@ public final class KfcGen {
     private static final int RECON_PHASE_HANDLE = 0;
     private static final int RECON_PHASE_TAG    = RECON_PHASE_ON ? RECON_TICKS / 3 : 0;
     private static final int RECON_PHASE_ND     = RECON_PHASE_ON ? (RECON_TICKS * 2) / 3 : 0;
+
+    // ── [주기 화해 자체를 없앤다 — 조건부 안전망] ───────────────────────────────
+    // 위상 분산은 '한 틱에 몰리는 것'만 막았을 뿐, 60초마다 세 번의 스파이크는 그대로 남는다.
+    // 그런데 이 주기가 실제로 필요한 잔여 범위를 따져보면 거의 비어 있다:
+    //   · 모든 명령(플레이어 채팅·커맨드블럭·콘솔·사인·/function·타 데이터팩·우리 브릿지)은
+    //     CommandManager.execute(ParseResults,String) 를 지나고, KfcFuncCoherenceMixin 이 그
+    //     HEAD 에서 dirty 플래그를 세워 다음 네이티브 접근에 즉시 화해한다.
+    //   · 우리 자신의 변이는 전부 명시적 훅(invalidateSnapshot/NAME_GEN/버킷 증분)을 거친다.
+    //   · 바닐라가 스스로 만드는 변화(스폰/디스폰/청크 로드)는 태그 버킷의 '개체군 지문' 대조와
+    //     엔티티 스냅샷의 (age, ENTITY_GEN) 키가 매 틱 잡는다.
+    //   · /reload 진부화는 END_DATA_PACK_RELOAD → resetAll() 이 전량 폐기로 처리한다.
+    // 남는 것은 '명령을 거치지 않고 API 로 직접 쓰는 타 모드'와 '믹스인 미적용' 두 경우뿐이다.
+    // 그래서 기본을 auto 로 두고, 즉시 화해 경로가 살아 있는 것이 확인되면(CommandManager 훅이
+    // 부팅 시 실제로 붙음) 주기 안전망을 아예 돌리지 않는다 → 60초 주기 스파이크가 사라진다.
+    //   -Dkfc.recon=auto(기본) | on(항상 켬) | off(항상 끔)
+    private static final String RECON_MODE = System.getProperty("kfc.recon", "auto");
+    private static boolean COHERENCE_LIVE = false;
+    private static boolean RECON_LOGGED = false;
+
+    /** KfcFuncCoherenceMixin 이 CommandManager 생성 시(부팅/리로드) 호출 — 즉시 화해 경로 확인. */
+    public static void markCoherenceApplied() { COHERENCE_LIVE = true; }
+
+    /** 주기 안전망을 이번에 돌려야 하는가. auto = 즉시 화해가 살아 있으면 불필요. */
+    private static boolean reconEnabled() {
+        boolean on;
+        if ("off".equalsIgnoreCase(RECON_MODE))      on = false;
+        else if ("on".equalsIgnoreCase(RECON_MODE))  on = true;
+        else                                          on = !COHERENCE_LIVE;   // auto
+        if (!RECON_LOGGED) {
+            RECON_LOGGED = true;
+            System.out.println("[KFC] 주기 화해 안전망 = " + (on ? "ON" : "OFF")
+                    + " (mode=" + RECON_MODE + ", 즉시화해=" + (COHERENCE_LIVE ? "live" : "미확인") + ")");
+        }
+        return on;
+    }
     // [selfrec-native/B-1] 비꼬리 자기재귀: 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.
     public static int REC_DEPTH;
     /** 네이티브 재귀로 처리할 최대 깊이. 초과분은 브릿지(바닐라 큐 엔진)로 위임된다.
@@ -448,10 +483,12 @@ public final class KfcGen {
                 HANDLE_RECON_TICK = t - RECON_PHASE_HANDLE;   // 위상만 설정(월드 시작 직후엔 화해 불요)
             } else if (t - HANDLE_RECON_TICK >= RECON_TICKS) {
                 HANDLE_RECON_TICK = t;
+                if (reconEnabled()) {
                 invalidateScoreHandles();
                 ENTITY_NBT_SNAP.clear();   // 무틱 엔티티(marker) NBT 스냅샷 외부 변이 화해
                 INTERP_ID_MAPS.clear();   // [P2] interp identity 층 — API 직접 쓰기 수렴(안전망 동일 축)
                 EXT_MASK_CACHE.clear(); FN_MASK_CACHE.clear();   // [v2] /reload 후 마스크 진부화 수렴
+                }
             }
             snapBarrierAll();   // 23차: 틱 경계 — 이전 틱의 미실체화 스냅샷을 콘솔 개입 전에 확정
         }
@@ -891,6 +928,8 @@ public final class KfcGen {
                 TB_RECON_TICK = tk - RECON_PHASE_TAG; reconDue = false;   // 위상 분산
             } else {
                 reconDue = (tk - TB_RECON_TICK >= RECON_TICKS);
+                // 안전망 비활성(즉시 화해가 살아 있음)이면 스탬프만 밀고 재구축은 생략.
+                if (reconDue && !reconEnabled()) { TB_RECON_TICK = tk; reconDue = false; }
             }
             if (drift || popDrift || reconDue) {
                 TB_RECON_TICK = tk;
@@ -2169,90 +2208,34 @@ public final class KfcGen {
         SCHED_BY_KEY.computeIfAbsent(fnId, k -> new java.util.ArrayList<>(2)).add(e);
     }
 
-    // ── 변환 tick 함수 디스패치 지점 (바닐라 정합) ───────────────────────────
-    // 바닐라 #minecraft:tick 함수는 MinecraftServer.tickWorlds 안 commandFunctions 단계에서,
-    // 즉 networkHandler.disableFlush() 로 flush 가 억제된 구간 안에서 실행된다. 그래서 tick
-    // 함수가 만든 패킷은 같은 틱의 엔티티 위치 동기화와 한 배치로 전달된다.
-    // Fabric 의 START_SERVER_TICK 은 tickWorlds '호출 직전'(= disableFlush 이전)이라 그 배치에
-    // 들어가지 못하고 개별 flush 되어, 고속 이동 중 사운드가 이전 틱 위치 기준으로 공간화되는
-    // 편차를 만들었다. KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서 이 훅을
-    // 호출해 바닐라와 같은 자리에서 디스패치한다.
+    // ── 변환 tick 함수 디스패치 (바닐라 정합) ─────────────────────────────
+    // 실행 지점은 '변환 시점'에 하나로 확정된다 — 런타임 분기/모드 전환이 없다.
+    //   function (기본): KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서 아래
+    //     runTickHook 을 호출한다. 바닐라 #minecraft:tick 함수와 같은 자리라, 여기서 만든
+    //     패킷이 disableFlush 구간에 들어가 같은 틱의 엔티티 위치 동기화와 한 배치로 나간다.
+    //   serverstart(--onserverstart): 진입점이 START_SERVER_TICK 에 본문을 직접 등록하고,
+    //     KfcTickPointMixin 은 산출물에 포함조차 되지 않는다. 아래 훅은 호출되지 않는다.
+    // [입력 지연] 두 지점 사이에는 ticks++ / tickManager.step() / disableFlush 뿐이고 서버
+    // 실행자 큐를 비우는 지점이 없다. 입력 패킷은 forceMainThread → executeSync 로 큐에 쌓여
+    // runTasksTillTickEnd(= 틱 사이)에 적용되므로 두 지점은 같은 입력 상태를 본다 —
+    // 조작 반영 지연 차이는 없고, 달라지는 것은 출력 패킷의 묶음/시점뿐이다.
     private static java.util.function.Consumer<net.minecraft.server.MinecraftServer> TICK_HOOK;
-    private static net.minecraft.server.MinecraftServer TICK_SERVER;
-    private static long TICK_LAST = Long.MIN_VALUE;
-    private static boolean TICK_POINT_SEEN = false;
+    private static boolean TICK_POINT_APPLIED = false;
 
-    // ── tick 실행 지점 선택 ────────────────────────────────────────────────
-    //  function    (기본) : CommandFunctionManager.tick — 바닐라 데이터팩과 완전히 같은 자리.
-    //                        tick 함수가 만든 패킷이 disableFlush 구간에 들어가 같은 틱의 엔티티
-    //                        위치 동기화와 한 배치로 전달된다.
-    //  serverstart        : Fabric START_SERVER_TICK — tickWorlds 호출 직전(= disableFlush 이전).
-    //                        패킷이 즉시 개별 flush 되어 위치 동기화보다 먼저 나간다.
-    //  [입력 지연] 두 지점 사이에는 ticks++ / tickManager.step() / disableFlush 뿐이고 서버
-    //  실행자 큐를 비우는 지점이 없다. 플레이어 입력 패킷은 forceMainThread → executeSync 로
-    //  큐에 쌓여 runTasksTillTickEnd(= 틱 사이)에서 적용되므로, 두 지점 모두 '직전 틱까지의
-    //  입력이 반영된 동일 상태'를 본다 → 조작 반영 지연 차이는 없다. 차이는 출력 패킷의
-    //  묶음/시점뿐이다.
-    //  변환 시 기본값은 ModEntry 가 주입하고, 런타임에 -Dkfc.tickpoint=function|serverstart 로
-    //  덮어쓸 수 있다(재변환 없이 A/B 비교용).
-    private static final String TICK_POINT_PROP = System.getProperty("kfc.tickpoint", "");
-    private static boolean TICK_AT_SERVER_START = false;
-
-    /** 진입점(ModEntry)이 부팅 시 1회 호출 — 변환 시 결정된 기본 지점을 주입한다.
-     *  시스템 프로퍼티가 지정돼 있으면 그쪽이 우선. */
-    public static void setTickPointServerStart(boolean generatedDefault) {
-        if ("serverstart".equalsIgnoreCase(TICK_POINT_PROP))      TICK_AT_SERVER_START = true;
-        else if ("function".equalsIgnoreCase(TICK_POINT_PROP))    TICK_AT_SERVER_START = false;
-        else                                                       TICK_AT_SERVER_START = generatedDefault;
-        System.out.println("[KFC] tick 실행 지점 = "
-                + (TICK_AT_SERVER_START ? "serverstart (START_SERVER_TICK)"
-                                        : "function (CommandFunctionManager.tick — 바닐라 동일)"));
-    }
-    public static boolean tickAtServerStart() { return TICK_AT_SERVER_START; }
-
-    /** START_SERVER_TICK 리스너용 — serverstart 모드일 때만 디스패치한다. */
-    public static void dispatchTickAtServerStart(net.minecraft.server.MinecraftServer server) {
-        if (!TICK_AT_SERVER_START) return;
-        setTickServer(server);
-        dispatchTick(server);
-    }
-
-    /** 진입점(ModEntry)이 부팅 시 1회 등록. server 는 SERVER_STARTED 에서 채워진다. */
+    /** 진입점(ModEntry)이 부팅 시 1회 등록(function 모드 전용). */
     public static void setTickHook(java.util.function.Consumer<net.minecraft.server.MinecraftServer> hook) {
         TICK_HOOK = hook;
     }
-    public static void setTickServer(net.minecraft.server.MinecraftServer server) {
-        if (TICK_SERVER == server) return;      // 멱등 — 폴백 경로가 매 틱 호출해도 중복판정 유지
-        TICK_SERVER = server;
-        TICK_LAST = Long.MIN_VALUE;             // 새 서버(월드 재입장) = 틱 카운터 리셋
-    }
-    /** 믹스인이 실제로 적용됐는지(= 바닐라 지점 디스패치가 살아 있는지). 진입점 폴백 판단용. */
-    public static boolean tickPointApplied() { return TICK_POINT_SEEN; }
 
-    /** KfcTickPointMixin 이 바닐라 tick 함수 지점에서 호출. 틱당 1회만 디스패치한다. */
-    public static void runTickHook() {
-        TICK_POINT_SEEN = true;
-        if (TICK_AT_SERVER_START) return;   // serverstart 모드 — START_SERVER_TICK 이 이미 처리
-        dispatchTick(TICK_SERVER);
-    }
+    /** KfcTickPointMixin 생성자 훅 — 주입 성공 신호(부팅·/reload 시 1회). */
+    public static void markTickPointApplied() { TICK_POINT_APPLIED = true; }
+    public static boolean tickPointApplied() { return TICK_POINT_APPLIED; }
 
-    private static boolean TICK_FALLBACK_WARNED = false;
-
-    /** 폴백(믹스인 미적용 시) 진입점이 호출 — 이미 이번 틱에 돌았으면 무시. */
-    public static void dispatchTick(net.minecraft.server.MinecraftServer server) {
-        if (server == null || TICK_HOOK == null) return;
-        if (!TICK_POINT_SEEN && !TICK_AT_SERVER_START && !TICK_FALLBACK_WARNED) {
-            TICK_FALLBACK_WARNED = true;
-            System.out.println("[KFC] *** 경고: KfcTickPointMixin 미적용 — tick 함수를 "
-                    + "END_SERVER_TICK 폴백에서 실행합니다(바닐라보다 늦은 시점, flush 배치 밖). "
-                    + "믹스인 충돌 여부를 확인하세요.");
-        }
+    /** KfcTickPointMixin 이 바닐라 tick 함수 지점에서 매 틱 호출. */
+    public static void runTickHook(net.minecraft.server.MinecraftServer server) {
         // 바닐라 CommandFunctionManager.tick 은 shouldTick() 이 거짓이면(/tick freeze 등)
-        // tick 태그 함수를 아예 돌리지 않는다 — 동일 조건을 재현한다.
+        // tick 태그 함수를 돌리지 않는다. TAIL 주입은 그 분기 밖이라 같은 조건을 재현한다.
         if (!server.getTickManager().shouldTick()) return;
-        long t = server.getTicks();
-        if (t == TICK_LAST) return;      // 같은 틱 중복 디스패치 방지
-        TICK_LAST = t;
         TICK_HOOK.accept(server);
     }
 
@@ -3109,7 +3092,8 @@ public final class KfcGen {
                 if (ND_RECON_TICK == Integer.MIN_VALUE) {
                     ND_RECON_TICK = tk - RECON_PHASE_ND;      // 위상 분산
                 } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
-                    ND_RECON_TICK = tk; ND_MAP.clear();
+                    ND_RECON_TICK = tk;
+                    if (reconEnabled()) ND_MAP.clear();
                 }
             }
             if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
@@ -3696,7 +3680,8 @@ public final class KfcGen {
             if (ND_RECON_TICK == Integer.MIN_VALUE) {
                 ND_RECON_TICK = tk - RECON_PHASE_ND;          // 위상 분산
             } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
-                ND_RECON_TICK = tk; ND_MAP.clear();
+                ND_RECON_TICK = tk;
+                if (reconEnabled()) ND_MAP.clear();
             }
         }
         if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {

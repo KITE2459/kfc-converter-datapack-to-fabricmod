@@ -43,6 +43,9 @@ public class KfcFuncCoherenceMixin {
     // 실행되면 CommandManager 로의 메서드 주입 자체가 성공했다는 뜻. SCS 처럼 1회만 로그.
     @Inject(method = "<init>", at = @At("TAIL"), require = 0)
     private void kfc$logApply(CallbackInfo ci) {
+        // 이 훅이 붙었다 = 모든 명령이 execute 훅으로 즉시 화해된다는 뜻. KfcGen 은 이 신호를
+        // 받으면 60초 주기 안전망(핸들/태그버킷/이름 전량 폐기)을 돌리지 않는다(-Dkfc.recon=auto).
+        __KFC_GROUP__.generated.KfcGen.markCoherenceApplied();
         if (!kfc$applyLogged) {
             kfc$applyLogged = true;
             System.out.println("[KFC] mixin apply-check: FuncCoherence(CommandManager) = APPLIED (execute hooks installed)");

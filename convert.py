@@ -950,7 +950,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     #     가 동일 템플릿 디렉토리를 스캔해 목록을 맞춘다).
     #   - 치환: __KFC_GROUP__ 플레이스홀더(KfcGen 등 그룹 참조) + 패키지 라인.
     mixin_dir = src_root / Path(*f"{group}.mixin".split("."))
-    _mixin_templates = sorted(Path(__file__).parent.glob("Kfc*Mixin.java"))
+    _mixin_templates = _mixin_template_paths()
     if _mixin_templates:
         mixin_dir.mkdir(parents=True, exist_ok=True)
         for _mx_path in _mixin_templates:
@@ -1445,6 +1445,18 @@ def fid_to_fqcn(fid: str, group: str) -> str:
 TICK_AT_SERVER_START = False
 
 
+def _mixin_template_paths() -> list:
+    """산출물에 넣을 Kfc*Mixin.java 템플릿 목록.
+
+    KfcTickPointMixin 은 tick 실행 지점이 'function'(기본)일 때만 필요하다.
+    --onserverstart 로 변환하면 진입점이 START_SERVER_TICK 에 직접 등록하므로, 이 믹스인이
+    남아 있으면 매 틱 아무 일도 안 하는 훅 호출만 늘어난다 → 아예 복사/등록하지 않는다."""
+    paths = sorted(Path(__file__).parent.glob("Kfc*Mixin.java"))
+    if TICK_AT_SERVER_START:
+        paths = [q for q in paths if q.stem != "KfcTickPointMixin"]
+    return paths
+
+
 def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set):
     """ModInitializer 진입점 생성. tick -> 바닐라 함수 tick 지점(기본) 또는 START_SERVER_TICK.
        load 함수는 데이터팩 load 태그(#minecraft:tags/function/load)가 바닐라 시맨틱으로 담당하므로
@@ -1454,8 +1466,35 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
         tick_calls.append(f"            {fid_to_fqcn(fid, group)}.executeReturn(src);")
     tick_body = "\n".join(tick_calls) if tick_calls else "            // (tick 함수 없음)"
 
-    tick_default_js = "true" if TICK_AT_SERVER_START else "false"
+    # tick 등록부는 '변환 시점에 확정된 한 경로'만 생성한다 — 런타임 분기 없음.
+    _body = (f"            ServerCommandSource src = server.getCommandSource().withSilent();\n"
+             f"{tick_body}\n"
+             f"            {group}.generated.KfcGen.tickNativeSchedule(server);")
+    if TICK_AT_SERVER_START:
+        tick_registration = f"""        // [tick 실행 지점 = serverstart] Fabric START_SERVER_TICK — tickWorlds 호출 직전.
+        //   바닐라 #tick 함수 자리(disableFlush 구간)보다 이르며, 여기서 만든 패킷은 같은 틱의
+        //   엔티티 위치 동기화보다 먼저 개별 flush 된다. (--onserverstart 로 변환됨)
+        //   바닐라는 tickManager.shouldTick() 이 거짓이면 tick 함수를 돌리지 않는다 — 동일 재현.
+        ServerTickEvents.START_SERVER_TICK.register(server -> {{
+            if (!server.getTickManager().shouldTick()) return;
+{_body}
+        }});"""
+    else:
+        tick_registration = f"""        // [tick 실행 지점 = function] KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서
+        //   아래 훅을 호출한다 — 바닐라 #minecraft:tick 함수와 완전히 같은 자리(disableFlush 구간
+        //   안이라 같은 틱의 위치 동기화와 한 배치로 전달). ServerTickEvents 는 쓰지 않는다.
+        {group}.generated.KfcGen.setTickHook(server -> {{
+{_body}
+        }});
+        // 주입 확인(부팅 1회) — 실패 시 조용히 아무것도 안 도는 상태를 즉시 알린다.
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> {{
+            if (!{group}.generated.KfcGen.tickPointApplied())
+                System.out.println("[KFC] *** 치명: KfcTickPointMixin 미적용 — tick 함수가 "
+                        + "실행되지 않습니다. 믹스인 충돌을 확인하세요.");
+        }});"""
 
+    tick_import = ("import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;\n"
+                   if TICK_AT_SERVER_START else "")
     n_load = len(tags.get("load", []))
     load_note = (f" *  - load 태그 함수 {n_load}개 -> 데이터팩 load 태그가 담당(자바 진입점 미관여)\n"
                  if n_load else "")
@@ -1463,8 +1502,7 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
     code = f"""package {group};
 
 import net.fabricmc.api.ModInitializer;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+{tick_import}import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.command.CommandManager;
@@ -1522,36 +1560,7 @@ public final class ModEntry implements ModInitializer {{
         ServerLifecycleEvents.END_DATA_PACK_RELOAD.register(
                 (server, resourceManager, success) -> {group}.generated.KfcGen.resetAll("datapack-reload"));
 
-        // [tick 실행 지점]
-        //   function(기본) : 바닐라 #minecraft:tick 함수와 같은 자리(CommandFunctionManager.tick).
-        //     바닐라는 MinecraftServer.tickWorlds 안 commandFunctions 단계에서 tick 함수를 돌리는데,
-        //     이 구간은 networkHandler.disableFlush() 로 flush 가 억제돼 있어 tick 함수가 만든
-        //     패킷이 같은 틱의 엔티티 위치 동기화와 한 배치로 전달된다.
-        //   serverstart    : Fabric START_SERVER_TICK(= tickWorlds 호출 직전, disableFlush 이전).
-        //     패킷이 즉시 개별 flush 되어 위치 동기화보다 먼저 나간다.
-        //   입력 반영 시점은 두 지점이 동일하다(둘 사이에 서버 실행자 큐를 비우는 지점이 없음)
-        //   — 조작 지연 차이는 없고, 달라지는 것은 출력 패킷의 묶음/시점뿐이다.
-        //   런타임에 -Dkfc.tickpoint=function|serverstart 로 덮어쓸 수 있다(재변환 없이 A/B).
-        {group}.generated.KfcGen.setTickPointServerStart({tick_default_js});
-        {group}.generated.KfcGen.setTickHook(server -> {{
-            ServerCommandSource src = server.getCommandSource().withSilent();
-{tick_body}
-            {group}.generated.KfcGen.tickNativeSchedule(server);
-        }});
-        ServerLifecycleEvents.SERVER_STARTED.register(
-                server -> {group}.generated.KfcGen.setTickServer(server));
-        // serverstart 모드 디스패치(해당 모드가 아니면 무동작).
-        ServerTickEvents.START_SERVER_TICK.register(
-                server -> {group}.generated.KfcGen.dispatchTickAtServerStart(server));
-        // 안전망: function 모드인데 믹스인이 적용되지 않은 환경에서도 틱당 1회는 반드시 돈다.
-        //   정상 환경에선 runTickHook 이 먼저 처리하므로 여기서는 중복 없이 무시된다.
-        ServerTickEvents.END_SERVER_TICK.register(server -> {{
-            if (!{group}.generated.KfcGen.tickAtServerStart()
-                    && !{group}.generated.KfcGen.tickPointApplied()) {{
-                {group}.generated.KfcGen.setTickServer(server);
-                {group}.generated.KfcGen.dispatchTick(server);
-            }}
-        }});
+{tick_registration}
         CommandRegistrationCallback.EVENT.register(
                 (dispatcher, registryAccess, environment) -> register(dispatcher));
     }}
@@ -1599,7 +1608,7 @@ def write_resources(out_root: Path, group: str, tags: dict, datapack_root=None):
     # 크래시 없이 바닐라 경로 유지(fail-safe: 최적화·화해만 소실, KfcGen 안전망이 정합 보장).
     # 25차: 목록을 convert.py 옆 Kfc*Mixin.java 템플릿에서 동적 수집 — 존재하지 않는 클래스를
     # 나열해 로딩 에러가 나던 것을 방지하고(과거 KfcPerfMixin 부재 시), 새 믹스인 자동 반영.
-    _mixin_names = sorted(p.stem for p in Path(__file__).parent.glob("Kfc*Mixin.java"))
+    _mixin_names = sorted(q.stem for q in _mixin_template_paths())
     mixins_json = {
         "required": False,
         "package": f"{group}.mixin",

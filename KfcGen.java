@@ -6401,6 +6401,44 @@ public static net.minecraft.entity.Entity nearestEntity(
         return all.size() <= n ? all : all.subList(0, n);
     }
 
+    /** [바닐라 술어 평가 시점 재현] 셀렉터 술어를 <b>본문 실행 전</b>에 전부 적용해 후보를 확정한다.
+     *
+     *  <p>바닐라 {@code EntitySelector.getEntities} 는 월드를 훑으며 {@code basePredicate} 를
+     *  <b>수집 시점에</b> 평가해 리스트를 만든 뒤, {@code execute as} 가 그 리스트를 순회한다.
+     *  즉 <b>모든 술어 평가가 어떤 본문보다 먼저</b> 끝난다.
+     *
+     *  <p>종전 생성 코드는 술어를 루프 본문 첫 줄의 {@code continue} 가드로 놓았다:
+     *  <pre>
+     *    for (Entity e : 후보) { if (!scoreMatches(e,…)) continue; 본문(e); }
+     *  </pre>
+     *  후보 목록 자체는 스냅샷이지만 <b>술어는 지연 평가</b>된다. 앞 엔티티의 본문이 뒤 엔티티의
+     *  점수/태그/NBT/팀 을 바꾸면 판정이 뒤집혀 바닐라와 결과 집합이 갈린다 — 양방향으로:
+     *  <ul>
+     *    <li>바닐라는 포함했는데 변환본은 <b>누락</b>(본문이 범위 밖으로 밀어냄)</li>
+     *    <li>바닐라는 제외했는데 변환본은 <b>추가 실행</b>(본문이 범위 안으로 끌어옴)</li>
+     *  </ul>
+     *  {@code limit=} 경로는 이미 {@code nearestN*} 의 {@code extra} 람다로 수집 시점 평가라
+     *  정상이었고, <b>limit 없는 다중 대상 경로만</b> 이 결함에 노출됐다.
+     *
+     *  <p>비용: 술어 평가 <b>횟수는 동일</b>(엔티티당 1회)하고 작은 ArrayList 하나가 추가될 뿐이다.
+     *  게다가 {@code random_chance} 같은 부수효과(RNG 소비) 술어의 평가 순서·횟수도 보존된다.
+     *  emit 은 점수/predicate/nbt/team/level/name/advancements/rotation 처럼 <b>본문이 바꿀 수
+     *  있는 술어가 실제로 있을 때만</b> 이 래퍼를 씌운다(태그만 있는 고빈도 경로는 종전 유지).
+     *
+     *  <p>제네릭인 이유: {@code ctx.allPlayers} 는 {@code List<ServerPlayerEntity>} 라
+     *  {@code Iterable<Entity>} 로 받으면 제네릭 불변성 때문에 컴파일되지 않는다.
+     *  덤으로 {@code ctx.allPlayers} 는 {@code PlayerManager.getPlayerList()} 의 <b>라이브
+     *  참조</b>이므로, 본문에서 플레이어가 나가면 종전 경로는 CME 위험이 있었다 — 스냅샷이
+     *  이것도 함께 없앤다(바닐라도 자기 리스트를 새로 만든다). */
+    public static <T extends net.minecraft.entity.Entity> java.util.List<T> selSnapshot(
+            Iterable<T> src, java.util.function.Predicate<? super T> p) {
+        java.util.ArrayList<T> out = new java.util.ArrayList<>();
+        for (T e : src) {
+            if (p.test(e)) out.add(e);
+        }
+        return out;
+    }
+
     public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {

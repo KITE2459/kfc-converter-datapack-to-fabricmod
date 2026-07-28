@@ -3027,15 +3027,53 @@ def _limit_extra_lambda(sel):
     return f', _pe -> ({" && ".join(_order_guards(g))})'
 
 
+_ITER_RE = re.compile(r'^(\s*for \(net\.minecraft\.entity\.Entity )(\w+)( : )(.+)(\) \{)$')
+_SKIP_RE = re.compile(r'^\s*if \((.+)\) continue;$')
+
+
+def _snapshot_iterable(open_lines, mut_conds, var: str):
+    """루프 오프너의 이터러블을 KfcGen.selSnapshot(…, _pe -> (…)) 으로 감싸,
+       가변 술어를 **본문 실행 전**(바닐라 수집 시점)에 전부 평가하게 만든다.
+
+       바닐라 EntitySelector.getEntities 는 basePredicate 를 수집 시점에 적용해 리스트를
+       확정한 뒤 execute as 가 그 리스트를 순회한다. 반면 continue-가드는 지연 평가라
+       앞 엔티티의 본문이 뒤 엔티티의 점수/태그/NBT/팀을 바꾸면 판정이 뒤집힌다.
+
+       open_lines[1:] 의 타입 제외 가드(`if (X) continue;`)도 같이 끌어올려, 술어 평가
+       순서와 횟수를 보존한다(random_chance 처럼 RNG 를 소비하는 술어가 있으면 중요).
+       오프너 형태가 예상과 다르면 종전 continue 형태로 안전 폴백."""
+    m = _ITER_RE.match(open_lines[0])
+    if m is None:
+        return list(open_lines) + [f'    if (!({c})) continue;' for c in _order_guards(mut_conds)]
+    head, v, mid, iterable, tail = m.groups()
+    pre, rest = [], []
+    for ln in open_lines[1:]:
+        sm = _SKIP_RE.match(ln)
+        if sm:
+            pre.append(f'!({sm.group(1)})')
+        else:
+            rest.append(ln)
+    lam = " && ".join(pre + _order_guards(mut_conds))
+    lam = re.sub(rf'\b{re.escape(v)}\b', '_pe', lam)
+    return [f'{head}{v}{mid}KfcGen.selSnapshot({iterable}, _pe -> ({lam})){tail}'] + rest
+
+
 def _loop_with_guards(open_lines, sel, var: str):
-    """@e 루프 오프너 뒤에 scores/predicates 가드(`if (!c) continue;`)를 덧붙인다.
+    """@e 루프 오프너에 scores/predicates + extra 술어를 부착한다.
+       가변 술어가 있으면 continue-가드가 아니라 **수집 시점 스냅샷**으로 감싼다
+       (바닐라 술어 평가 시점 재현 — _snapshot_iterable 참조).
        predicate 미해소면 None(폴백)."""
+    global _LIMIT_LAMBDA_CONSUMED_EXTRA
     if open_lines is None:
         return None
     g = _loop_score_pred_conds(sel, var)
     if g is None:
         return None
-    return list(open_lines) + [f'    if (!({c})) continue;' for c in _order_guards(g)]
+    g = list(g) + _selector_extra_conds(sel, var)
+    if not g:
+        return list(open_lines)
+    _LIMIT_LAMBDA_CONSUMED_EXTRA = True   # entity_loop_open 이 extra 를 중복 부착하지 않도록
+    return _snapshot_iterable(open_lines, g, var)
 
 
 def entity_loop_open(sel, var):
@@ -3056,10 +3094,18 @@ def entity_loop_open(sel, var):
 
 def _entity_loop_open_core(sel, var: str):
     """셀렉터 -> 'for (Entity var : ...) {' 여는 줄들. @a/@e 지원. 못하면 None."""
+    global _LIMIT_LAMBDA_CONSUMED_EXTRA
     tp = jarr_tags(sel.tags_pos); tn = jarr_tags(sel.tags_neg)
     lo, hi = sel.distance if sel.distance else (None, None)
     dmin = _dist_arg(lo); dmax = _dist_arg(hi)
     if sel.base == "a":
+        # [무결성] @a 분기는 limit= 절단을 구현하지 않는다. 종전에는 이를 조용히 무시해
+        # limit=N 이 전체 플레이어 루프로 전개될 수 있었다(바닐라는 N명만).
+        # 이 팩은 @a/@p limit 이 전부 1 이라 호출부의 single_entity_expr 가 먼저 잡아
+        # 실제 발현은 없었지만, 다른 데이터팩에선 즉시 어긋난다.
+        # -> None 폴백(단일 식 또는 바닐라 브릿지로 해소)으로 fail-safe.
+        if sel.limit:
+            return None
         if sel.sort in ("nearest", "furthest"):
             # sort=nearest/furthest — origin(현재 source 위치, at 으로 rebind 됨) 기준 정렬 순회.
             # 순위 부여(거리순 max 증가) 알고리즘에서 정렬 순서가 결과를 좌우한다.
@@ -3085,6 +3131,15 @@ def _entity_loop_open_core(sel, var: str):
         if _sp is None:
             return None
         conds += _sp
+        # 본문이 바꿀 수 있는 술어(scores/predicate + team/level/name/nbt/advancements/rotation)가
+        # 있으면 수집 시점 스냅샷으로 전환한다 — continue-가드는 앞 엔티티의 본문 결과에
+        # 뒤 엔티티의 판정이 오염된다(바닐라는 모든 술어를 본문보다 먼저 평가).
+        # tag/distance/gamemode 만인 고빈도 경로는 종전 continue 유지(할당 없음).
+        _ex = _selector_extra_conds(sel, var)
+        if _sp or _ex:
+            conds += _ex
+            _LIMIT_LAMBDA_CONSUMED_EXTRA = True
+            return _snapshot_iterable(out, conds, var)
         if conds:
             out.append(f'    if (!({" && ".join(_order_guards(conds))})) continue;')
         return out
@@ -6323,7 +6378,10 @@ def parse_modifiers(head: list[dict], src_var: str = "source"):
                     # 술어는 location_check/weather/position 등 위치·문맥 의존 조건을 담을 수 있으므로
                     # execute at/positioned/rotated 로 재바인딩된 소스(cur_src)로 평가해야 한다.
                     # (bare source 는 원본 실행 위치라, at @s 뒤 위치 술어가 어긋난다.)
-                    c = f'KfcGen.testPredicate({cur_src}, executor, {jstr(pid_norm)})'
+                    # [무결성] execute if predicate 는 바닐라가 COMMAND 컨텍스트로 평가한다
+                    # (ORIGIN=source.getPosition(), THIS_ENTITY=source.getEntity() 선택, world=source).
+                    # 선택자 @e[predicate=] 의 SELECTOR 컨텍스트와 다르므로 전용 헬퍼를 쓴다.
+                    c = f'KfcGen.testPredicateCmd({cur_src}, {jstr(pid_norm)})'
                 else:
                     c = expr.replace("{E}", "executor")
                 conds.append(f'!({c})' if neg else c)

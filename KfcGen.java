@@ -628,8 +628,11 @@ public final class KfcGen {
     static java.util.List<net.minecraft.entity.Entity> typeBucket(GameContext ctx, net.minecraft.entity.EntityType<?> t) {
         int tk = ctx.server.getTicks();
         if (TYPE_INDEX == null || TYPEIDX_SERVER != ctx.server || TYPEIDX_TICK != tk || TYPEIDX_GEN != ENTITY_GEN) {
-            java.util.IdentityHashMap<net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>> m =
-                    new java.util.IdentityHashMap<>();
+            // fastutil Reference2Object: JDK IdentityHashMap 의 선형 탐사 + Map.computeIfAbsent
+            // 디폴트 구현(get→put 2회 조회) 대비 조회가 싸다(실측: identityHashCode 0.057 이
+            // 이 재구축 경로였다). 키는 EntityType 인스턴스 — identity 시맨틱 동일.
+            it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>> m =
+                    new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>();
             for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx))
                 m.computeIfAbsent(e.getType(), k -> new java.util.ArrayList<>()).add(e);
             TYPE_INDEX = m; TYPEIDX_SERVER = ctx.server; TYPEIDX_TICK = tk; TYPEIDX_GEN = ENTITY_GEN;
@@ -1048,9 +1051,32 @@ public final class KfcGen {
         }
     }
 
+    /**
+     * 엔티티 소멸 시 태그 버킷에서 제거.
+     *
+     * <p><b>[개정]</b> 종전에는 <b>모든 버킷을 순회</b>하며 각각 {@code remove(e)} 를 했다.
+     * 이 팩의 distinct 태그는 1,910개라, 엔티티 하나를 죽일 때마다 버킷 전체를 훑은 셈이다
+     * (실측: {@code ArrayList.remove} 0.068 + {@code HashMap$ValueIterator.next} 0.007,
+     * 충돌 처리의 kill 경로가 주 호출자).
+     *
+     * <p><b>[불변식]</b> 엔티티는 <b>자기가 가진 태그의 버킷에만</b> 들어간다 — 삽입 지점
+     * 전수 확인: {@code tagBucketsOnAdd}(자기 태그 순회) · {@code addTag}/{@code onCommandTagAdded}
+     * (해당 태그 추가 직후) · {@code tagBucket} 전체 재구축(엔티티별 자기 태그). 제거 지점도
+     * 대칭이다({@code removeTag}/{@code onCommandTagRemoved} 는 해당 버킷만,
+     * {@code readNbtTagAware} 는 태그 집합 변화 시 전체 clear).
+     * 따라서 {@code e.getCommandTags()} 만 돌면 충분하다 — {@code tagBucketsOnAdd} 와 대칭.
+     *
+     * <p>혹시 불변식이 깨져 잔존 항목이 생기더라도, 호출측이 {@code matchTagsAlive} 로
+     * {@code isAlive()} 를 재검사하므로 <b>결과 집합은 영향받지 않는다</b>(fail-safe).
+     */
     private static void tagBucketsOnRemove(net.minecraft.entity.Entity e) {
         if (TAG_BUCKETS.isEmpty() || e == null) return;
-        for (java.util.ArrayList<net.minecraft.entity.Entity> b : TAG_BUCKETS.values()) b.remove(e);
+        java.util.Set<String> tg = e.getCommandTags();
+        if (tg.isEmpty()) return;                      // 무태그 — 어느 버킷에도 없음
+        for (String t : tg) {
+            java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(t);
+            if (b != null) b.remove(e);
+        }
     }
 
     /** e.readNbt(n) 대체 — readNbt 는 n.Tags 로 커맨드태그를 통째로 재로드할 수 있다(data merge/
@@ -3390,6 +3416,26 @@ public final class KfcGen {
             ND_MAP.put(p, nd);
         }
         return nd;
+    }
+
+    /**
+     * <b>해당 엔티티 하나만</b> 이름/표시명 캐시에서 내린다.
+     *
+     * <p>종전에는 CustomName 쓰기마다 {@code NAME_GEN++} 로 <b>전역 무효화</b>를 했다.
+     * 그런데 {@code NAME_GEN} 의 소비자는 이 ND 캐시 하나뿐이고, 쓰기 지점은 대상 엔티티를
+     * 이미 인자로 들고 있다. 즉 엔티티 1개의 이름을 바꾸려고 <b>전체 캐시를 버리고</b> 있었다.
+     *
+     * <p>실측(16인 주행): {@code withEntitySrc} 0.632 mspt 중 <b>0.283(45%)이 ndOf 미스</b>였다
+     * ({@code Entity.getName} 0.116 · {@code DataTracker.Entry.get} 0.103 · ndOf self 0.077 ·
+     * {@code IdentityHashMap.put} 0.030 — put 이 보인다는 것 자체가 상시 재삽입의 증거).
+     * 이 팩은 텍스트 디스플레이/이름표에 CustomName 을 상시 쓰므로 캐시가 사실상 무력화돼 있었다.
+     *
+     * <p>팀 변경({@code /team}) 처럼 <b>대상 집합을 알 수 없는</b> 경로는 종전대로 전역
+     * {@code NAME_GEN++} 를 유지한다 — 팀 장식은 소속 엔티티 전체의 표시명을 바꾸는데
+     * 멤버십을 추적하지 않기 때문이다(fail-closed).
+     */
+    public static void invalidateNameOf(net.minecraft.entity.Entity e) {
+        if (e != null) ND_MAP.remove(e);
     }
 
     /** ND 캐시 유효화(틱 경계 주기 화해 + 서버/NAME_GEN 변화). withEntitySrc 와 동일 규약. */
@@ -8074,7 +8120,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityPutSnbt(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return;
-        if (path != null && path.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
+        if (path != null && path.contains("CustomName")) invalidateNameOf(e);   // 해당 엔티티만(10차 전역→개별)
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -8108,7 +8154,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  vanilla store success 는 readNbt 가 나중에 경로를 버려도 put 개수 기준이므로 이 판정이 관측 동등. */
     public static boolean entityPutSnbtChanged(net.minecraft.entity.Entity e, String path, String snbt) {
         if (e == null) return false;
-        if (path != null && path.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
+        if (path != null && path.contains("CustomName")) invalidateNameOf(e);   // 해당 엔티티만(10차 전역→개별)
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
                 try {
@@ -8243,7 +8289,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, String snbt) {
         if (e == null) return;
-        if (snbt != null && snbt.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
+        if (snbt != null && snbt.contains("CustomName")) invalidateNameOf(e);   // 해당 엔티티만(10차 전역→개별)
         try {
             // SNBT 리터럴은 변환 시점 상수 — 캐시된 템플릿을 copy (storagePutSnbt 와 동일 패턴).
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -8303,7 +8349,7 @@ public static net.minecraft.entity.Entity firstEntity(
      *  대응)이면 invalidateSnapshot 후 무동작 — String 판과 동일 순서. */
     public static void entityMergeSnbt(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound tc) {
         if (e == null || tc == null) return;
-        if (tc.contains("CustomName")) NAME_GEN++;   // 이름 틱-캐시 무효화(10차)
+        if (tc.contains("CustomName")) invalidateNameOf(e);   // 해당 엔티티만(10차 전역→개별)
         try {
             if (!DISPLAY_MERGE_SLOW && displayMergeFast(e, tc)) { invalidateSnapshot(e); return; }
             net.minecraft.nbt.NbtCompound patch = tc.copy();

@@ -1515,10 +1515,28 @@ public final class ModEntry implements ModInitializer {{
         ServerLifecycleEvents.END_DATA_PACK_RELOAD.register(
                 (server, resourceManager, success) -> {group}.generated.KfcGen.resetAll("datapack-reload"));
 
-        ServerTickEvents.START_SERVER_TICK.register(server -> {{
+        // [tick 시점 — 바닐라 정합]
+        //   바닐라 #minecraft:tick 함수는 MinecraftServer.tickWorlds 안 commandFunctions 단계,
+        //   즉 networkHandler.disableFlush() 로 flush 가 억제된 구간에서 실행된다. Fabric 의
+        //   START_SERVER_TICK 은 tickWorlds '호출 직전'(disableFlush 이전)이라 이 구간 밖이고,
+        //   그래서 tick 함수가 만든 패킷이 같은 틱의 위치 동기화보다 한 배치 먼저 flush 됐다
+        //   (고속 이동 시 사운드가 이전 틱 위치로 공간화 = 감쇠·끊김).
+        //   KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서 KfcGen.runTickHook 을
+        //   호출해 바닐라와 같은 자리에서 디스패치한다. 아래는 그 훅 본문 등록 + 안전망이다.
+        {group}.generated.KfcGen.setTickHook(server -> {{
             ServerCommandSource src = server.getCommandSource().withSilent();
 {tick_body}
             {group}.generated.KfcGen.tickNativeSchedule(server);
+        }});
+        ServerLifecycleEvents.SERVER_STARTED.register(
+                server -> {group}.generated.KfcGen.setTickServer(server));
+        // 안전망: 믹스인이 적용되지 않은 환경(믹스인 충돌 등)에서도 틱당 1회는 반드시 돈다.
+        //   정상 환경에선 runTickHook 이 먼저 처리하므로 여기서는 중복 없이 무시된다.
+        ServerTickEvents.END_SERVER_TICK.register(server -> {{
+            if (!{group}.generated.KfcGen.tickPointApplied()) {{
+                {group}.generated.KfcGen.setTickServer(server);
+                {group}.generated.KfcGen.dispatchTick(server);
+            }}
         }});
         CommandRegistrationCallback.EVENT.register(
                 (dispatcher, registryAccess, environment) -> register(dispatcher));

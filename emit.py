@@ -20,7 +20,7 @@ brigadier 의 chain 은 [노드들 + 인자들] 이 평탄하게 섞여 있다. 
 """
 from __future__ import annotations
 import os as _osmod
-import json, re, sys
+import json, math, re, sys
 from datapack_io import open_datapack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2032,8 +2032,18 @@ def emit_target(line: str, command: str, chain: list[dict], em: Emitted) -> bool
             sub_cmd = sub[0] if sub else None
             inner = Emitted(line=line)
             if sub_cmd and emit_target(line, sub_cmd, inner_chain, inner):
-                em.java.extend(inner.java)
-                em.java.append("return 1;")
+                # 바닐라 `return run <명령>` 은 그 명령의 '결과값'을 함수 반환값으로 전파하고,
+                # 명령이 실패하면 함수도 실패(값 없음 = 관측 0)로 끝난다. 결과값을 계산할 수
+                # 있는 명령은 카운트 판 헬퍼로 바꿔 그대로 반환한다(_RETURN_RUN_COUNTED).
+                _cnt = _counted_return_stmt(inner.java)
+                if _cnt is None:
+                    # 결과값을 계산할 수 없는 명령은 '1' 로 추측하지 않는다 — 바닐라 결과가 1이
+                    # 아닌 명령(scoreboard players set = 설정값, tag add = 대상 수, playsound =
+                    # 수신 인원 …)에서 반환값이 조용히 어긋나기 때문이다. 이 줄을 폴백 처리해
+                    # 함수 단위로 원본 mcfunction 이 실행되게 한다(= 바닐라 정확).
+                    em.reason = f"return run {sub_cmd} 결과값 미계산(바닐라 반환값 보존 위해 폴백)"
+                    return False
+                em.java.extend(_cnt)
                 em.kind = inner.kind
                 em.terminal = True
                 return True
@@ -3277,27 +3287,44 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     # minVolume 시맨틱(바닐라 PlaySoundCommand): 가청 반경(vol>1?vol*16:16) 밖 대상은
     # minVolume ≤ 0 이면 미재생, > 0 이면 '플레이어 위치+소리방향×2'에서 minVolume 으로 재생.
     # KfcGen.playSound minVolume 오버로드가 완전 미러 — 0 이면 종전 시그니처(무변화) 유지.
-    _mv_arg = f', {jfloat(minvol)}' if _mv != 0.0 else ''
+    # 시드: 바닐라 PlaySoundCommand 는 `source.getWorld().getRandom().nextLong()` 을 명령 실행
+    # 1회당 정확히 1개 뽑아 전 대상에 공유한다(랜덤 변형 일치). 두 가지를 정확히 지켜야
+    # 월드 난수 스트림이 바닐라와 어긋나지 않는다:
+    #   ① 난수원은 '소스 월드'(ctx.world = 오버월드 고정이 아님).
+    #   ② 대상 셀렉터가 0명이면 바닐라는 EntityArgumentType 에서 실패해 execute 에 진입조차
+    #      못 하므로 난수를 '소비하지 않는다'.
     if sel.base == "s":
+        # @s: 실행자가 플레이어가 아니면 바닐라 셀렉터가 실패 → 난수 미소비. if 본문 안에서 뽑는다.
         call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
-                f'{pe}, {jfloat(vol)}, {jfloat(pitch)}{_mv_arg});')
+                f'{pe}, {jfloat(vol)}, {jfloat(pitch)}, {jfloat(minvol)}, '
+                f'source.getWorld().getRandom().nextLong());')
         em.java.append('if (executor instanceof net.minecraft.server.network.ServerPlayerEntity _ps) '
                        + call)
         em.kind = "native"
         return True
-    # 다중 대상: 바닐라는 명령 실행 1회당 난수 시드 1개를 전 대상에 공유(랜덤 변형 동일)
-    # → 시드를 루프 밖에서 1회 뽑아 전달한다.
-    _sd = _fresh_var("_sndSd")
-    em.java.append(f'long {_sd} = ctx.world.getRandom().nextLong();')
-    call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
-            f'{pe}, {jfloat(vol)}, {jfloat(pitch)}, {jfloat(minvol)}, {_sd});')
-    em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
     conds = _tag_conds(sel, '_ps')
     _vc = _volume_cond(sel, "_ps")
     if _vc: conds.append(_vc)
-    if conds:
-        em.java.append(f'    if (!({" && ".join(conds)})) continue;')
+    _cond_j = f'    if (!({" && ".join(conds)})) continue;' if conds else None
+    _sd = _fresh_var("_sndSd")
+    _any = _fresh_var("_sndAny")
+    if _cond_j:
+        # 매칭 대상 유무 선판정(할당 없는 2패스) — 0명이면 시드도 뽑지 않는다(바닐라 동일).
+        em.java.append(f'boolean {_any} = false;')
+        em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
+        em.java.append(f'    if ({" && ".join(conds)}) {{ {_any} = true; break; }}')
+        em.java.append("}")
+        em.java.append(f'if ({_any}) {{')
+    else:
+        em.java.append('if (!ctx.allPlayers.isEmpty()) {')
+    em.java.append(f'long {_sd} = source.getWorld().getRandom().nextLong();')
+    call = (f'KfcGen.playSound(_ps, {jstr(sound)}, {jstr(cat)}, '
+            f'{pe}, {jfloat(vol)}, {jfloat(pitch)}, {jfloat(minvol)}, {_sd});')
+    em.java.append("for (net.minecraft.server.network.ServerPlayerEntity _ps : ctx.allPlayers) {")
+    if _cond_j:
+        em.java.append(_cond_j)
     em.java.append("    " + call)
+    em.java.append("}")
     em.java.append("}")
     em.kind = "native"
     return True
@@ -3497,14 +3524,26 @@ def _num(v):
 
 
 def _time_to_ticks(v):
-    """'10' / '10t' / '5s' / '1d' -> 정수 틱. 파싱불가 시 None."""
+    """'10' / '10t' / '5s' / '1d' -> 정수 틱. 파싱불가 시 None.
+
+    바닐라 TimeArgumentType.parse 는 `float f = readFloat(); int j = Math.round(f * unit)` 이다
+    (unit: t/무단위=1, s=20, d=24000). 절삭(int 캐스팅)이 아니라 **반올림**이라 소수 틱에서
+    갈린다(예: `1.5t` -> 바닐라 2, 절삭 1). float 정밀도까지 맞추기 위해 배수 곱도 32비트로
+    수행한 뒤 floor(x+0.5)(=Java Math.round(float)) 를 적용한다."""
+    import struct as _struct
     s = str(v).strip()
     mult = 1.0
     if s.endswith("t"): s = s[:-1]
     elif s.endswith("s"): s, mult = s[:-1], 20.0
     elif s.endswith("d"): s, mult = s[:-1], 24000.0
-    try: return int(float(s) * mult)
-    except ValueError: return None
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    def _f32(x):   # 자바 float 정밀도로 라운딩
+        return _struct.unpack("f", _struct.pack("f", x))[0]
+    prod = _f32(_f32(f) * mult)
+    return math.floor(prod + 0.5)          # Java Math.round(float)
 
 
 def _blockpos_java(pos) -> str | None:
@@ -3952,6 +3991,11 @@ def emit_schedule(nn: list[str], args: dict, em: Emitted) -> bool:
     ticks = _time_to_ticks(time) if time is not None else None
     if ticks is None:
         em.reason = f"schedule 시간({time}) 파싱불가"; return False
+    if ticks == 0:
+        # 바닐라 ScheduleCommand: time == 0 이면 commands.schedule.same_tick 으로 명령 실패 —
+        # 타이머에 아무것도 등록되지 않는다. 네이티브로도 '아무 일 없음'이 정확한 재현이다.
+        em.java.append("// schedule 0t: vanilla same_tick failure (no-op)")
+        em.kind = "native"; return True
     append = "append" in nn
     if ALL_FIDS and fn in ALL_FIDS and fn not in MACRO_FNS:
         # (#15) 변환된 네이티브 함수 → 자체 큐 스케줄러로 디스패치. 바닐라 타이머의
@@ -3966,6 +4010,45 @@ def emit_schedule(nn: list[str], args: dict, em: Emitted) -> bool:
         # 미변환(외부 네임스페이스)/매크로 함수는 종전대로 바닐라 타이머(고증 동일).
         em.java.append(f"KfcGen.scheduleFunction(source, {jstr(fn)}, {ticks}L, {str(append).lower()});")
     em.kind = "native"; return True
+
+
+# `return run <명령>` 결과값 전파용: 무반환 헬퍼 → 동작 동일 + 바닐라 결과값(변경 종단 수)을
+# 돌려주는 카운트 판. 바닐라 DataCommand.executeModify 는 이 수가 0 이면 명령 실패다.
+_RETURN_RUN_COUNTED = {
+    # data modify: 결과 = 변경된 종단 수(0 이면 바닐라 명령 실패)
+    "KfcGen.storagePutSnbt":   "KfcGen.storagePutSnbtCount",
+    "KfcGen.storagePutNumber": "KfcGen.storagePutNumberCount",
+    "KfcGen.entityPutSnbt":    "KfcGen.entityPutSnbtCount",
+    # particle: 결과 = 파티클 패킷이 전달된 플레이어 수(헬퍼가 그대로 int 반환)
+    "KfcGen.spawnParticle":       "KfcGen.spawnParticle",
+    "KfcGen.spawnParticleParsed": "KfcGen.spawnParticleParsed",
+    "KfcGen.spawnParticleEffect": "KfcGen.spawnParticleEffect",
+    "KfcGen.spawnDust":           "KfcGen.spawnDust",
+}
+
+_COUNTED_BLOCK_RE = re.compile(r'^\{\s*(.*?)\s*(KfcGen\.\w+)\((.*)\);\s*\}$', re.S)
+
+
+def _counted_return_stmt(java: list[str]) -> list[str] | None:
+    """방출된 본문의 '마지막 문장'이 바닐라 결과값을 낼 수 있는 헬퍼 호출이면 그 값을 반환하도록
+       재작성한다. 두 형태를 인식한다:
+         ① `KfcGen.f(...);`            -> `return KfcGen.fCount(...);`
+         ② `{ <준비문들> KfcGen.f(...); }` -> `{ <준비문들> return KfcGen.fCount(...); }`  (particle 등)
+       인식 실패는 None — 호출부가 '결과값 계산 불가'로 처리한다(추측하지 않음)."""
+    if len(java) != 1:
+        return None
+    stmt = java[0].strip()
+    for void_fn, count_fn in _RETURN_RUN_COUNTED.items():
+        pre = void_fn + "("
+        if stmt.startswith(pre) and stmt.endswith(");"):
+            return [f"return {count_fn}({stmt[len(pre):-2]});"]
+    m = _COUNTED_BLOCK_RE.match(stmt)
+    if m:
+        prep, fn, argsj = m.group(1), m.group(2), m.group(3)
+        cnt = _RETURN_RUN_COUNTED.get(fn)
+        if cnt is not None:
+            return [f"{{ {prep} return {cnt}({argsj}); }}"]
+    return None
 
 
 def emit_give(nn: list[str], args: dict, em: Emitted) -> bool:

@@ -363,9 +363,13 @@ public final class KfcGen {
         public final net.minecraft.server.world.ServerWorld world;
         public final ServerScoreboard scoreboard;
         public final java.util.List<net.minecraft.server.network.ServerPlayerEntity> allPlayers;
-        private GameContext(net.minecraft.server.MinecraftServer s) {
+        private GameContext(net.minecraft.server.MinecraftServer s,
+                            net.minecraft.server.world.ServerWorld w) {
             this.server = s;
-            this.world = s.getOverworld();
+            // [바닐라 정합] 종전엔 s.getOverworld() 고정이었다. 바닐라의 위치/엔티티 의존 명령은
+            // 전부 `source.getWorld()` 기준이므로(@e 셀렉터·if block·particle·time/weather 등),
+            // 실행 소스가 다른 차원이면 오버월드를 보던 것은 오컴파일이었다. 소스 월드를 쓴다.
+            this.world = w;
             this.scoreboard = s.getScoreboard();
             this.allPlayers = s.getPlayerManager().getPlayerList();
         }
@@ -425,7 +429,9 @@ public final class KfcGen {
         if (EXTERNAL_DIRTY) { EXTERNAL_DIRTY = false; int _m = EXTERNAL_MASK; EXTERNAL_MASK = 0; onExternalFunctionExecuted(_m); }
         GameContext c = CTX_CACHE;
         net.minecraft.server.MinecraftServer s = src.getServer();
-        if (c == null || c.server != s) { c = new GameContext(s); CTX_CACHE = c; }
+        // 컨텍스트는 (서버, 소스 월드) 단위 — 단일 월드 팩은 최초 1회 생성 후 참조 비교만 한다.
+        net.minecraft.server.world.ServerWorld w = src.getWorld();
+        if (c == null || c.server != s || c.world != w) { c = new GameContext(s, w); CTX_CACHE = c; }
         int t = s.getTicks();
         if (t != OBJ_TICK) {
             OBJ_TICK = t; OBJ_GEN++;   // 외부(콘솔/바닐라) objective 변경 재해소(ObjRef 전용 — 저렴)
@@ -460,6 +466,7 @@ public final class KfcGen {
     //            (b) 우리 명령이 엔티티를 추가/제거(summon/lootSpawn/killEntity) → ENTITY_GEN 증가.
     static long ENTITY_GEN = 0;
     private static net.minecraft.server.MinecraftServer SNAP_SERVER;
+    private static net.minecraft.server.world.ServerWorld SNAP_WORLD;
     private static int  SNAP_TICK = Integer.MIN_VALUE;
     private static long SNAP_GEN  = -1;
     private static java.util.List<net.minecraft.entity.Entity> SNAP_ENTITIES;
@@ -475,7 +482,10 @@ public final class KfcGen {
     }
     public static java.util.List<net.minecraft.entity.Entity> entitiesSnapshot(GameContext ctx) {
         int t = ctx.server.getTicks();
-        if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
+        // 캐시 키에 월드 포함 — 다른 차원의 컨텍스트가 같은 틱에 끼어들면 재수집해야 한다
+        // (단일 월드 팩에선 참조 비교 1회, 재수집 없음).
+        if (SNAP_ENTITIES == null || SNAP_SERVER != ctx.server || SNAP_WORLD != ctx.world
+                || SNAP_TICK != t || SNAP_GEN != ENTITY_GEN) {
             java.util.ArrayList<net.minecraft.entity.Entity> list = new java.util.ArrayList<>();
             long fp = 0, tfp = 0;
             for (net.minecraft.entity.Entity e : ctx.world.iterateEntities()) {
@@ -486,7 +496,7 @@ public final class KfcGen {
                 if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) tfp += f;   // 태그 보유만(off 면 호출조차 안 됨)
             }
             SNAP_ENTITIES = list; SNAP_FP = fp; SNAP_TAG_FP = tfp;
-            SNAP_SERVER = ctx.server; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
+            SNAP_SERVER = ctx.server; SNAP_WORLD = ctx.world; SNAP_TICK = t; SNAP_GEN = ENTITY_GEN;
         }
         return SNAP_ENTITIES;
     }
@@ -645,10 +655,12 @@ public final class KfcGen {
     private static int  TYPEIDX_TICK = Integer.MIN_VALUE;
     private static long TYPEIDX_GEN  = -1;
     private static net.minecraft.server.MinecraftServer TYPEIDX_SERVER;
+    private static net.minecraft.server.world.ServerWorld TYPEIDX_WORLD;
     private static java.util.Map<net.minecraft.entity.EntityType<?>, java.util.List<net.minecraft.entity.Entity>> TYPE_INDEX;
     static java.util.List<net.minecraft.entity.Entity> typeBucket(GameContext ctx, net.minecraft.entity.EntityType<?> t) {
         int tk = ctx.server.getTicks();
-        if (TYPE_INDEX == null || TYPEIDX_SERVER != ctx.server || TYPEIDX_TICK != tk || TYPEIDX_GEN != ENTITY_GEN) {
+        if (TYPE_INDEX == null || TYPEIDX_SERVER != ctx.server || TYPEIDX_WORLD != ctx.world
+                || TYPEIDX_TICK != tk || TYPEIDX_GEN != ENTITY_GEN) {
             // fastutil Reference2Object: JDK IdentityHashMap 의 선형 탐사 + Map.computeIfAbsent
             // 디폴트 구현(get→put 2회 조회) 대비 조회가 싸다(실측: identityHashCode 0.057 이
             // 이 재구축 경로였다). 키는 EntityType 인스턴스 — identity 시맨틱 동일.
@@ -656,7 +668,8 @@ public final class KfcGen {
                     new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>();
             for (net.minecraft.entity.Entity e : entitiesSnapshot(ctx))
                 m.computeIfAbsent(e.getType(), k -> new java.util.ArrayList<>()).add(e);
-            TYPE_INDEX = m; TYPEIDX_SERVER = ctx.server; TYPEIDX_TICK = tk; TYPEIDX_GEN = ENTITY_GEN;
+            TYPE_INDEX = m; TYPEIDX_SERVER = ctx.server; TYPEIDX_WORLD = ctx.world;
+            TYPEIDX_TICK = tk; TYPEIDX_GEN = ENTITY_GEN;
         }
         java.util.List<net.minecraft.entity.Entity> b = TYPE_INDEX.get(t);
         return b == null ? java.util.Collections.emptyList() : b;
@@ -773,6 +786,7 @@ public final class KfcGen {
     private static final java.util.HashMap<String, java.util.ArrayList<net.minecraft.entity.Entity>> TAG_BUCKETS =
             new java.util.HashMap<>();
     private static net.minecraft.server.MinecraftServer TB_SERVER;
+    private static net.minecraft.server.world.ServerWorld TB_WORLD;
     private static int  TB_TICK = Integer.MIN_VALUE;
     private static long TB_GEN  = -1;
     // 14차: 틱 간 증분 유지용 외부-드리프트 감지 상태.
@@ -887,8 +901,8 @@ public final class KfcGen {
             }
             if (DEBUG_TAGBUCKET) tbdReport(tk);
         }
-        if (TB_SERVER != ctx.server || TB_GEN != ENTITY_GEN) {
-            TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_GEN = ENTITY_GEN;
+        if (TB_SERVER != ctx.server || TB_WORLD != ctx.world || TB_GEN != ENTITY_GEN) {
+            TAG_BUCKETS.clear(); TB_EPOCH++; TB_SERVER = ctx.server; TB_WORLD = ctx.world; TB_GEN = ENTITY_GEN;
             if (DEBUG_TAGBUCKET) {
                 TBD_GEN++;
                 TBD_SRC[GEN_SRC >= 0 && GEN_SRC < TBD_SRC.length ? GEN_SRC : 0]++;
@@ -1105,13 +1119,37 @@ public final class KfcGen {
         }
     }
 
+    /** 바닐라 EntityDataObject.setNbt 게이트 — 엔티티 NBT 쓰기가 허용되는 대상인가.
+     *
+     *  <p>바닐라 {@code EntityDataObject.setNbt} 는 대상이 {@code PlayerEntity} 면
+     *  {@code commands.data.entity.invalid} 로 <b>명령을 실패</b>시키고 아무것도 쓰지 않는다
+     *  (merged jar 소스 확인). 이 경로를 타는 명령은 {@code data merge|modify|remove entity},
+     *  {@code execute store result|success entity …} 전부다 — 즉 플레이어 대상 엔티티 NBT
+     *  쓰기는 바닐라에서 항상 무변경이다. */
+    private static boolean entityNbtWritable(net.minecraft.entity.Entity e) {
+        return !(e instanceof net.minecraft.entity.player.PlayerEntity);
+    }
+
     /** e.readNbt(n) 대체 — readNbt 는 n.Tags 로 커맨드태그를 통째로 재로드할 수 있다(data merge/
-     *  modify entity, store ... entity 등). 전후 태그가 실제로 달라졌을 때만 버킷을 무효화한다. */
+     *  modify entity, store ... entity 등). 전후 태그가 실제로 달라졌을 때만 버킷을 무효화한다.
+     *
+     *  <p>[바닐라 정합] 이 메서드는 KFC 의 엔티티 NBT 쓰기가 모두 지나는 단일 관문이므로
+     *  바닐라 {@code EntityDataObject.setNbt} 의 두 규칙을 여기서 재현한다:
+     *   ① 플레이어 대상은 무변경(명령 실패) — {@link #entityNbtWritable}.
+     *   ② readNbt 전후로 UUID 보존 — 바닐라는 {@code uuid=getUuid(); readNbt(nbt); setUuid(uuid);}
+     *      라 패치/스냅샷의 UUID 키가 엔티티 식별자를 바꾸지 못한다. */
     private static void readNbtTagAware(net.minecraft.entity.Entity e, net.minecraft.nbt.NbtCompound n) {
+        if (!entityNbtWritable(e)) return;   // 바닐라: commands.data.entity.invalid → 무변경
         QUERY_MUT++;   // NBT 재로드는 Tags/Health(생사)를 바꿀 수 있음 → 존재검사 메모 무효화
-        if (TAG_BUCKETS.isEmpty()) { e.readNbt(n); return; }
+        java.util.UUID keepUuid = e.getUuid();
+        if (TAG_BUCKETS.isEmpty()) {
+            e.readNbt(n);
+            e.setUuid(keepUuid);
+            return;
+        }
         java.util.HashSet<String> before = new java.util.HashSet<>(e.getCommandTags());
         e.readNbt(n);
+        e.setUuid(keepUuid);
         if (!before.equals(e.getCommandTags())) {
             TAG_BUCKETS.clear(); TB_EPOCH++;
             if (DEBUG_TAGBUCKET) TBD_NBT++;
@@ -2082,7 +2120,9 @@ public final class KfcGen {
                                         String fnId, long delayTicks, boolean append) {
         net.minecraft.util.Identifier id = net.minecraft.util.Identifier.tryParse(fnId);
         if (id == null) return;
-        long trigger = src.getServer().getOverworld().getTime() + delayTicks;
+        // 바닐라 ScheduleCommand: deadline = source.getWorld().getTime() + time
+        // (타이머 자체는 메인 월드 속성에 저장되지만 기준 시각은 소스 월드다).
+        long trigger = src.getWorld().getTime() + delayTicks;
         net.minecraft.world.timer.Timer<net.minecraft.server.MinecraftServer> timer = _fnTimer(src);
         if (!append) { timer.remove(fnId); schedNativeRemove(fnId); }   // replace 는 양쪽 큐 모두 대체
         timer.setEvent(fnId, trigger, new net.minecraft.world.timer.FunctionTimerCallback(id));
@@ -2129,6 +2169,57 @@ public final class KfcGen {
         SCHED_BY_KEY.computeIfAbsent(fnId, k -> new java.util.ArrayList<>(2)).add(e);
     }
 
+    // ── 변환 tick 함수 디스패치 지점 (바닐라 정합) ───────────────────────────
+    // 바닐라 #minecraft:tick 함수는 MinecraftServer.tickWorlds 안 commandFunctions 단계에서,
+    // 즉 networkHandler.disableFlush() 로 flush 가 억제된 구간 안에서 실행된다. 그래서 tick
+    // 함수가 만든 패킷은 같은 틱의 엔티티 위치 동기화와 한 배치로 전달된다.
+    // Fabric 의 START_SERVER_TICK 은 tickWorlds '호출 직전'(= disableFlush 이전)이라 그 배치에
+    // 들어가지 못하고 개별 flush 되어, 고속 이동 중 사운드가 이전 틱 위치 기준으로 공간화되는
+    // 편차를 만들었다. KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서 이 훅을
+    // 호출해 바닐라와 같은 자리에서 디스패치한다.
+    private static java.util.function.Consumer<net.minecraft.server.MinecraftServer> TICK_HOOK;
+    private static net.minecraft.server.MinecraftServer TICK_SERVER;
+    private static long TICK_LAST = Long.MIN_VALUE;
+    private static boolean TICK_POINT_SEEN = false;
+
+    /** 진입점(ModEntry)이 부팅 시 1회 등록. server 는 SERVER_STARTED 에서 채워진다. */
+    public static void setTickHook(java.util.function.Consumer<net.minecraft.server.MinecraftServer> hook) {
+        TICK_HOOK = hook;
+    }
+    public static void setTickServer(net.minecraft.server.MinecraftServer server) {
+        if (TICK_SERVER == server) return;      // 멱등 — 폴백 경로가 매 틱 호출해도 중복판정 유지
+        TICK_SERVER = server;
+        TICK_LAST = Long.MIN_VALUE;             // 새 서버(월드 재입장) = 틱 카운터 리셋
+    }
+    /** 믹스인이 실제로 적용됐는지(= 바닐라 지점 디스패치가 살아 있는지). 진입점 폴백 판단용. */
+    public static boolean tickPointApplied() { return TICK_POINT_SEEN; }
+
+    /** KfcTickPointMixin 이 바닐라 tick 함수 지점에서 호출. 틱당 1회만 디스패치한다. */
+    public static void runTickHook() {
+        TICK_POINT_SEEN = true;
+        dispatchTick(TICK_SERVER);
+    }
+
+    private static boolean TICK_FALLBACK_WARNED = false;
+
+    /** 폴백(믹스인 미적용 시) 진입점이 호출 — 이미 이번 틱에 돌았으면 무시. */
+    public static void dispatchTick(net.minecraft.server.MinecraftServer server) {
+        if (server == null || TICK_HOOK == null) return;
+        if (!TICK_POINT_SEEN && !TICK_FALLBACK_WARNED) {
+            TICK_FALLBACK_WARNED = true;
+            System.out.println("[KFC] *** 경고: KfcTickPointMixin 미적용 — tick 함수를 "
+                    + "END_SERVER_TICK 폴백에서 실행합니다(바닐라보다 늦은 시점, flush 배치 밖). "
+                    + "믹스인 충돌 여부를 확인하세요.");
+        }
+        // 바닐라 CommandFunctionManager.tick 은 shouldTick() 이 거짓이면(/tick freeze 등)
+        // tick 태그 함수를 아예 돌리지 않는다 — 동일 조건을 재현한다.
+        if (!server.getTickManager().shouldTick()) return;
+        long t = server.getTicks();
+        if (t == TICK_LAST) return;      // 같은 틱 중복 디스패치 방지
+        TICK_LAST = t;
+        TICK_HOOK.accept(server);
+    }
+
     /** 진입점이 매 틱(tick 함수 디스패치 직후) 호출. 같은 틱 재-스케줄은 다음 틱 발화(바닐라 동일). */
     public static void tickNativeSchedule(net.minecraft.server.MinecraftServer server) {
         SCHED_NOW++;
@@ -2152,18 +2243,61 @@ public final class KfcGen {
         }
     }
 
-    // ── give: 아이템 지급(스택 한도 초과 시 분할, 오버플로우는 giveItemStack 이 드롭) ──
+    // ── give: 아이템 지급 ──────────────────────────────────────────────────
+    // [바닐라 정합] 종전 구현은 `p.giveItemStack(stack)`(= PlayerEntity.giveItemStack =
+    // inventory.insertStack) 만 호출했다. 그런데 바닐라 GiveCommand 의 루프는 삽입 이후
+    // 세 가지를 더 한다(merged jar 소스/바이트코드 확인):
+    //   ① 전량 삽입 성공 시 ENTITY_ITEM_PICKUP 사운드(PLAYERS, vol 0.2,
+    //      pitch=((rnd-rnd)*0.7+1)*2) — '아이템 먹는 소리'. 종전엔 이게 통째로 빠져
+    //      GUI 에서 아이템을 받아도 무음이었다.
+    //   ② 전량 삽입 성공 시 dropItem(1개짜리, false) + setDespawnImmediately()
+    //      (클라이언트 픽업 연출용 즉시소멸 아이템 엔티티).
+    //   ③ 인벤토리가 모자라 남으면 남은 스택을 바닥에 드롭 + resetPickupDelay + setOwner.
+    //      종전엔 insertStack 이 남긴 잔량을 그냥 버려 '아이템 소실'이었다.
+    //   ④ 삽입 후 currentScreenHandler.sendContentUpdates() — 화면(GUI)이 열린 상태에서
+    //      지급했을 때 클라이언트 인벤토리 표시를 즉시 갱신한다.
+    // 아래 giveStacks 가 그 루프를 그대로 재현한다(개수 분할 규칙 포함).
+    /** 바닐라 GiveCommand 루프 1인분. supplier 는 'n개짜리 새 스택'을 만든다(바닐라 item.createStack). */
+    private static void giveStacks(net.minecraft.server.network.ServerPlayerEntity p,
+                                   java.util.function.IntFunction<net.minecraft.item.ItemStack> supplier,
+                                   int count) {
+        net.minecraft.item.ItemStack one = supplier.apply(1);   // 바닐라 itemStack(표시·연출용 1개)
+        if (one == null || one.isEmpty()) return;
+        int max = one.getMaxCount();
+        if (max < 1) max = 1;
+        // 바닐라: count > maxCount*100 이면 commands.give.failed.toomanyitems 로 실패 — 아무것도 안 준다.
+        if (count > max * 100) return;
+        int k = count;
+        while (k > 0) {
+            int l = Math.min(max, k);
+            k -= l;
+            net.minecraft.item.ItemStack part = supplier.apply(l);
+            if (part == null || part.isEmpty()) return;
+            boolean inserted = p.getInventory().insertStack(part);
+            if (inserted && part.isEmpty()) {
+                net.minecraft.entity.ItemEntity ie = p.dropItem(one, false);
+                if (ie != null) ie.setDespawnImmediately();
+                p.getWorld().playSound(null, p.getX(), p.getY(), p.getZ(),
+                        net.minecraft.sound.SoundEvents.ENTITY_ITEM_PICKUP,
+                        net.minecraft.sound.SoundCategory.PLAYERS, 0.2f,
+                        ((p.getRandom().nextFloat() - p.getRandom().nextFloat()) * 0.7f + 1.0f) * 2.0f);
+                p.currentScreenHandler.sendContentUpdates();
+            } else {
+                net.minecraft.entity.ItemEntity ie = p.dropItem(part, false);
+                if (ie != null) {
+                    ie.resetPickupDelay();
+                    ie.setOwner(p.getUuid());
+                }
+            }
+        }
+    }
+
     public static void giveItem(net.minecraft.server.network.ServerPlayerEntity p, String itemId, int count) {
+        if (p == null) return;
         net.minecraft.item.Item item =
             net.minecraft.registry.Registries.ITEM.get(idOf(itemId));
         if (item == net.minecraft.item.Items.AIR) return;
-        int max = new net.minecraft.item.ItemStack(item).getMaxCount();
-        if (max < 1) max = 1;
-        while (count > 0) {
-            int n = Math.min(count, max);
-            count -= n;
-            p.giveItemStack(new net.minecraft.item.ItemStack(item, n));
-        }
+        giveStacks(p, n -> new net.minecraft.item.ItemStack(item, n), count);
     }
 
     /** give <id>[components] — 컴포넌트/데이터 동반 아이템 지급. 기존 parseItemStack(캐시) 재사용.
@@ -2174,16 +2308,8 @@ public final class KfcGen {
         if (p == null || itemString == null) return;
         try {
             net.minecraft.server.MinecraftServer server = source.getServer();
-            net.minecraft.item.ItemStack base = parseItemStack(server, itemString, 1);
-            if (base == null || base.isEmpty()) return;
-            int max = base.getMaxCount();
-            if (max < 1) max = 1;
-            while (count > 0) {
-                int n = Math.min(count, max);
-                count -= n;
-                net.minecraft.item.ItemStack s = parseItemStack(server, itemString, n);
-                if (s != null && !s.isEmpty()) p.giveItemStack(s);
-            }
+            // 바닐라 GiveCommand 루프와 동일(픽업 사운드·연출·잔량 드롭·화면 갱신 포함).
+            giveStacks(p, n -> parseItemStack(server, itemString, n), count);
         } catch (Exception ex) {
             // 무동작
         }
@@ -3039,22 +3165,23 @@ public final class KfcGen {
     }
 
     /** particle <name> <pos> <delta> <speed> <count> — 단순 파티클(파라미터 없는 타입). */
-    public static void spawnParticle(net.minecraft.server.world.ServerWorld world, String name,
-                                     double x, double y, double z,
-                                     double dx, double dy, double dz, double speed, int count) {
-        spawnParticle(world, name, x, y, z, dx, dy, dz, speed, count, false, null);
+    public static int spawnParticle(net.minecraft.server.world.ServerWorld world, String name,
+                                    double x, double y, double z,
+                                    double dx, double dy, double dz, double speed, int count) {
+        return spawnParticle(world, name, x, y, z, dx, dy, dz, speed, count, false, null);
     }
 
-    public static void spawnParticle(net.minecraft.server.world.ServerWorld world, String name,
-                                     double x, double y, double z,
-                                     double dx, double dy, double dz, double speed, int count,
-                                     boolean force,
+    /** @return 바닐라 ParticleCommand 결과값(전달된 플레이어 수). 미등록/비단순 파티클 = 0(명령 실패 동등). */
+    public static int spawnParticle(net.minecraft.server.world.ServerWorld world, String name,
+                                    double x, double y, double z,
+                                    double dx, double dy, double dz, double speed, int count,
+                                    boolean force,
                                      java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
         net.minecraft.util.Identifier id = idOf(
                 name.contains(":") ? name : "minecraft:" + name);
         net.minecraft.particle.ParticleType<?> pt = net.minecraft.registry.Registries.PARTICLE_TYPE.get(id);
-        if (!(pt instanceof net.minecraft.particle.SimpleParticleType spt)) return;
-        spawnParticleEffect(world, spt, x, y, z, dx, dy, dz, speed, count, force, viewers);
+        if (!(pt instanceof net.minecraft.particle.SimpleParticleType spt)) return 0;   // 미등록/비단순 = 명령 실패
+        return spawnParticleEffect(world, spt, x, y, z, dx, dy, dz, speed, count, force, viewers);
     }
 
     // ──────────────── effect ────────────────
@@ -3571,16 +3698,28 @@ public final class KfcGen {
         if (e == null) return src;
         if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
             scsFuseLog();
-            // 기존 withPosition+withRotation 2-체인과 필드 단위로 동일(pos·rot 만 교체, world 불변).
+            // 기존 withWorld+withPosition+withRotation 3-체인과 필드 단위로 동일.
+            // [바닐라 정합] 바닐라 `at <targets>` 는 withWorld((ServerWorld)entity.getWorld()) 를
+            // '먼저' 적용한 뒤 위치/회전을 바꾼다(ExecuteCommand 바이트코드 확인). 종전엔 월드를
+            // src 것으로 유지해, 대상 엔티티가 다른 차원에 있으면 이후의 월드 의존 명령
+            // (블록 검사·파티클·엔티티 질의)이 원 차원에서 평가되는 오컴파일이었다.
             return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
                     acc.kfc$output(), e.getPos(),
                     new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()),
-                    src.getWorld(), acc.kfc$level(), src.getName(), src.getDisplayName(),
+                    atWorldOf(src, e), acc.kfc$level(), src.getName(), src.getDisplayName(),
                     src.getServer(), src.getEntity(), src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
         }
-        return src.withPosition(e.getPos())
+        return src.withWorld(atWorldOf(src, e))
+                  .withPosition(e.getPos())
                   .withRotation(new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()));
+    }
+
+    /** 바닐라 `at`/`positioned as` 의 월드 재바인딩 — 대상 엔티티가 속한 ServerWorld.
+     *  (엔티티가 서버 월드에 없는 예외 상황이면 원 소스 월드 유지 — fail-safe.) */
+    private static net.minecraft.server.world.ServerWorld atWorldOf(
+            net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
+        return (e.getWorld() instanceof net.minecraft.server.world.ServerWorld sw) ? sw : src.getWorld();
     }
 
     /** [D-10] `as <e> at @s` 융합: withEntity(e)+atEntity(…,e) 3-생성 체인 → 단일 생성.
@@ -3602,7 +3741,7 @@ public final class KfcGen {
             return __KFC_GROUP__.mixin.KfcScsMixin.kfc$create(
                     acc.kfc$output(), e.getPos(),
                     new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()),
-                    src.getWorld(), acc.kfc$level(),
+                    atWorldOf(src, e), acc.kfc$level(),   // 바닐라 at: 대상 엔티티의 월드로 재바인딩
                     (String) nd[0], ((net.minecraft.text.Text) nd[1]).copy(),
                     sv, e, src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
@@ -3688,7 +3827,12 @@ public final class KfcGen {
                             net.minecraft.entity.attribute.EntityAttributeModifier.Operation.ADD_MULTIPLIED_TOTAL;
                     default -> net.minecraft.entity.attribute.EntityAttributeModifier.Operation.ADD_VALUE;
                 };
-        inst.removeModifier(mid);
+        // 바닐라 AttributeCommand.executeModifierAdd:
+        //   if (inst.hasModifier(id)) throw commands.attribute.failed.modifier_already_present;
+        //   else inst.addPersistentModifier(new EntityAttributeModifier(id, value, op));
+        // 즉 같은 id 가 이미 있으면 '명령 실패 + 기존 값 유지'다 — 종전의 removeModifier 선행은
+        // upsert(덮어쓰기)라서, 제거 없이 두 번 add 하는 팩에서 값이 갈렸다(바닐라=첫 값 유지).
+        if (inst.hasModifier(mid)) return;
         inst.addPersistentModifier(new net.minecraft.entity.attribute.EntityAttributeModifier(mid, value, o));
     }
 
@@ -3716,57 +3860,61 @@ public final class KfcGen {
     }
 
     /** particle dust{color:[r,g,b],scale:s} — 색상 파티클. r,g,b 는 0~1. */
-    public static void spawnDust(net.minecraft.server.world.ServerWorld world,
-                                 double x, double y, double z,
-                                 double dx, double dy, double dz, double speed, int count,
-                                 float r, float g, float b, float scale) {
-        spawnDust(world, x, y, z, dx, dy, dz, speed, count, r, g, b, scale, false, null);
+    public static int spawnDust(net.minecraft.server.world.ServerWorld world,
+                                double x, double y, double z,
+                                double dx, double dy, double dz, double speed, int count,
+                                float r, float g, float b, float scale) {
+        return spawnDust(world, x, y, z, dx, dy, dz, speed, count, r, g, b, scale, false, null);
     }
 
     /** force 모드 + viewers 지원. 바닐라 `particle ... force @a[...]` 는 클라 파티클 설정을
      *  무시하고(force=true) 지정된 플레이어들에게 강제 표시한다. force/viewers 를 빠뜨리면
      *  파티클이 클라 설정에 따라 샘플링돼 양이 줄고 불규칙해진다(드리프트 스키드 증상). */
-    public static void spawnDust(net.minecraft.server.world.ServerWorld world,
-                                 double x, double y, double z,
-                                 double dx, double dy, double dz, double speed, int count,
-                                 float r, float g, float b, float scale,
-                                 boolean force,
+    public static int spawnDust(net.minecraft.server.world.ServerWorld world,
+                                double x, double y, double z,
+                                double dx, double dy, double dz, double speed, int count,
+                                float r, float g, float b, float scale,
+                                boolean force,
                                  java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
         int packed = (Math.round(r * 255) << 16) | (Math.round(g * 255) << 8) | Math.round(b * 255);
         net.minecraft.particle.DustParticleEffect eff =
                 new net.minecraft.particle.DustParticleEffect(packed, scale);
-        spawnParticleEffect(world, eff, x, y, z, dx, dy, dz, speed, count, force, viewers);
+        return spawnParticleEffect(world, eff, x, y, z, dx, dy, dz, speed, count, force, viewers);
     }
 
     /** ParticleEffect 를 force/viewers 규칙에 맞게 스폰하는 공통 경로. */
     /** particle <복합타입> ... — block{block_state:..}/item{..}/dust_color_transition 등 파라미터 동반
      *  파티클을 ParticleEffectArgumentType.readParameters 로 파싱해 스폰(모든 vanilla 파티클 지원). */
-    public static void spawnParticleParsed(net.minecraft.server.world.ServerWorld world, String particleStr,
-                                           double x, double y, double z,
-                                           double dx, double dy, double dz, double speed, int count,
-                                           boolean force,
-                                           java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
+    public static int spawnParticleParsed(net.minecraft.server.world.ServerWorld world, String particleStr,
+                                          double x, double y, double z,
+                                          double dx, double dy, double dz, double speed, int count,
+                                          boolean force,
+                                          java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
         try {
             net.minecraft.particle.ParticleEffect eff = net.minecraft.command.argument.ParticleEffectArgumentType
                     .readParameters(new com.mojang.brigadier.StringReader(particleStr), world.getRegistryManager());
-            spawnParticleEffect(world, eff, x, y, z, dx, dy, dz, speed, count, force, viewers);
-        } catch (Exception ignored) {}
+            return spawnParticleEffect(world, eff, x, y, z, dx, dy, dz, speed, count, force, viewers);
+        } catch (Exception ignored) { return 0; }   // 파싱 실패 = 바닐라 명령 실패(결과 없음)
     }
 
-    public static void spawnParticleEffect(net.minecraft.server.world.ServerWorld world,
-                                           net.minecraft.particle.ParticleEffect eff,
-                                           double x, double y, double z,
-                                           double dx, double dy, double dz, double speed, int count,
-                                           boolean force,
-                                           java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
+    /** @return 바닐라 ParticleCommand 의 결과값 — 파티클 패킷이 실제로 전달된 플레이어 수.
+     *  (`return run particle` / `execute store result … run particle` 이 이 값을 관측한다.) */
+    public static int spawnParticleEffect(net.minecraft.server.world.ServerWorld world,
+                                          net.minecraft.particle.ParticleEffect eff,
+                                          double x, double y, double z,
+                                          double dx, double dy, double dz, double speed, int count,
+                                          boolean force,
+                                          java.util.List<net.minecraft.server.network.ServerPlayerEntity> viewers) {
         if (viewers != null) {
-            // 지정된 플레이어에게만 표시(바닐라 viewers 시맨틱).
+            // 지정된 플레이어에게만 표시(바닐라 viewers 시맨틱). 바닐라와 동일하게 '전달된' 수만 센다.
+            int n = 0;
             for (net.minecraft.server.network.ServerPlayerEntity p : viewers) {
-                world.spawnParticles(p, eff, force, false, x, y, z, count, dx, dy, dz, speed);
+                if (world.spawnParticles(p, eff, force, false, x, y, z, count, dx, dy, dz, speed)) n++;
             }
-        } else {
-            world.spawnParticles(eff, force, false, x, y, z, count, dx, dy, dz, speed);
+            return n;
         }
+        // viewers 생략 = 월드 전체 대상. 브로드캐스트 오버로드가 전달 인원수를 그대로 돌려준다.
+        return world.spawnParticles(eff, force, false, x, y, z, count, dx, dy, dz, speed);
     }
 
     /** 명령 좌표 리터럴 파싱(바닐라 WorldCoordinate.parseDouble 의 centerIntegers 규칙).
@@ -3816,11 +3964,19 @@ public final class KfcGen {
     public static void summon(net.minecraft.server.world.ServerWorld world, String type,
                               double x, double y, double z, String nbtSnbt) {
         try {
+            // 바닐라 SummonCommand: 좌표가 월드 범위 밖이면 commands.summon.invalidPosition 으로
+            // 명령 실패 — 엔티티를 만들지 않는다(World.isValid 는 y 범위 + x/z ±3000만).
+            if (!net.minecraft.world.World.isValid(net.minecraft.util.math.BlockPos.ofFloored(x, y, z))) return;
             net.minecraft.nbt.NbtCompound nbt;
+            // 바닐라는 nbt 인자가 '없는' 형태(summon <e> / summon <e> <pos>)에서만 initialize=true 로
+            // MobEntity.initialize 를 돌린다(장비/변종/속성 랜덤화). nbt 를 준 3인자 형태는 false.
+            boolean initialize;
             if (nbtSnbt != null && !nbtSnbt.isEmpty()) {
                 nbt = net.minecraft.nbt.StringNbtReader.readCompound(nbtSnbt);
+                initialize = false;
             } else {
                 nbt = new net.minecraft.nbt.NbtCompound();
+                initialize = true;
             }
             nbt.putString("id", type.contains(":") ? type : "minecraft:" + type);
             net.minecraft.entity.Entity e = net.minecraft.entity.EntityType.loadEntityWithPassengers(
@@ -3829,6 +3985,11 @@ public final class KfcGen {
                         return ent;
                     });
             if (e != null) {
+                // 바닐라: spawnNewEntityAndPassengers 직전에 initialize (몹이 아니면 생략).
+                if (initialize && e instanceof net.minecraft.entity.mob.MobEntity mob) {
+                    mob.initialize(world, world.getLocalDifficulty(e.getBlockPos()),
+                                   net.minecraft.entity.SpawnReason.COMMAND, null);
+                }
                 world.spawnNewEntityAndPassengers(e); snapAdd(e);
             }
         } catch (Exception ex) {
@@ -7838,10 +7999,13 @@ public static net.minecraft.entity.Entity firstEntity(
         if (p == null) return false;
         try {
             boolean changed = false;
+            // 바닐라 NbtPath.insert(index, …): 대상은 NbtList 만이 아니라 AbstractNbtList 전체
+            // (NbtList/NbtByteArray/NbtIntArray/NbtLongArray)이고, 삽입은 addElement 로 한다 —
+            // 타입 불일치면 false 를 돌려주고 '변경 없음'이 된다(NbtList.add 처럼 예외를 던지지 않음).
+            // append = insert(-1) = size 위치, prepend = insert(0).
             for (net.minecraft.nbt.NbtElement el : p.getOrInit(root, net.minecraft.nbt.NbtList::new)) {
-                if (el instanceof net.minecraft.nbt.NbtList list) {
-                    list.add(prepend ? 0 : list.size(), elem.copy());
-                    changed = true;
+                if (el instanceof net.minecraft.nbt.AbstractNbtList lst) {
+                    if (lst.addElement(prepend ? 0 : lst.size(), elem.copy())) changed = true;
                 }
             }
             return changed;
@@ -7900,7 +8064,7 @@ public static net.minecraft.entity.Entity firstEntity(
 
     /** store result entity <sel> <path> <type> <scale> — 타입 숫자를 임의 NBT 경로에 기록. */
     public static void entityPutNumberPath(net.minecraft.entity.Entity e, String path, String type, double value) {
-        if (e == null) return;
+        if (e == null || !entityNbtWritable(e)) return;   // 바닐라 setNbt: 플레이어는 무변경(아래 Rotation 지름길 포함)
         // 회전(Rotation[0]=yaw, Rotation[1]=pitch)은 NBT 라운드트립 대신 직접 적용 —
         // 디스플레이 엔티티 등에서 writeNbt/readNbt 로는 라이브 회전이 확실히 갱신되지 않을 수 있다.
         if (path.equals("Rotation[0]")) {
@@ -7989,16 +8153,33 @@ public static net.minecraft.entity.Entity firstEntity(
 
     public static void storagePutNumber(net.minecraft.server.MinecraftServer server, String id,
                                         String path, double value, String type) {
+        storagePutNumberCount(server, id, path, value, type);
+    }
+
+    /** storagePutNumber + 바닐라 `data modify … set value <수치>` 의 결과값(변경 종단 수). */
+    public static int storagePutNumberCount(net.minecraft.server.MinecraftServer server, String id,
+                                            String path, double value, String type) {
         snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
         if (root == null) root = new net.minecraft.nbt.NbtCompound();
-        if (putAtPath(root, path, numberNbt(type, value))) storageSave(server, id, root);  // NbtPath
+        if (putAtPath(root, path, numberNbt(type, value))) { storageSave(server, id, root); return 1; }  // NbtPath
+        return 0;
     }
 
     /** 임의 SNBT 값을 경로에 기록. mode: set | append | prepend | merge.
      *  값 파싱은 `{v:<snbt>}` 로 감싸 readCompound — 리스트/문자열/컴파운드/숫자 전부 합법. */
     public static void storagePutSnbt(net.minecraft.server.MinecraftServer server, String id,
                                       String path, String snbt, String mode) {
+        storagePutSnbtCount(server, id, path, snbt, mode);
+    }
+
+    /** storagePutSnbt 와 동일 동작 + 바닐라 `data modify` 의 <b>결과값</b>(변경된 종단 수)을 반환.
+     *  바닐라 executeModify 는 modify 반환이 0 이면 commands.data.modify.failed 로 <b>명령 실패</b>,
+     *  아니면 그 수를 결과로 돌려준다. `return run data modify …` 가 이 값을 함수 반환값으로
+     *  전파하므로(= execute store result/success · if function 의 관측값) 카운트 판이 필요하다.
+     *  단일 종단 경로(이 팩 전량)에서 성공=1 / 실패=0 으로 바닐라와 일치한다. */
+    public static int storagePutSnbtCount(net.minecraft.server.MinecraftServer server, String id,
+                                          String path, String snbt, String mode) {
         snapBarrier(id);   // 23차: 이 storage 의 미실체화 바인드 스냅샷을 변이 전에 복사
         try {
             // SNBT 리터럴은 변환 시점 상수 — 매 호출 파싱 대신 캐시된 템플릿을 copy.
@@ -8010,7 +8191,7 @@ public static net.minecraft.entity.Entity firstEntity(
                     return v == null ? SNBT_INVALID : v;
                 } catch (Exception ex) { return SNBT_INVALID; }
             });
-            if (tmpl == SNBT_INVALID) return;
+            if (tmpl == SNBT_INVALID) return 0;
             net.minecraft.nbt.NbtElement val = tmpl.copy();
             net.minecraft.nbt.NbtCompound root = storageRoot(server, id);
             if (root == null) root = new net.minecraft.nbt.NbtCompound();
@@ -8024,7 +8205,8 @@ public static net.minecraft.entity.Entity firstEntity(
                 default        -> changed = putAtPath(root, path, val);   // set
             }
             if (changed) storageSave(server, id, root);
-        } catch (Exception ignored) {}
+            return changed ? 1 : 0;
+        } catch (Exception ignored) { return 0; }
     }
 
     /** data modify storage <id> <path> insert <index> value <snbt> — 리스트 index 앞 삽입.
@@ -8290,8 +8472,15 @@ public static net.minecraft.entity.Entity firstEntity(
      *  바닐라 /data modify entity 처럼 writeNbt→put→readNbt 라운드트립을 하되, put 반환(변경 개수)>0
      *  으로 성공을 판정한다. display fast-path 는 건너뛰고 전체 라운드트립을 쓴다(변경 개수 필요·희소 경로).
      *  vanilla store success 는 readNbt 가 나중에 경로를 버려도 put 개수 기준이므로 이 판정이 관측 동등. */
+    /** entityPutSnbt + 바닐라 `data modify entity … set value` 의 결과값(변경 종단 수 = 1/0).
+     *  `return run data modify entity …` 의 반환값 전파에 쓴다. */
+    public static int entityPutSnbtCount(net.minecraft.entity.Entity e, String path, String snbt) {
+        return entityPutSnbtChanged(e, path, snbt) ? 1 : 0;
+    }
+
     public static boolean entityPutSnbtChanged(net.minecraft.entity.Entity e, String path, String snbt) {
-        if (e == null) return false;
+        // 바닐라 executeModify 는 modify 성공 후 setNbt 에서 플레이어면 예외 → 명령 실패(=성공 0).
+        if (e == null || !entityNbtWritable(e)) return false;
         if (path != null && path.contains("CustomName")) invalidateNameOf(e);   // 해당 엔티티만(10차 전역→개별)
         try {
             net.minecraft.nbt.NbtElement tmpl = SNBT_CACHE.computeIfAbsent(snbt, s -> {
@@ -9386,13 +9575,13 @@ public static net.minecraft.entity.Entity firstEntity(
 
         // ── 2) 엔티티/서버/월드 참조를 보유하는 핫패스 캐시 ──
         CTX_CACHE = null;
-        SNAP_ENTITIES = null; SNAP_SERVER = null;
+        SNAP_ENTITIES = null; SNAP_SERVER = null; SNAP_WORLD = null;
         SNAP_TICK = MIN; SNAP_GEN = -1; SNAP_FP = 0; SNAP_TAG_FP = 0;
         PF_CACHE = null; PF_SERVER = null; PF_TICK = MIN; PF_GEN = -1; PF_MUT = -1;
-        TYPE_INDEX = null; TYPEIDX_SERVER = null; TYPEIDX_TICK = MIN; TYPEIDX_GEN = -1;
+        TYPE_INDEX = null; TYPEIDX_SERVER = null; TYPEIDX_WORLD = null; TYPEIDX_TICK = MIN; TYPEIDX_GEN = -1;
         TAG_BUCKETS.clear();
         TBC_CACHE.clear(); TBC_SERVER = null; TBC_TICK = MIN; TBC_GEN = -1;
-        TB_SERVER = null; TB_TICK = MIN; TB_GEN = -1; TB_PLN = -1; TB_PLH = 0;
+        TB_SERVER = null; TB_WORLD = null; TB_TICK = MIN; TB_GEN = -1; TB_PLN = -1; TB_PLH = 0;
         TB_RECON_TICK = MIN; TB_FP = Long.MIN_VALUE; TB_TAG_FP = Long.MIN_VALUE; TB_EPOCH++;
         ANY_MEMO.clear(); AM_SERVER = null; AM_TICK = MIN; AM_GEN = -1; AM_MUT = -1;
         ONP_MAP.clear(); ONP_VEH.clear();

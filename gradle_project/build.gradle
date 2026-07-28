@@ -210,10 +210,13 @@ tasks.register('kfcGenerate', Exec) {
         def jobs = project.findProperty('jobs')
         if (jobs) environment 'KFC_JOBS', jobs.toString()
         workingDir converterDir
-        commandLine pythonExe, "${converterDir}/convert.py", 'generate',
+        // -Ponserverstart : tick 함수를 START_SERVER_TICK 에서 실행(기본은 바닐라 함수 tick 지점).
+        def genArgs = [pythonExe, "${converterDir}/convert.py", 'generate',
                 kfcTrees.absolutePath,
                 project.file(datapack).absolutePath,
-                project.file(outDir).absolutePath
+                project.file(outDir).absolutePath]
+        if (project.hasProperty('onserverstart')) genArgs << '--onserverstart'
+        commandLine genArgs
     }
 }
 

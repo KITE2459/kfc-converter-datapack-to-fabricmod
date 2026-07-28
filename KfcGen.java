@@ -2182,6 +2182,41 @@ public final class KfcGen {
     private static long TICK_LAST = Long.MIN_VALUE;
     private static boolean TICK_POINT_SEEN = false;
 
+    // ── tick 실행 지점 선택 ────────────────────────────────────────────────
+    //  function    (기본) : CommandFunctionManager.tick — 바닐라 데이터팩과 완전히 같은 자리.
+    //                        tick 함수가 만든 패킷이 disableFlush 구간에 들어가 같은 틱의 엔티티
+    //                        위치 동기화와 한 배치로 전달된다.
+    //  serverstart        : Fabric START_SERVER_TICK — tickWorlds 호출 직전(= disableFlush 이전).
+    //                        패킷이 즉시 개별 flush 되어 위치 동기화보다 먼저 나간다.
+    //  [입력 지연] 두 지점 사이에는 ticks++ / tickManager.step() / disableFlush 뿐이고 서버
+    //  실행자 큐를 비우는 지점이 없다. 플레이어 입력 패킷은 forceMainThread → executeSync 로
+    //  큐에 쌓여 runTasksTillTickEnd(= 틱 사이)에서 적용되므로, 두 지점 모두 '직전 틱까지의
+    //  입력이 반영된 동일 상태'를 본다 → 조작 반영 지연 차이는 없다. 차이는 출력 패킷의
+    //  묶음/시점뿐이다.
+    //  변환 시 기본값은 ModEntry 가 주입하고, 런타임에 -Dkfc.tickpoint=function|serverstart 로
+    //  덮어쓸 수 있다(재변환 없이 A/B 비교용).
+    private static final String TICK_POINT_PROP = System.getProperty("kfc.tickpoint", "");
+    private static boolean TICK_AT_SERVER_START = false;
+
+    /** 진입점(ModEntry)이 부팅 시 1회 호출 — 변환 시 결정된 기본 지점을 주입한다.
+     *  시스템 프로퍼티가 지정돼 있으면 그쪽이 우선. */
+    public static void setTickPointServerStart(boolean generatedDefault) {
+        if ("serverstart".equalsIgnoreCase(TICK_POINT_PROP))      TICK_AT_SERVER_START = true;
+        else if ("function".equalsIgnoreCase(TICK_POINT_PROP))    TICK_AT_SERVER_START = false;
+        else                                                       TICK_AT_SERVER_START = generatedDefault;
+        System.out.println("[KFC] tick 실행 지점 = "
+                + (TICK_AT_SERVER_START ? "serverstart (START_SERVER_TICK)"
+                                        : "function (CommandFunctionManager.tick — 바닐라 동일)"));
+    }
+    public static boolean tickAtServerStart() { return TICK_AT_SERVER_START; }
+
+    /** START_SERVER_TICK 리스너용 — serverstart 모드일 때만 디스패치한다. */
+    public static void dispatchTickAtServerStart(net.minecraft.server.MinecraftServer server) {
+        if (!TICK_AT_SERVER_START) return;
+        setTickServer(server);
+        dispatchTick(server);
+    }
+
     /** 진입점(ModEntry)이 부팅 시 1회 등록. server 는 SERVER_STARTED 에서 채워진다. */
     public static void setTickHook(java.util.function.Consumer<net.minecraft.server.MinecraftServer> hook) {
         TICK_HOOK = hook;
@@ -2197,6 +2232,7 @@ public final class KfcGen {
     /** KfcTickPointMixin 이 바닐라 tick 함수 지점에서 호출. 틱당 1회만 디스패치한다. */
     public static void runTickHook() {
         TICK_POINT_SEEN = true;
+        if (TICK_AT_SERVER_START) return;   // serverstart 모드 — START_SERVER_TICK 이 이미 처리
         dispatchTick(TICK_SERVER);
     }
 
@@ -2205,7 +2241,7 @@ public final class KfcGen {
     /** 폴백(믹스인 미적용 시) 진입점이 호출 — 이미 이번 틱에 돌았으면 무시. */
     public static void dispatchTick(net.minecraft.server.MinecraftServer server) {
         if (server == null || TICK_HOOK == null) return;
-        if (!TICK_POINT_SEEN && !TICK_FALLBACK_WARNED) {
+        if (!TICK_POINT_SEEN && !TICK_AT_SERVER_START && !TICK_FALLBACK_WARNED) {
             TICK_FALLBACK_WARNED = true;
             System.out.println("[KFC] *** 경고: KfcTickPointMixin 미적용 — tick 함수를 "
                     + "END_SERVER_TICK 폴백에서 실행합니다(바닐라보다 늦은 시점, flush 배치 밖). "

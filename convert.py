@@ -17,6 +17,7 @@ convert.py - 데이터팩 -> 네이티브 Fabric 모드 소스 오케스트레�
   # 개별 단계(디버깅/수동 파싱용)
   python convert.py extract  <datapack(.zip|dir)> <out_lines.json>
   python convert.py generate <trees.json> <datapack(.zip|dir)> <out_src_dir> [--group <name>]
+         [--onserverstart]   # tick 함수를 START_SERVER_TICK 에서 실행(기본: 바닐라 함수 tick 지점)
 
 버전 변수(마인크래프트/Fabric)는 build_config.py 의 BuildProfile 로 격리한다.
 현재 기본 프로파일: MC 1.21.5 / Fabric Loader 0.18.4. 새 버전 지원 시 프로파일만 추가.
@@ -1440,14 +1441,20 @@ def fid_to_fqcn(fid: str, group: str) -> str:
     return f"{pkg}.{cls}" if segs[:-1] else f"{group}.{emit.sanitize(ns)}.{cls}"
 
 
+# --onserverstart 로 켜면 tick 함수를 Fabric START_SERVER_TICK 에서 돌린다(기본은 바닐라 지점).
+TICK_AT_SERVER_START = False
+
+
 def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set):
-    """ModInitializer 진입점 생성. tick -> START_SERVER_TICK 매틱(틱 시작).
+    """ModInitializer 진입점 생성. tick -> 바닐라 함수 tick 지점(기본) 또는 START_SERVER_TICK.
        load 함수는 데이터팩 load 태그(#minecraft:tags/function/load)가 바닐라 시맨틱으로 담당하므로
        진입점에서는 다루지 않는다(SERVER_STARTED 핸들러 불필요)."""
     tick_calls = []
     for fid in tags.get("tick", []):
         tick_calls.append(f"            {fid_to_fqcn(fid, group)}.executeReturn(src);")
     tick_body = "\n".join(tick_calls) if tick_calls else "            // (tick 함수 없음)"
+
+    tick_default_js = "true" if TICK_AT_SERVER_START else "false"
 
     n_load = len(tags.get("load", []))
     load_note = (f" *  - load 태그 함수 {n_load}개 -> 데이터팩 load 태그가 담당(자바 진입점 미관여)\n"
@@ -1515,14 +1522,17 @@ public final class ModEntry implements ModInitializer {{
         ServerLifecycleEvents.END_DATA_PACK_RELOAD.register(
                 (server, resourceManager, success) -> {group}.generated.KfcGen.resetAll("datapack-reload"));
 
-        // [tick 시점 — 바닐라 정합]
-        //   바닐라 #minecraft:tick 함수는 MinecraftServer.tickWorlds 안 commandFunctions 단계,
-        //   즉 networkHandler.disableFlush() 로 flush 가 억제된 구간에서 실행된다. Fabric 의
-        //   START_SERVER_TICK 은 tickWorlds '호출 직전'(disableFlush 이전)이라 이 구간 밖이고,
-        //   그래서 tick 함수가 만든 패킷이 같은 틱의 위치 동기화보다 한 배치 먼저 flush 됐다
-        //   (고속 이동 시 사운드가 이전 틱 위치로 공간화 = 감쇠·끊김).
-        //   KfcTickPointMixin 이 CommandFunctionManager.tick TAIL 에서 KfcGen.runTickHook 을
-        //   호출해 바닐라와 같은 자리에서 디스패치한다. 아래는 그 훅 본문 등록 + 안전망이다.
+        // [tick 실행 지점]
+        //   function(기본) : 바닐라 #minecraft:tick 함수와 같은 자리(CommandFunctionManager.tick).
+        //     바닐라는 MinecraftServer.tickWorlds 안 commandFunctions 단계에서 tick 함수를 돌리는데,
+        //     이 구간은 networkHandler.disableFlush() 로 flush 가 억제돼 있어 tick 함수가 만든
+        //     패킷이 같은 틱의 엔티티 위치 동기화와 한 배치로 전달된다.
+        //   serverstart    : Fabric START_SERVER_TICK(= tickWorlds 호출 직전, disableFlush 이전).
+        //     패킷이 즉시 개별 flush 되어 위치 동기화보다 먼저 나간다.
+        //   입력 반영 시점은 두 지점이 동일하다(둘 사이에 서버 실행자 큐를 비우는 지점이 없음)
+        //   — 조작 지연 차이는 없고, 달라지는 것은 출력 패킷의 묶음/시점뿐이다.
+        //   런타임에 -Dkfc.tickpoint=function|serverstart 로 덮어쓸 수 있다(재변환 없이 A/B).
+        {group}.generated.KfcGen.setTickPointServerStart({tick_default_js});
         {group}.generated.KfcGen.setTickHook(server -> {{
             ServerCommandSource src = server.getCommandSource().withSilent();
 {tick_body}
@@ -1530,10 +1540,14 @@ public final class ModEntry implements ModInitializer {{
         }});
         ServerLifecycleEvents.SERVER_STARTED.register(
                 server -> {group}.generated.KfcGen.setTickServer(server));
-        // 안전망: 믹스인이 적용되지 않은 환경(믹스인 충돌 등)에서도 틱당 1회는 반드시 돈다.
+        // serverstart 모드 디스패치(해당 모드가 아니면 무동작).
+        ServerTickEvents.START_SERVER_TICK.register(
+                server -> {group}.generated.KfcGen.dispatchTickAtServerStart(server));
+        // 안전망: function 모드인데 믹스인이 적용되지 않은 환경에서도 틱당 1회는 반드시 돈다.
         //   정상 환경에선 runTickHook 이 먼저 처리하므로 여기서는 중복 없이 무시된다.
         ServerTickEvents.END_SERVER_TICK.register(server -> {{
-            if (!{group}.generated.KfcGen.tickPointApplied()) {{
+            if (!{group}.generated.KfcGen.tickAtServerStart()
+                    && !{group}.generated.KfcGen.tickPointApplied()) {{
                 {group}.generated.KfcGen.setTickServer(server);
                 {group}.generated.KfcGen.dispatchTick(server);
             }}
@@ -1817,6 +1831,8 @@ def build(datapack_root: str, out_src_dir: str, argv: list):
     import assemble as _asm
     _asm.set_force_bridge(force)
     _asm.set_trace(traced)
+    global TICK_AT_SERVER_START
+    TICK_AT_SERVER_START = "--onserverstart" in argv
     generate(trees_json, datapack_root, out_src_dir, group, profile=profile,
              clean=("--no-clean" not in argv),
              merge=not any(f in argv for f in ("--no-merge", "--none-merge")))
@@ -1845,6 +1861,10 @@ def main():
         import assemble as _asm
         _asm.set_force_bridge(force)
         _asm.set_trace(traced)
+        global TICK_AT_SERVER_START
+        TICK_AT_SERVER_START = "--onserverstart" in sys.argv
+        if TICK_AT_SERVER_START:
+            print("[generate] tick 실행 지점: START_SERVER_TICK (--onserverstart)")
         if force:
             print(f"[generate] forced bridge prefix: {force}")
         from build_config import get_profile

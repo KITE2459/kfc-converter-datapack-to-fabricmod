@@ -6918,6 +6918,18 @@ public static net.minecraft.entity.Entity firstEntity(
         return gm != null && gm.asString().equals(name);
     }
 
+    /**
+     * gamemode=!X 셀렉터 필터. <b>{@code !gamemodeIs(e, X)} 와 다르다</b> — 바닐라
+     * EntitySelectorOptions 의 gamemode 술어는 부정형에서도 대상이 플레이어가 아니면 거짓이다
+     * (술어가 {@code entity instanceof ServerPlayerEntity && ...} 로 시작). 부정을 자바 {@code !}
+     * 로 표현하면 비플레이어 엔티티가 전부 통과해버린다.
+     */
+    public static boolean gamemodeIsNot(net.minecraft.entity.Entity e, String name) {
+        if (!(e instanceof net.minecraft.server.network.ServerPlayerEntity p)) return false;
+        net.minecraft.world.GameMode gm = p.interactionManager.getGameMode();
+        return gm == null || !gm.asString().equals(name);
+    }
+
     /** scores={obj=lo..hi} 1개 동반 @e/@n 존재검사 (Box 한정 재사용). */
     public static boolean anyEntityScored(GameContext ctx, net.minecraft.util.math.Vec3d origin,
                                           net.minecraft.entity.EntityType<?>[] types,

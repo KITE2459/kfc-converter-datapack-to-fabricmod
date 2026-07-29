@@ -897,6 +897,7 @@ def at_effect_cond(raw: str) -> str | None:
         return None
     guards = [f'KfcGen.hasEffect(_pp, {jstr(effect)})']
     guards += _tag_conds(sel, '_pp')
+    guards += _gamemode_conds(sel, '_pp')
     guards += _score_conds(sel, '_pp')
     if base == "s":
         return ('(executor instanceof net.minecraft.server.network.ServerPlayerEntity _pp && '
@@ -1012,11 +1013,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
         lo, hi = sel.distance
         conds.append(f'KfcGen.posInRange({src_var}.getPosition(), {evar}.getPos(), '
                      f'{_dist_arg(lo)}, {_dist_arg(hi)})')
-    # 회전(x_rotation/y_rotation)은 _selector_extra_conds 에서 일괄 추가(중복 방지).
-    # 게임모드
-    if sel.gamemode is not None:
-        ge = f'KfcGen.gamemodeIs({evar}, {jstr(sel.gamemode)})'
-        conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+    # 회전(x_rotation/y_rotation)·게임모드는 _selector_extra_conds 에서 일괄 추가(중복 방지).
     # 점수
     conds += _score_conds(sel, evar)
     # predicate (런타임 testPredicate 폴백 포함)
@@ -1025,7 +1022,7 @@ def _selector_entity_guards(sel, evar: str, src_var: str = "source", player: boo
         if pg is None:
             return None
         conds += pg
-    # team/name/level/nbt/advancements
+    # gamemode/team/name/level/nbt/advancements
     conds += _selector_extra_conds(sel, evar)
     return _order_guards(conds)
 
@@ -1089,9 +1086,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
         dx, dy, dz = sel.volume
         pc = _tag_conds(sel, '_pe')
         pc.append(f'KfcGen.posInBox({box_origin_expr(sel, src_var)}, {dx}, {dy}, {dz}, _pe)')
-        if sel.gamemode is not None:
-            ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
-            pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+        pc += _gamemode_conds(sel, '_pe')
         return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc)}))' 
     if sel.scores and sel.base != "s":
         # @e/@n + scores 1개: anyEntityScored 로 지원 (rectangle-hitbox/calc 의 #crashed 판정 등).
@@ -1184,9 +1179,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
             if lo3 is not None or hi3 is not None:
                 tagconds.append(f'KfcGen.posInRange({src_var}.getPosition(), _pe.getPos(), '
                                 f'{_dist_arg(lo3)}, {_dist_arg(hi3)})')
-            if sel.gamemode is not None:
-                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
-                tagconds.append(f'!({ge})' if sel.gamemode_neg else ge)
+            tagconds += _gamemode_conds(sel, '_pe')
             allc = " && ".join(tagconds + pexprs) if (tagconds or pexprs) else "true"
             return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({allc}))'
         return _selector_cond_general(sel, src_var)  # @e/@n+predicate 등 -> 범용 런타임
@@ -1213,9 +1206,7 @@ def selector_cond(sel: "Selector", src_var: str = "source") -> str | None:
                           f'{_dist_arg(dl)}, {_dist_arg(dh)})')
             _vc = _volume_cond(sel, "_pe", src_var)
             if _vc: pc.append(_vc)
-            if sel.gamemode is not None:
-                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
-                pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+            pc += _gamemode_conds(sel, '_pe')
             pc += _score_conds(sel, '_pe')
             return f'KfcGen.anyPlayerWhere(ctx, _pe -> ({" && ".join(pc) if pc else "true"}))'
         return f'KfcGen.anyPlayer(ctx, {src_var}.getPosition(), {tp}, {tn}, {lo}, {hi})'
@@ -1510,6 +1501,8 @@ def nearest_entity_java(sel: "Selector") -> str | None:
        대상이 스위칭돼(logmain 모델 2대 번갈아 전진 등) 관측이 어긋난다."""
     if sel is None or sel.scores or getattr(sel, "predicates", None) or _sel_has_extra(sel):
         return None
+    if sel.gamemode is not None:
+        return None   # nearestPlayer/firstPlayer 헬퍼는 게임모드 필터를 못 받는다 -> 상위 경로로 폴백
     lo = hi = "-1"
     if sel.distance is not None:
         dlo, dhi = sel.distance
@@ -2950,11 +2943,33 @@ def rotation_conds(sel, evar: str):
     return out
 
 
+def _gamemode_conds(sel, var: str) -> list:
+    """gamemode= 를 'bare boolean 조건식'으로 반환. 없으면 빈 리스트.
+
+       [바닐라 시맨틱] EntitySelectorOptions 의 gamemode 술어는 대상이 ServerPlayerEntity 가
+       아니면 **부정형(gamemode=!X) 에서도 거짓**이다:
+
+           entity -> entity instanceof ServerPlayerEntity p
+                     && (negated ? p.interactionManager.getGameMode() != mode
+                                 : p.interactionManager.getGameMode() == mode)
+
+       그래서 부정형을 `!KfcGen.gamemodeIs(e, "X")` 로 쓰면 비플레이어가 참이 되어 어긋난다.
+       전용 헬퍼 gamemodeIsNot 을 써서 두 방향 모두 '플레이어일 때만 참'을 유지한다."""
+    if sel is None or sel.gamemode is None:
+        return []
+    fn = "gamemodeIsNot" if sel.gamemode_neg else "gamemodeIs"
+    return [f'KfcGen.{fn}({var}, {jstr(sel.gamemode)})']
+
+
 def _selector_extra_conds(sel, var: str) -> list:
-    """team/level/name/nbt/advancements 를 'bare boolean 조건식'으로 반환(AND 빌더용).
+    """gamemode/team/level/name/nbt/advancements 를 'bare boolean 조건식'으로 반환(AND 빌더용).
        parse 는 되지만 이 필드들을 빠뜨리는 소비경로가 있으면 셀렉터가 느슨해져
-       거짓양성(예: nbt 조건 누락)이 난다. 그 누락을 막기 위한 공통 조건 생성기."""
-    c = []
+       거짓양성(예: nbt 조건 누락)이 난다. 그 누락을 막기 위한 공통 조건 생성기.
+
+       gamemode 가 여기 포함되기 전에는 `as @a[gamemode=adventure] ... run` 루프(emit_as_loop)
+       가 게임모드 필터를 통째로 잃고 **전체 플레이어**를 순회했다 — 관전자(spectator)에게까지
+       `effect clear @s night_vision` 이 걸려 야간투시가 사라지던 원인."""
+    c = _gamemode_conds(sel, var)
     if sel.team is not None:
         val, inv = sel.team
         c.append(f'KfcGen.teamIs({var}, {jstr(val)}, {str(inv).lower()})')
@@ -3129,9 +3144,7 @@ def _entity_loop_open_core(sel, var: str):
             dx, dy, dz = sel.volume
             conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, '
                          f'{dx}, {dy}, {dz}, {var})')
-        if sel.gamemode is not None:
-            ge = f'KfcGen.gamemodeIs({var}, {jstr(sel.gamemode)})'
-            conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+        # gamemode 는 아래 _selector_extra_conds 가 일괄 부착한다(중복 방지).
         if sel.distance:
             _dlo, _dhi = sel.distance
             _dmin = _dist_arg(_dlo)
@@ -3246,6 +3259,7 @@ def emit_stopsound(nn: list[str], args: dict, em: Emitted) -> bool:
     conds = _tag_conds(sel, '_sp')
     _vc = _volume_cond(sel, "_sp")
     if _vc: conds.append(_vc)
+    conds += _gamemode_conds(sel, '_sp')
     if conds:
         em.java.append(f'    if (!({" && ".join(conds)})) continue;')
     em.java.append("    " + call)
@@ -3305,6 +3319,7 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
     conds = _tag_conds(sel, '_ps')
     _vc = _volume_cond(sel, "_ps")
     if _vc: conds.append(_vc)
+    conds += _gamemode_conds(sel, '_ps')
     _cond_j = f'    if (!({" && ".join(conds)})) continue;' if conds else None
     _sd = _fresh_var("_sndSd")
     _any = _fresh_var("_sndAny")
@@ -3428,9 +3443,7 @@ def emit_tag_selector(verb: str, holder: str, name: str, em: Emitted) -> bool:
             # 회수 실패 → 방장 미이양) 바닐라와 어긋난다.
             dx, dy, dz = sel.volume
             conds.append(f'KfcGen.posInBox({box_origin_expr(sel, "source")}, {dx}, {dy}, {dz}, _t)')
-        if sel.gamemode is not None:
-            gexpr = f'KfcGen.gamemodeIs(_t, {jstr(sel.gamemode)})'
-            conds.append(f'!{gexpr}' if sel.gamemode_neg else gexpr)
+        conds += _gamemode_conds(sel, '_t')
         conds += _score_conds(sel, '_t')
         for ns, inv in _nbt_conds:
             conds.append(f'KfcGen.nbtMatches(_t, {ns}, {inv})')
@@ -4132,6 +4145,7 @@ def bossbar_player_collection(sel_raw: str, var: str):
         conds = _tag_conds(sel, '_pp')
         _vc = _volume_cond(sel, "_pp")
         if _vc: conds.append(_vc)
+        conds += _gamemode_conds(sel, '_pp')
         if sel.predicates:
             conds += predicate_guards(sel.predicates, "_pp", player=True)
         conds += _score_guards()
@@ -4146,6 +4160,7 @@ def bossbar_player_collection(sel_raw: str, var: str):
             guards.append(f'_pp.getCommandTags().contains({jstr(t)})')
         for t in sel.tags_neg:
             guards.append(f'!_pp.getCommandTags().contains({jstr(t)})')
+        guards += _gamemode_conds(sel, '_pp')
         if sel.predicates:
             guards += predicate_guards(sel.predicates, "_pp", player=True)
         guards += _score_guards()
@@ -4680,6 +4695,7 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
                 cs += [f'!_od.getCommandTags().contains({jstr(t)})' for t in dsel.tags_neg]
                 _vc = _volume_cond(dsel, "_od")
                 if _vc: cs.append(_vc)
+                cs += _gamemode_conds(dsel, '_od')
                 if cs:
                     body.append(f'    if (!({" && ".join(cs)})) continue;')
             elif lo is not None:
@@ -4720,6 +4736,7 @@ def emit_scoreboard_op_selector(args: dict, em: Emitted) -> bool:
                     cs += [f'!_os.getCommandTags().contains({jstr(t)})' for t in ssel.tags_neg]
                     _vc = _volume_cond(ssel, "_os")
                     if _vc: cs.append(_vc)
+                    cs += _gamemode_conds(ssel, '_os')
                     if cs:
                         body.append(f'    if (!({" && ".join(cs)})) continue;')
                 elif lo is not None:
@@ -6857,6 +6874,7 @@ def _emit_as_loop_recursive(line, head, tail, em, sel, uuid_raw=None):
                         em.reason = "as @s predicate 미해소"; return False
                     guards += pg
                 guards += _score_conds(sel, 'executor')
+                guards += _gamemode_conds(sel, 'executor')
                 # @s 의 distance 는 자기 자신(거리 0) -> 무시(항상 통과)
                 loop_open = [f'if ({" && ".join(guards)}) {{ net.minecraft.entity.Entity {_asE} = executor;']
             else:
@@ -8069,9 +8087,7 @@ def _particle_viewers_expr(raw: str) -> str | None:
         lo, hi = sel.distance
         conds.append(f'KfcGen.posInRange(source.getPosition(), _pv.getPos(), '
                      f'{_dist_arg(lo)}, {_dist_arg(hi)})')
-    if sel.gamemode is not None:
-        ge = f'KfcGen.gamemodeIs(_pv, {jstr(sel.gamemode)})'
-        conds.append(f'!({ge})' if sel.gamemode_neg else ge)
+    conds += _gamemode_conds(sel, '_pv')
     body = " && ".join(conds) if conds else "true"
     return f'KfcGen.filterPlayers(ctx, _pv -> ({body}))'
 
@@ -8126,9 +8142,7 @@ def single_entity_expr(raw: str) -> str | None:
         # 다른 셀렉터 분기(@p/@e)와 동일하게 scoreMatches 가드를 적용해 바닐라 무결성 회복.
         guards += _score_conds(sel, 'executor')
         # gamemode= 가드 (@s 가 플레이어일 때) - 마찬가지로 누락되어 있던 제약 복원.
-        if sel.gamemode is not None:
-            ge = f'KfcGen.gamemodeIs(executor, {jstr(sel.gamemode)})'
-            guards.append(f'!({ge})' if sel.gamemode_neg else ge)
+        guards += _gamemode_conds(sel, 'executor')
         if sel.type_id and not sel.type_is_tag:
             jt = entity_type_java(sel.type_id)
             if not jt:
@@ -8172,9 +8186,7 @@ def single_entity_expr(raw: str) -> str | None:
         _is_arbitrary = (sel.base == "a")
         if sel.gamemode is not None or sel.scores or sel.predicates or sel.x_rotation or sel.y_rotation or sel.volume is not None:
             pc = _tag_conds(sel, '_pe')
-            if sel.gamemode is not None:
-                ge = f'KfcGen.gamemodeIs(_pe, {jstr(sel.gamemode)})'
-                pc.append(f'!({ge})' if sel.gamemode_neg else ge)
+            pc += _gamemode_conds(sel, '_pe')
             pc += _score_conds(sel, '_pe')
             rcp = rotation_conds(sel, "_pe")
             if rcp is None:

@@ -4508,15 +4508,23 @@ public final class KfcGen {
     public static void lootGive(java.util.List<net.minecraft.item.ItemStack> loot,
                                 java.util.Collection<net.minecraft.server.network.ServerPlayerEntity> players) {
         if (loot == null) return;
-        for (net.minecraft.server.network.ServerPlayerEntity p : players)
-            for (net.minecraft.item.ItemStack st : loot) {
-                net.minecraft.item.ItemStack c = st.copy();
-                boolean inserted = p.getInventory().insertStack(c);
-                if (!inserted || !c.isEmpty()) {
-                    net.minecraft.entity.ItemEntity ie = p.dropItem(c, false);
-                    if (ie != null) { ie.resetPickupDelay(); ie.setOwner(p.getUuid()); }
-                }
-            }
+        // [바닐라 정합] 바닐라 LootCommand.executeGive 는 오직 insertStack 만 한다:
+        //     for (stack : stacks) for (player : players)
+        //         if (player.getInventory().insertStack(stack.copy())) list.add(stack);
+        // 삽입에 실패하거나(인벤토리 가득) 일부만 들어가면 <b>남은 분량은 그냥 버려진다</b> —
+        // /give 와 달리 바닥에 드롭하지 않는다(merged jar 소스 확인).
+        //
+        // 종전 구현은 /give 의 오버플로 드롭 시맨틱을 잘못 가져와, 인벤토리가 가득 찬
+        // 플레이어에게 `loot give` 가 돌 때마다 아이템 엔티티를 바닥에 뱉었다. 이게
+        // '멀티 로비 팀전에서 일부 유저에게만 팀 바꾸기 아이템이 계속 지급되는' 증상의 원인이다:
+        //   multiplay:hub/team-player 는 `unless items entity @s container.* jigsaw` 로 지급을
+        //   가드하는데, container.*(플레이어=메인 인벤 0~35)에 아이템이 못 들어가면 가드가 매 틱
+        //   계속 참이라 loot give 가 매 틱 재실행된다. 바닐라는 그때 조용히 아무것도 안 하지만,
+        //   종전 KFC 는 매 틱 지그소를 바닥에 드롭했다(가방이 여유 있는 유저는 정상이라 재현 안 됨).
+        // 인자 순회 순서도 바닐라와 동일하게 stack→player 로 맞춘다(다중 대상 시 삽입 순서 일치).
+        for (net.minecraft.item.ItemStack st : loot)
+            for (net.minecraft.server.network.ServerPlayerEntity p : players)
+                p.getInventory().insertStack(st.copy());
     }
 
     /** target: spawn <pos> — ItemEntity 스폰. executeSpawn 그대로. */

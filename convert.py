@@ -1536,6 +1536,13 @@ public final class ModEntry implements ModInitializer {{
         }} catch (NoSuchFieldException e) {{
             System.out.println("[KFC]   Perf(Entity) = MISSING");
         }} catch (Throwable t) {{ System.out.println("[KFC]   Perf(Entity) = ERROR " + t); }}
+        // Nd : Entity 가 KfcGen.NdHolder(엔티티 부착 캐시 슬롯)를 구현하는지. MISSING 이면
+        //      ndOf/승객 평탄화가 종전 IdentityHashMap 경로로 폴백한다(동작 동일, 최적화 소실).
+        try {{
+            boolean nd = {group}.generated.KfcGen.NdHolder.class.isAssignableFrom(
+                    net.minecraft.entity.Entity.class);
+            System.out.println("[KFC]   Nd(Entity slots) = " + (nd ? "APPLIED" : "MISSING"));
+        }} catch (Throwable t) {{ System.out.println("[KFC]   Nd(Entity slots) = ERROR " + t); }}
         // [월드 수명 경계 — 캐시/메모리 전체 해제]
         //   ModInitializer 는 JVM 당 1회 실행이고 KfcGen 의 캐시는 전부 static 이라 게임을
         //   끄기 전까지 살아남는다. 반면 싱글플레이에서 '월드 나가기'를 하면 통합 서버

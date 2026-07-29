@@ -502,6 +502,14 @@ public final class KfcGen {
     // 무효화 조건: (a) 서버 틱이 바뀜(getTicks) → 게임이 스폰/디스폰한 변화 반영,
     //            (b) 우리 명령이 엔티티를 추가/제거(summon/lootSpawn/killEntity) → ENTITY_GEN 증가.
     static long ENTITY_GEN = 0;
+
+    // [27차 측정 후 폐기] ENTITY_NBT_SNAP 을 ENTITY_GEN 에서 떼어내 전용 축(NBT_GEN)으로 옮겨
+    // '우리 자신의 소환/킬'이 무관한 엔티티의 NBT 스냅샷을 버리지 않게 하는 안을 구현·실측했다.
+    // 대상(Entity.writeNbt)은 0.234 -> 0.209 ms/tick 로 줄었으나 실작업 전체는 10.65 -> 10.97 로
+    // 악화됐다. 이 맵이 Collections.synchronizedMap(WeakHashMap) 이라 invalidateSnapshot 1회가
+    // '모니터 + identityHashCode + stale 정리'인데, 축 분리는 long 증가 1회를 소환/킬마다 그
+    // remove 여러 번으로 바꾼다(실측 System.identityHashCode +0.05 ms/tick). 무효화가 공짜여도
+    // 상한이 0.026 ms/tick(실작업의 0.25%)이라 재시도 가치가 없다.
     private static net.minecraft.server.MinecraftServer SNAP_SERVER;
     private static net.minecraft.server.world.ServerWorld SNAP_WORLD;
     private static int  SNAP_TICK = Integer.MIN_VALUE;
@@ -2921,6 +2929,40 @@ public final class KfcGen {
     private static long ND_NGEN = -1;
     private static int  ND_RECON_TICK = Integer.MIN_VALUE;    // 22차: 100틱 주기 화해 스탬프
 
+    /**
+     * [27차 — 엔티티 부착 슬롯] 엔티티 키 캐시를 <b>맵에서 엔티티 필드로</b> 옮기기 위한 덕 인터페이스.
+     * {@code KfcEntityNdMixin}(Entity 클래스 믹스인)이 {@code @Unique} 필드 4개로 구현하며,
+     * 믹스인이 붙으면 {@code Entity instanceof NdHolder} 가 참이 된다.
+     *
+     * <p><b>왜</b> — spark 실측(16인 주행, 실작업 27,048ms 기준): {@code IdentityHashMap.get}
+     * 444ms(1.64%) + {@code System.identityHashCode} 272ms(1.01%) + {@code ndOf} self 504ms(1.86%).
+     * ndOf 본문은 맵 조회 한 줄뿐이므로 이 비용은 사실상 <b>전부 해시 조회</b>다. 조회 대상이
+     * 이미 손에 든 엔티티 객체이므로, 값을 그 객체에 얹으면 조회 자체가 필드 로드 1회로 사라진다.
+     * (승객 수백 파츠 카트 × 틱당 on-passengers 재구축이 이 경로의 지배 호출원이다.)
+     *
+     * <p><b>무효화 계약</b> — 맵 전량 폐기({@code ND_MAP.clear()})는 전역 스탬프 {@code ND_STAMP}
+     * 증가로 대체한다. 엔티티 슬롯은 {@code kfc$ndStamp() == ND_STAMP} 일 때만 유효하므로
+     * '전량 폐기 = O(1) 스탬프 증가'이고 무효화 시점/범위는 종전과 <b>정확히 동일</b>하다.
+     * 개별 무효화({@code invalidateNameOf})는 슬롯 스탬프를 0(=영원히 불일치)으로 만든다.
+     * 부수 효과로 죽은 엔티티를 맵이 붙잡던 강참조가 사라진다(슬롯은 엔티티와 함께 소멸).
+     *
+     * <p><b>fail-safe</b> — 믹스인 미적용이면 {@code instanceof} 가 거짓이라 종전 {@code ND_MAP}
+     * 경로를 그대로 탄다(관측 동일, 최적화만 소실). 크래시 경로 없음.
+     */
+    public interface NdHolder {
+        Object[] kfc$nd();            void kfc$nd(Object[] v);
+        long     kfc$ndStamp();       void kfc$ndStamp(long s);
+    }
+
+    /** ND 슬롯 유효 스탬프. 0 은 '무효' 예약값이므로 1 에서 시작해 단조 증가만 한다. */
+    private static long ND_STAMP = 1;
+
+    /** 종전 {@code ND_MAP.clear()} 자리 — 맵(폴백 경로)과 엔티티 슬롯(스탬프)을 함께 폐기. */
+    private static void ndDropAll() {
+        ND_MAP.clear();
+        ND_STAMP++;
+    }
+
     private static final class Wef {
         static byte state = 0;   // 0=미프로브 1=활성(자기검증 통과) 2=영구 vanilla 폴백
         static java.lang.reflect.Constructor<net.minecraft.server.command.ServerCommandSource> ctor;
@@ -3093,11 +3135,11 @@ public final class KfcGen {
                     ND_RECON_TICK = tk - RECON_PHASE_ND;      // 위상 분산
                 } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
                     ND_RECON_TICK = tk;
-                    if (reconEnabled()) ND_MAP.clear();
+                    if (reconEnabled()) ndDropAll();
                 }
             }
             if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
-                ND_MAP.clear(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
+                ndDropAll(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
             }
             Object[] nd = ndOf(p);
             net.minecraft.server.command.ServerCommandSource fast =
@@ -3644,6 +3686,17 @@ public final class KfcGen {
      * 바닐라는 매번 새 인스턴스를 주고 소비자가 MutableText 를 제자리 변형할 수 있다.
      */
     private static Object[] ndOf(net.minecraft.entity.Entity p) {
+        // 27차: 엔티티 부착 슬롯 우선(해시 조회 0). 스탬프 불일치/미적용이면 종전 맵 경로.
+        if (p instanceof NdHolder h) {
+            if (h.kfc$ndStamp() == ND_STAMP) {
+                Object[] hit = h.kfc$nd();
+                if (hit != null) return hit;
+            }
+            Object[] fresh = new Object[] { p.getName().getString(), p.getDisplayName() };
+            h.kfc$nd(fresh);
+            h.kfc$ndStamp(ND_STAMP);
+            return fresh;
+        }
         Object[] nd = ND_MAP.get(p);
         if (nd == null) {
             nd = new Object[] { p.getName().getString(), p.getDisplayName() };
@@ -3669,7 +3722,9 @@ public final class KfcGen {
      * 멤버십을 추적하지 않기 때문이다(fail-closed).
      */
     public static void invalidateNameOf(net.minecraft.entity.Entity e) {
-        if (e != null) ND_MAP.remove(e);
+        if (e == null) return;
+        if (e instanceof NdHolder h) { h.kfc$ndStamp(0L); h.kfc$nd(null); }   // 0 = 영원히 불일치
+        ND_MAP.remove(e);
     }
 
     /** ND 캐시 유효화(틱 경계 주기 화해 + 서버/NAME_GEN 변화). withEntitySrc 와 동일 규약. */
@@ -3681,11 +3736,11 @@ public final class KfcGen {
                 ND_RECON_TICK = tk - RECON_PHASE_ND;          // 위상 분산
             } else if (tk - ND_RECON_TICK >= RECON_TICKS) {
                 ND_RECON_TICK = tk;
-                if (reconEnabled()) ND_MAP.clear();
+                if (reconEnabled()) ndDropAll();
             }
         }
         if (ND_SERVER != sv || ND_NGEN != NAME_GEN) {
-            ND_MAP.clear(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
+            ndDropAll(); ND_SERVER = sv; ND_NGEN = NAME_GEN;
         }
     }
 
@@ -4747,6 +4802,18 @@ public final class KfcGen {
      *  ImmutableList.isEmpty → AbstractCollection.isEmpty → size)으로 ~2.0%p 를 태웠다
      *  (수백 파츠 × 틱당 미세이동 수). 진입부 size 검사 + 인덱스 순회로 교체 — 가드 체인과
      *  이터레이터 할당이 사라진다. 이동 순서/결과는 종전과 완전 동일(동일 리스트, 동일 순번). */
+    // [27차 철회 — 재시도 금지] 이 순회 결과를 (틱, ENTITY_GEN, RIDE_MUT) 스탬프로 vehicle 에
+    // 캐시해 틱당 1회 평탄화로 줄이는 시도를 했다가 원복했다. 그 스탬프 축은 **불완전**하다:
+    // 풀 텔레포트(teleportTo)는 탑승자를 stopRiding 으로 하차시키면서 RIDE_MUT/ENTITY_GEN 중
+    // 어느 것도 올리지 않는다(아래 teleportTo 주석 '① 탑승자 직접 tp 시 stopRiding' 참조).
+    // 매번 새로 받는 getPassengersDeep() 는 하차분이 자동으로 빠지지만, 캐시는 **이미 하차한
+    // 엔티티를 계속 delta 로 끌고 다닌다** → 남겨졌어야 할 파츠가 매 틱 차량을 따라 이동.
+    // spark 실측 회귀: MathHelper.packDegrees 72ms → 856ms(12배, 트래커 회전 동기화 폭증),
+    // ReferenceLinkedOpenHashSet.add/remove +0.49ms/tick(AreaMap — 섹션 이동 급증),
+    // NearbyEntityTracking.tick/handleTracker +0.27ms/tick.
+    // 다시 캐시하려면 Entity.addPassenger/removePassenger 에 믹스인 훅을 걸어 탑승 위상 전용
+    // 세대를 만들고(누가 바꾸든 잡힘), 그 훅이 '적용됐음'이 확인된 뒤에만 캐시를 켜야 한다
+    // (KfcEntityTagMixin 의 TAG_HOOK_ACTIVE 자기 부트스트랩 게이트와 동일 패턴).
     private static void _movePassengersByDelta(net.minecraft.entity.Entity vehicle,
                                                double dx, double dy, double dz) {
         // [실측] 종전 재귀(depth 마다 getPassengerList + 프레임)가 self 의 최상위였다(카트 모델은
@@ -7627,8 +7694,25 @@ public static net.minecraft.entity.Entity firstEntity(
     //   (실 필드 Pos/Rotation/Tags/attributes/Passengers/Health 등은 쓰기 전 직렬화에 키가 있어
     //    절대 droppable 로 분류되지 않고 기존과 동일하게 round-trip 한다.)
     //  보편성: 특정 데이터팩/경로 하드코딩 없음 — 어떤 엔티티·경로든 런타임 관측으로 판정한다.
-    private static final java.util.Map<String, Boolean> NBT_DROP =
-            new java.util.HashMap<>();
+    // 27차: 종전 키는 (클래스명 + '\0' + 최상위키) 문자열 연결이었다. 판정 자체는 (클래스, 키)당
+    // 1회지만 '조회'는 엔티티 NBT 읽기/쓰기마다 일어나므로, 조회마다 40자+ 문자열을 새로 만들고
+    // 그걸 해싱·비교하고 있었다(spark: HashMap.getNode 1072ms/3.96% + String.equals 316ms 의 지분).
+    // 튜플을 그대로 2단 맵으로 표현하면 연결·해싱이 사라진다 — 키 집합·판정 의미는 완전 동일.
+    // 1단은 클래스 identity(Reference 맵 — Class 는 equals 가 곧 identity), 2단은 최상위 키.
+    private static final java.util.Map<Class<?>, java.util.HashMap<String, Boolean>> NBT_DROP =
+            new it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap<>();
+
+    /** (엔티티 클래스, 최상위 키) 의 구조적 no-op 판정 — 미관측이면 null. */
+    private static Boolean dropState(net.minecraft.entity.Entity e, String topKey) {
+        java.util.HashMap<String, Boolean> m = NBT_DROP.get(e.getClass());
+        return (m == null) ? null : m.get(topKey);
+    }
+
+    private static void dropPut(net.minecraft.entity.Entity e, String topKey, Boolean v) {
+        java.util.HashMap<String, Boolean> m = NBT_DROP.get(e.getClass());
+        if (m == null) { m = new java.util.HashMap<>(); NBT_DROP.put(e.getClass(), m); }
+        m.put(topKey, v);
+    }
 
     private static String topSeg(String path) {
         int end = path.length();
@@ -7636,12 +7720,9 @@ public static net.minecraft.entity.Entity firstEntity(
         int br  = path.indexOf('['); if (br  >= 0 && br  < end) end = br;
         return path.substring(0, end);
     }
-    private static String dropKey(net.minecraft.entity.Entity e, String topKey) {
-        return e.getClass().getName() + '\u0000' + topKey;
-    }
     /** 이 경로가 (엔티티 클래스 기준) 구조적으로 버려지는 no-op 경로로 이미 판정됐는가. */
     private static boolean nbtPathDroppable(net.minecraft.entity.Entity e, String path) {
-        return NBT_DROP.get(dropKey(e, topSeg(path))) == Boolean.TRUE;
+        return dropState(e, topSeg(path)) == Boolean.TRUE;
     }
 
     /** writeNbt→put→readNbt 엔티티 NBT 쓰기 공통 경로 + 구조적 no-op 자가검증/생략.
@@ -7650,8 +7731,7 @@ public static net.minecraft.entity.Entity firstEntity(
                                            net.minecraft.nbt.NbtElement v) {
         if (e == null || v == null) return;
         String top = topSeg(path.replace(" ", ""));
-        String k = dropKey(e, top);
-        Boolean known = NBT_DROP.get(k);
+        Boolean known = dropState(e, top);
         if (known != null) {
             if (known) return;                       // 구조적 no-op — writeNbt 생략(엔티티 불변)
             // effective — 작업 컴파운드를 읽기 스냅샷 캐시의 copy 로 조달(웜이면 직렬화 0회,
@@ -7682,7 +7762,7 @@ public static net.minecraft.entity.Entity firstEntity(
         e.writeNbt(after);
         boolean afterHas = after.contains(top);
         // 전·후 모두 최상위 키 부재 = readNbt 가 버림 = 구조적 droppable(값-독립).
-        NBT_DROP.put(k, (!beforeHas && !afterHas) ? Boolean.TRUE : Boolean.FALSE);
+        dropPut(e, top, (!beforeHas && !afterHas) ? Boolean.TRUE : Boolean.FALSE);
     }
 
     // ── source 읽기 ──
@@ -9627,7 +9707,7 @@ public static net.minecraft.entity.Entity firstEntity(
         ANY_MEMO.clear(); AM_SERVER = null; AM_TICK = MIN; AM_GEN = -1; AM_MUT = -1;
         ONP_MAP.clear(); ONP_VEH.clear();
         ONP_MAP_SERVER = null; ONP_MAP_TICK = MIN; ONP_MAP_GEN = -1;
-        ND_MAP.clear(); ND_SERVER = null; ND_TICK = MIN; ND_NGEN = -1; ND_RECON_TICK = MIN;
+        ndDropAll(); ND_SERVER = null; ND_TICK = MIN; ND_NGEN = -1; ND_RECON_TICK = MIN;
         ENTITY_NBT_SNAP.clear();
         NAME_CACHE.clear();          // WeakHashMap 이지만 즉시 반환(엔트리 purge 는 접근 시에만 일어남)
 

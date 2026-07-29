@@ -1075,7 +1075,7 @@ public final class KfcGen {
     // [자기 부트스트랩] 훅이 실제로 도는 것이 확인되기 전에는 분류기가 종전대로 BR_TAG 를
     // 유지한다. 첫 발동에서 플래그를 켜고 마스크 memo 를 비워, 이후 tag 명령이 BR_NBT 만
     // 내도록 재계산되게 한다. 믹스인 미적용 시 플래그는 영원히 false → 종전 동작 그대로.
-    static boolean TAG_HOOK_ACTIVE = false;
+    static boolean TAG_HOOK_ACTIVE = true;   // 31차: 믹스인 정상적용 전제 — 부팅부터 활성
     private static final boolean TAG_HOOK_ENABLED =
             !"off".equalsIgnoreCase(System.getProperty("kfc.taghook", "on"));
 
@@ -2971,8 +2971,6 @@ public final class KfcGen {
     //   · 어떤 실패든 [KFC-WEF] disabled: <사유> 1회 로그 후 영구 vanilla 폴백(fail-closed).
     //     최초 실사용 1회는 vanilla 결과와 식별 14필드 전수 비교 자기검증을 통과해야 활성화.
     private static long NAME_GEN = 0;
-    private static final java.util.IdentityHashMap<net.minecraft.entity.Entity, Object[]> ND_MAP =
-            new java.util.IdentityHashMap<>();
     private static net.minecraft.server.MinecraftServer ND_SERVER;
     private static int  ND_TICK = Integer.MIN_VALUE;          // 22차: 화해 주기 판정용(무효화 축 아님)
     private static long ND_NGEN = -1;
@@ -2989,26 +2987,30 @@ public final class KfcGen {
      * 이미 손에 든 엔티티 객체이므로, 값을 그 객체에 얹으면 조회 자체가 필드 로드 1회로 사라진다.
      * (승객 수백 파츠 카트 × 틱당 on-passengers 재구축이 이 경로의 지배 호출원이다.)
      *
-     * <p><b>무효화 계약</b> — 맵 전량 폐기({@code ND_MAP.clear()})는 전역 스탬프 {@code ND_STAMP}
+     * <p><b>무효화 계약</b> — 전량 폐기는 전역 스탬프 {@code ND_STAMP}
      * 증가로 대체한다. 엔티티 슬롯은 {@code kfc$ndStamp() == ND_STAMP} 일 때만 유효하므로
      * '전량 폐기 = O(1) 스탬프 증가'이고 무효화 시점/범위는 종전과 <b>정확히 동일</b>하다.
      * 개별 무효화({@code invalidateNameOf})는 슬롯 스탬프를 0(=영원히 불일치)으로 만든다.
      * 부수 효과로 죽은 엔티티를 맵이 붙잡던 강참조가 사라진다(슬롯은 엔티티와 함께 소멸).
      *
-     * <p><b>fail-safe</b> — 믹스인 미적용이면 {@code instanceof} 가 거짓이라 종전 {@code ND_MAP}
-     * 경로를 그대로 탄다(관측 동일, 최적화만 소실). 크래시 경로 없음.
+     * <p><b>31차 전제</b> — 믹스인 정상적용을 전제로 폴백(구 ND_MAP 경로)을 제거했다. 미적용
+     * 환경이면 첫 사용에서 CCE 로 즉시 실패한다. 다중 변환 모드 동시 탑재는 convert.py 가 멤버를
+     * {@code kfc$<modid>$X} 로 네임스페이스해 충돌 없이 각자 적용된다.
      */
     public interface NdHolder {
         Object[] kfc$nd();            void kfc$nd(Object[] v);
         long     kfc$ndStamp();       void kfc$ndStamp(long s);
+        /** 30차: 승객 트리 평탄화 캐시 — RIDE_TOPO_GEN(변이 지점 훅) 축. 훅 활성 시에만 사용. */
+        java.util.List<net.minecraft.entity.Entity> kfc$deep();
+        void     kfc$deep(java.util.List<net.minecraft.entity.Entity> v);
+        long     kfc$deepStamp();     void kfc$deepStamp(long s);
     }
 
     /** ND 슬롯 유효 스탬프. 0 은 '무효' 예약값이므로 1 에서 시작해 단조 증가만 한다. */
     private static long ND_STAMP = 1;
 
-    /** 종전 {@code ND_MAP.clear()} 자리 — 맵(폴백 경로)과 엔티티 슬롯(스탬프)을 함께 폐기. */
+    /** ND 슬롯 전량 폐기 = 전역 스탬프 증가(O(1)). */
     private static void ndDropAll() {
-        ND_MAP.clear();
         ND_STAMP++;
     }
 
@@ -3709,13 +3711,7 @@ public final class KfcGen {
     // 두 with 의 합성과 정확히 같은 pos/rot 소스). null 은 바닐라 at 처럼 no-op(src 유지).
     // [D-10] KfcScsMixin(접근자+생성자 인보커) 적용 시 '단일 생성' 리바인드. 미적용이면
     // instanceof 가 거짓 → 기존 with* 체인 폴백(관측 동일). 첫 융합 시 1회 로그(적용 검증용).
-    private static boolean SCS_FUSE_LOGGED = false;
-    private static void scsFuseLog() {
-        if (!SCS_FUSE_LOGGED) {
-            SCS_FUSE_LOGGED = true;
-            System.out.println("[KFC] SCS fused rebind active (KfcScsMixin single-construction)");
-        }
-    }
+
 
     /**
      * SCS 리바인드용 (name, displayName) 캐시 조회.
@@ -3735,23 +3731,17 @@ public final class KfcGen {
      * 바닐라는 매번 새 인스턴스를 주고 소비자가 MutableText 를 제자리 변형할 수 있다.
      */
     private static Object[] ndOf(net.minecraft.entity.Entity p) {
-        // 27차: 엔티티 부착 슬롯 우선(해시 조회 0). 스탬프 불일치/미적용이면 종전 맵 경로.
-        if (p instanceof NdHolder h) {
-            if (h.kfc$ndStamp() == ND_STAMP) {
-                Object[] hit = h.kfc$nd();
-                if (hit != null) return hit;
-            }
-            Object[] fresh = new Object[] { p.getName().getString(), p.getDisplayName() };
-            h.kfc$nd(fresh);
-            h.kfc$ndStamp(ND_STAMP);
-            return fresh;
+        // 31차: 믹스인 정상적용 전제(다중 모드는 멤버 네임스페이스로 충돌 차단) — 슬롯 직행.
+        // 미적용 환경이면 여기서 CCE 로 즉시·시끄럽게 실패한다(조용한 성능 저하보다 낫다).
+        NdHolder h = (NdHolder) p;
+        if (h.kfc$ndStamp() == ND_STAMP) {
+            Object[] hit = h.kfc$nd();
+            if (hit != null) return hit;
         }
-        Object[] nd = ND_MAP.get(p);
-        if (nd == null) {
-            nd = new Object[] { p.getName().getString(), p.getDisplayName() };
-            ND_MAP.put(p, nd);
-        }
-        return nd;
+        Object[] fresh = new Object[] { p.getName().getString(), p.getDisplayName() };
+        h.kfc$nd(fresh);
+        h.kfc$ndStamp(ND_STAMP);
+        return fresh;
     }
 
     /**
@@ -3772,8 +3762,8 @@ public final class KfcGen {
      */
     public static void invalidateNameOf(net.minecraft.entity.Entity e) {
         if (e == null) return;
-        if (e instanceof NdHolder h) { h.kfc$ndStamp(0L); h.kfc$nd(null); }   // 0 = 영원히 불일치
-        ND_MAP.remove(e);
+        NdHolder h = (NdHolder) e;
+        h.kfc$ndStamp(0L); h.kfc$nd(null);   // 0 = 영원히 불일치
     }
 
     /** ND 캐시 유효화(틱 경계 주기 화해 + 서버/NAME_GEN 변화). withEntitySrc 와 동일 규약. */
@@ -3803,8 +3793,7 @@ public final class KfcGen {
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
         if (e == null) return src;
         if (src.getEntity() == e) return src;              // 바닐라 동일-엔티티 단락
-        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
-            scsFuseLog();
+        { __KFC_GROUP__.mixin.KfcScsMixin acc = (__KFC_GROUP__.mixin.KfcScsMixin) (Object) src;
             net.minecraft.server.MinecraftServer sv = src.getServer();
             ndSync(sv);
             Object[] nd = ndOf(e);
@@ -3815,14 +3804,12 @@ public final class KfcGen {
                     sv, e, src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
         }
-        return src.withEntity(e);
     }
 
     public static net.minecraft.server.command.ServerCommandSource atEntity(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
         if (e == null) return src;
-        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
-            scsFuseLog();
+        { __KFC_GROUP__.mixin.KfcScsMixin acc = (__KFC_GROUP__.mixin.KfcScsMixin) (Object) src;
             // 기존 withWorld+withPosition+withRotation 3-체인과 필드 단위로 동일.
             // [바닐라 정합] 바닐라 `at <targets>` 는 withWorld((ServerWorld)entity.getWorld()) 를
             // '먼저' 적용한 뒤 위치/회전을 바꾼다(ExecuteCommand 바이트코드 확인). 종전엔 월드를
@@ -3835,9 +3822,6 @@ public final class KfcGen {
                     src.getServer(), src.getEntity(), src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
         }
-        return src.withWorld(atWorldOf(src, e))
-                  .withPosition(e.getPos())
-                  .withRotation(new net.minecraft.util.math.Vec2f(e.getPitch(), e.getYaw()));
     }
 
     /** 바닐라 `at`/`positioned as` 의 월드 재바인딩 — 대상 엔티티가 속한 ServerWorld.
@@ -3853,8 +3837,7 @@ public final class KfcGen {
     public static net.minecraft.server.command.ServerCommandSource withEntityAt(
             net.minecraft.server.command.ServerCommandSource src, net.minecraft.entity.Entity e) {
         if (e == null) return src;
-        if (src instanceof __KFC_GROUP__.mixin.KfcScsMixin acc) {
-            scsFuseLog();
+        { __KFC_GROUP__.mixin.KfcScsMixin acc = (__KFC_GROUP__.mixin.KfcScsMixin) (Object) src;
             // [버그 수정] 종전엔 name 을 e.getNameForScoreboard() 로 넣었으나, 바닐라
             // ServerCommandSource.withEntity 는 e.getName().getString() 을 쓴다(바이트코드 확인).
             // 비플레이어(디스플레이 파츠 등)는 전자가 UUID 문자열이라 SCS.getName() 이 어긋났다.
@@ -3871,7 +3854,6 @@ public final class KfcGen {
                     sv, e, src.isSilent(), src.getReturnValueConsumer(),
                     src.getEntityAnchor(), src.getSignedArguments(), src.getMessageChainTaskQueue());
         }
-        return atEntity(src.withEntity(e), e);
     }
 
     /** anchored eyes — caret(^) 원점을 실행자 눈 위치로(소스 위치 리바인드). */
@@ -4851,6 +4833,30 @@ public final class KfcGen {
      *  ImmutableList.isEmpty → AbstractCollection.isEmpty → size)으로 ~2.0%p 를 태웠다
      *  (수백 파츠 × 틱당 미세이동 수). 진입부 size 검사 + 인덱스 순회로 교체 — 가드 체인과
      *  이터레이터 할당이 사라진다. 이동 순서/결과는 종전과 완전 동일(동일 리스트, 동일 순번). */
+    // ── [30차] 탑승 위상 세대 — KfcRideMixin(addPassenger/removePassenger RETURN)이 올린다 ──
+    // 27차 철회 주석(아래)의 처방 그대로: 축이 '변이 지점 그 자체'라 teleportTo 하차·kill·타 모드
+    // 경로 전부가 구조적으로 잡힌다. 훅 첫 발동 전에는 캐시 미사용(자기 부트스트랩, fail-safe).
+    private static long RIDE_TOPO_GEN = 1;         // 0 = 슬롯 무효 예약값
+    public static void onRideTopologyChanged() {
+        RIDE_TOPO_GEN++;
+    }
+
+    /** vehicle 의 직접+중첩 승객 평탄 리스트. 훅 활성 + 슬롯 스탬프 일치 시 재사용, 아니면 1회
+     *  평탄화 후 슬롯에 기록. 훅 비활성/믹스인 미적용이면 항상 신선 순회(종전과 동일). */
+    private static java.util.List<net.minecraft.entity.Entity> passengersDeepCached(
+            net.minecraft.entity.Entity vehicle) {
+        NdHolder h = (NdHolder) vehicle;   // 31차: 믹스인 정상적용 전제(미적용이면 즉시 CCE)
+        if (h.kfc$deepStamp() == RIDE_TOPO_GEN) {
+            java.util.List<net.minecraft.entity.Entity> hit = h.kfc$deep();
+            if (hit != null) return hit;
+        }
+        java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (net.minecraft.entity.Entity ps : vehicle.getPassengersDeep()) out.add(ps);
+        h.kfc$deep(out);
+        h.kfc$deepStamp(RIDE_TOPO_GEN);
+        return out;
+    }
+
     // [27차 철회 — 재시도 금지] 이 순회 결과를 (틱, ENTITY_GEN, RIDE_MUT) 스탬프로 vehicle 에
     // 캐시해 틱당 1회 평탄화로 줄이는 시도를 했다가 원복했다. 그 스탬프 축은 **불완전**하다:
     // 풀 텔레포트(teleportTo)는 탑승자를 stopRiding 으로 하차시키면서 RIDE_MUT/ENTITY_GEN 중
@@ -4871,7 +4877,9 @@ public final class KfcGen {
         // [정합] delta 는 절대 평행이동(newpos = oldpos + delta)이라 순서 무관 — updatePosition/
         // requestTeleport 는 승객을 자동 동반하지 않으므로(그래서 이 함수가 필요) 각 엔티티의
         // oldpos 가 서로 독립. 프리오더 재귀든 평탄 순회든 결과 위치 완전 동일(관측 동등).
-        for (net.minecraft.entity.Entity ps : vehicle.getPassengersDeep()) {
+        java.util.List<net.minecraft.entity.Entity> _deep = passengersDeepCached(vehicle);
+        for (int _i = 0, _n = _deep.size(); _i < _n; _i++) {
+            net.minecraft.entity.Entity ps = _deep.get(_i);
             if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
                 sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
                         sp.getYaw(), sp.getPitch());
@@ -10206,7 +10214,7 @@ public static net.minecraft.entity.Entity firstEntity(
         MACRO_NORM_CACHE.clear();
 
         // ── 7) 세대/에폭/플래그 — 레지스트리 밖 셀까지 스탬프 불일치로 강제 재해소 ──
-        ENTITY_GEN++; GEN_SRC = 6; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++;
+        ENTITY_GEN++; GEN_SRC = 6; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++; RIDE_TOPO_GEN++;
         OBJ_TICK = MIN;
         REC_DEPTH = 0;                       // 월드가 중간에 내려가도 재귀 깊이가 새지 않게
         EXTERNAL_DIRTY = false; EXTERNAL_MASK = 0;

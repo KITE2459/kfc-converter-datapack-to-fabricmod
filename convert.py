@@ -932,11 +932,16 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     # KfcGen / kfcutil 안내 (실제 파일은 기존 것을 사용)
     # KfcGen.java 를 출력 트리에 자동 포함 (group 패키지로). convert.py 옆의 KfcGen.java 를 읽어 패키지 치환.
     kfcgen_src = Path(__file__).parent / "KfcGen.java"
+    # [31차] 믹스인 멤버 네임스페이스 — 다중 변환 모드 동시 탑재 시 같은 바닐라 클래스에 병합되는
+    # public 멤버(kfc$nd/kfc$create 등)의 이름 충돌을 그룹별 접두(kfc$<id>$)로 원천 차단한다.
+    _mix_id = re.sub(r'[^A-Za-z0-9_]', '', group.split(".")[-1]) or "kfc"
+    def _mix_ns(txt: str) -> str:
+        return txt.replace("kfc$", f"kfc${_mix_id}$")
     if kfcgen_src.exists():
         kg = kfcgen_src.read_text(encoding="utf-8")
         kg = re.sub(r'^package\s+[\w.]+;', f'package {group}.generated;', kg, count=1, flags=re.M)
         # D-10: KfcGen 이 KfcScsMixin(그룹.mixin) 을 참조하므로 그룹 토큰도 치환.
-        kg = kg.replace("__KFC_GROUP__", group)
+        kg = _mix_ns(kg.replace("__KFC_GROUP__", group))
         gen_dir = src_root / Path(*f"{group}.generated".split("."))
         gen_dir.mkdir(parents=True, exist_ok=True)
         write_if_changed(gen_dir / "KfcGen.java", kg)
@@ -955,7 +960,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         mixin_dir.mkdir(parents=True, exist_ok=True)
         for _mx_path in _mixin_templates:
             mx = _mx_path.read_text(encoding="utf-8")
-            mx = mx.replace("__KFC_GROUP__", group)
+            mx = _mix_ns(mx.replace("__KFC_GROUP__", group))
             mx = re.sub(r'^package\s+[\w.]+;', f'package {group}.mixin;', mx, count=1, flags=re.M)
             write_if_changed(mixin_dir / _mx_path.name, mx)
             print(f"[generate] {_mx_path.name} -> {group}.mixin")
@@ -1579,6 +1584,9 @@ public final class ModEntry implements ModInitializer {{
     }}
 }}
 """
+    import re as _re31
+    _mid = _re31.sub(r'[^A-Za-z0-9_]', '', group.split(".")[-1]) or "kfc"
+    code = code.replace("kfc$", f"kfc${_mid}$")   # [31차] 믹스인 멤버 감사 문자열도 동일 네임스페이스
     (src_root / Path(*group.split("."))).mkdir(parents=True, exist_ok=True)
     write_if_changed(src_root / Path(*group.split(".")) / "ModEntry.java", code)
     print(f"[generate] entrypoint ModEntry.java (load {len(tags.get('load',[]))} / tick {len(tags.get('tick',[]))})")

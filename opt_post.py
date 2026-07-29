@@ -293,6 +293,15 @@ _SETDISPLAY = re.compile(rf'scoreboard objectives setdisplay \S+ ({_O})')
 _DISPLAY_PLAYER = re.compile(rf'scoreboard players display \S+ \S+ ({_O})')
 _OBJ_MODIFY = re.compile(rf'scoreboard objectives modify ({_O}) ')
 
+# 매크로 전역 보수화 판정용 — objective 인자를 '리터럴 제약 없이'(\S+) 받는 판본.
+# _OBJ_* 는 objective 문법(_O)만 받으므로 `$(obj)` 같은 매크로 토큰을 못 잡는다.
+# 여기서는 그 자리에 무엇이 오든 잡아야 하므로 \S+ 를 쓴다. group(1) = objective 토큰.
+_MACRO_OBJ_GATES = (
+    re.compile(r'scoreboard objectives (?:remove|modify) (\S+)'),
+    re.compile(r'scoreboard objectives setdisplay \S+ (\S+)'),
+    re.compile(r'scoreboard players display \S+ \S+ (\S+)'),
+)
+
 
 def demotable_objectives(lines_map: dict) -> set:
     """전 팩 라인 분석: '표시/관측 경로에 절대 등장하지 않는 dummy objective' 집합.
@@ -319,11 +328,25 @@ def demotable_objectives(lines_map: dict) -> set:
             m = _OBJ_MODIFY.search(l)
             if m:
                 disq.add(m.group(1))      # displayname/numberformat/rendertype 등 표시 계열
-            # 매크로($())가 표시/제거 명령의 objective 위치에 올 수 있으면 어떤 objective 든
-            # 런타임에 표시될 수 있다 → 전역 보수화(전체 강등 비활성).
-            if "$(" in raw and ("objectives setdisplay" in l or "objectives remove" in l
-                                or "objectives modify" in l or "players display" in l):
-                return set()
+            # 매크로($())가 표시/제거 명령의 objective '인자 위치'에 올 수 있으면, 어떤
+            # objective 든 런타임에 표시/제거될 수 있다 → 전역 보수화(전체 강등 비활성).
+            #
+            # [정밀화] 종전엔 "줄 어딘가에 $( 가 있고 + 명령 이름이 보이면" 무조건 전역
+            # 보수화였다. 그런데 실제 팩에서 걸리던 5줄은 전부 objective 가 리터럴이고
+            # 매크로는 그 '뒤'의 표시 텍스트/숫자포맷 payload 에만 있었다:
+            #     $scoreboard players display numberformat @s timerdisplay fixed "$(rank)등"
+            #     $scoreboard players display name timertext timerdisplay {translate:"$(min):..."}
+            # 이 한 줄들 때문에 팩 전체(적격 objective 187개)의 강등이 통째로 꺼져 있었다.
+            #
+            # 판정 기준을 '명령 키워드 ~ objective 토큰 끝' 구간으로 좁힌다. 매크로 확장은
+            # 공백을 포함할 수 있어 뒤 토큰을 밀어낼 수 있으므로, 그 구간 안에 $( 가 있으면
+            # (objective 위치 자체든, 그 앞 인자든) 종전대로 전역 보수화한다 — fail-closed.
+            # 구간 밖(payload)의 매크로는 어떤 objective 가 표시되는지를 바꾸지 못한다.
+            if "$(" in raw:
+                for _rgx in _MACRO_OBJ_GATES:
+                    _mm = _rgx.search(l)
+                    if _mm is not None and "$(" in l[_mm.start():_mm.end(1)]:
+                        return set()
     safe = set()
     for o, cs in crit.items():
         if o in disq or cs != {"dummy"}:

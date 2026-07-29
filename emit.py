@@ -6980,6 +6980,230 @@ def _es_used(varname: str, *code_blocks) -> bool:
     return False
 
 
+# ═════════ [LICM] as-루프 불변 셀렉터 끌어올리기 ═════════
+#
+# 바닐라 `execute as <sel> …`는 실행자만 바꾸고 **위치는 바꾸지 않는다**. 그래서 루프 안에서
+# 평가되는 다른 셀렉터가 소스 위치만 기준으로 하고 루프 변수를 안 쓰면, 그 값은 매 반복
+# 동일하다. 그런데 종전 생성 코드는 그것을 반복마다 다시 계산했다:
+#
+#   execute as @e[distance=..200,tag=check-point,type=marker]
+#           if score @s check-num = @p[tag=check-player-temp,distance=..5] check-num
+#           run tag @s add checkpoint-passed-temp
+#
+#   → for (Entity e : 마커버킷) { … KfcGen.nearestPlayer(ctx, es.getPosition(), …) … }
+#
+# 트랙의 체크포인트 마커가 반경 200 안에 수백 개라 `nearestPlayer`(전 플레이어 스캔)를
+# 마커 수만큼 반복한다. checkpoint:system/check-pass 는 정적 비용 추정 1위(2위의 6배)였고,
+# 이 함수 하나에서만 통과 1회당 nearestPlayer 가 1,000회 넘게 돈다.
+#
+# ── 동등성 논거 ────────────────────────────────────────────────────────────────
+# 끌어올리기가 바닐라와 관측 동일하려면 세 가지가 필요하다. 하나라도 증명 못 하면 원형 유지.
+#   (1) 위치 불변  — es 가 `withEntityOnly`(= 바닐라 as)로만 만들어졌을 때 es.getPosition()
+#                    은 부모 소스의 위치와 **같은 객체**다(KfcGen.withEntityOnly 가 위치를
+#                    그대로 넘긴다). at/positioned 리바인딩이 있으면 대상에서 제외한다.
+#   (2) 부작용 없음 — 끌어올릴 식이 순수 조회여야 한다. 0회 평가(루프 미진입)와 1회 평가가
+#                    구별되면 안 되므로 난수 소비(@r/randomPlayer)·predicate(random_chance)·
+#                    NBT 쓰기가 섞인 식은 전부 제외한다.
+#   (3) 무간섭   — 루프 본문이 그 식의 입력(태그/점수/엔티티 집합/위치)을 바꾸면 안 된다.
+#                    본문의 KfcGen 호출을 화이트리스트로 제한하고(태그·점수 쓰기와 순수 조회
+#                    만 허용, 함수 호출·브릿지·summon/kill/tp 는 전부 불허), 쓰는 태그·
+#                    objective 리터럴이 식이 참조하는 리터럴과 겹치면 포기한다.
+#
+# 부수 효과: 끌어올린 뒤 es 참조가 사라지면 _es_used 가 false 가 되어 반복마다 만들던
+# ServerCommandSource 할당까지 함께 없어진다.
+
+# 순수 조회 셀렉터 — 부작용 0, 난수 미소비. (@r 계열 randomPlayer/randomEntity 는 난수를
+# 소비하므로 의도적으로 제외. *Where 는 람다에 predicate 가 없을 때만 아래서 통과시킨다.)
+_LICM_PURE_SEL = (
+    "nearestPlayer", "firstPlayer", "nearestPlayerWhere", "firstPlayerWhere",
+    "nearestEntity", "firstEntity", "nearestEntityWhere", "firstEntityWhere",
+    "nearestEntityAnyType", "firstEntityAnyType",
+    "nearestEntityAnyTypeWhere", "firstEntityAnyTypeWhere",
+)
+
+# 루프 본문에 나타나도 되는 KfcGen 헬퍼 — 순수 조회 + '리터럴 인자 태그/점수 쓰기'뿐.
+# 여기 없는 헬퍼가 하나라도 있으면 끌어올리지 않는다(fail-closed).
+_LICM_ALLOWED_KFC = frozenset({
+    # 순수 조회
+    "nameOf", "scoreCmp", "scoreCmpL", "scoreMatches", "scoreMatchesEntity",
+    "getScore", "readScore", "inRange", "posInRange", "posInBox", "entityHasTags",
+    "gamemodeIs", "gamemodeIsNot", "teamIs", "nameIs", "levelInRange", "nbtMatches",
+    "hasEffect", "objRef", "sch", "rch", "selSnapshot", "typeBucketCopy", "typeBucketRO",
+    "allEntities", "allEntitiesAny", "allEntitiesAnyType", "entityByUuid",
+    "anyPlayer", "anyPlayerWhere", "anyEntity", "anyEntityWhere", "anyEntityAnyType",
+    "entityInTypeTag", "rotInRange", "localOffset", "NO_TAGS",
+    # 소스 리바인딩/파생(할당만, 관측 변이 없음)
+    "withEntityOnly", "withEntityAt", "atEntity", "atWorldOf", "withWorld",
+    "onVehicle", "onOwner", "onPassengers", "passengersOf", "passengerFirstSnap",
+    # 리터럴 인자 태그/점수 쓰기 — 아래서 리터럴을 뽑아 식의 참조와 대조한다
+    "addTag", "removeTag", "setScore", "addScore", "opScore", "opScoreN",
+}) | frozenset(_LICM_PURE_SEL)
+
+# KfcGen 외 호출 중 허용되는 것(전부 읽기 전용 게터). 이 목록 밖의 메서드가 보이면 포기.
+_LICM_ALLOWED_JAVA = frozenset({
+    "getPosition", "getRotation", "getEntity", "getWorld", "getServer", "getPos",
+    "getCommandTags", "contains", "isAlive", "getType", "getX", "getY", "getZ",
+    "getYaw", "getPitch", "getUuid", "getNameForScoreboard", "getName", "getString",
+    "hasVehicle", "getVehicle", "size", "isEmpty", "squaredDistanceTo", "equals",
+    "getBlockPos", "isRemoved", "valueOf", "min", "max", "abs", "floor", "sqrt",
+})
+
+_LICM_CALL = re.compile(r'(?:KfcGen\.)?(\w+)\s*\(')
+_LICM_TAGW = re.compile(r'KfcGen\.(?:addTag|removeTag)\(\s*[^,]+,\s*"((?:[^"\\]|\\.)*)"\s*\)')
+_LICM_SCOREW = re.compile(r'KfcGen\.(?:setScore|addScore|opScoreN?)\(sb,\s*(?:[^,]+,\s*)?"((?:[^"\\]|\\.)*)"')
+_LICM_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
+# 끌어올릴 식이 참조해도 되는 자유 식별자 — 전부 루프 밖에서 정의되는 것들.
+# 루프 밖에서 값이 정해지는 이름만 허용한다. kfcSrcN 은 루프 '안'에서 만들어질 수도
+# 있으므로 통째로 허용하지 않고, 이 루프의 부모 소스(pre_src)일 때만 개별 허용한다.
+_LICM_FREE_OK = re.compile(
+    r'^(?:ctx|sb|server|source|executor|_pos|_exName|KfcGen|EntityType|Integer|Math|'
+    r'net|java|true|false|null|new|var|_ex\w*|KFC_\w+|'
+    r'String|Entity|ServerPlayerEntity|ServerCommandSource|Double|Float|Long|Boolean)$')
+
+
+def _licm_balanced(text: str, open_idx: int) -> int:
+    """text[open_idx] == '(' 일 때 짝이 맞는 ')' 의 인덱스+1. 문자열 리터럴 인지."""
+    d = 0; i = open_idx; n = len(text); ins = False
+    while i < n:
+        ch = text[i]
+        if ins:
+            if ch == '\\': i += 2; continue
+            if ch == '"': ins = False
+        elif ch == '"': ins = True
+        elif ch == '(': d += 1
+        elif ch == ')':
+            d -= 1
+            if d == 0: return i + 1
+        i += 1
+    return -1
+
+
+def _licm_free_idents(expr: str) -> set:
+    """식에서 '자유 식별자'(자기 안에서 선언된 람다 파라미터 제외) 집합.
+       문자열 리터럴 안의 단어는 식별자가 아니므로 먼저 제거한다 — 안 하면
+       `new String[]{"check-player-temp"}` 의 check/player/temp 가 미지 식별자로 잡혀
+       모든 후보가 탈락한다."""
+    expr = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expr)
+    bound = set(re.findall(r'(\w+)\s*->', expr))
+    out = set()
+    for m in re.finditer(r'(?<![\w.$])([A-Za-z_]\w*)', expr):
+        w = m.group(1)
+        if w in bound: continue
+        # 메서드 이름(뒤에 '(' 이 붙는 것)은 식별자 참조가 아니다
+        j = m.end()
+        while j < len(expr) and expr[j] == ' ': j += 1
+        if j < len(expr) and expr[j] == '(': continue
+        out.add(w)
+    return out
+
+
+# 킬 스위치 — 끌어올리기로 회귀가 의심되면 False 로 두고 재변환하면 종전 코드가 나온다.
+HOIST_INVARIANT_SELECTORS = True
+
+
+def _hoist_invariant_selectors(mod_conds: list, body: list, pre_src: str,
+                              normalize_es: bool = True):
+    """as-루프의 조건·본문에서 '루프 불변 순수 셀렉터 식'을 끌어올린다.
+
+       반환: (hoist_lines, new_mod_conds, new_body). 조건 미충족이면 ([], 원본, 원본).
+       주의: 호출측이 `es = KfcGen.withEntityOnly(pre_src, e)` 형태(리바인딩 없음)임을
+             보장한 뒤에만 호출해야 한다 — 위치 불변이 그 전제 위에서만 성립한다."""
+    if not HOIST_INVARIANT_SELECTORS:
+        return [], mod_conds, body
+    blob = "\n".join(mod_conds + body)
+    if not re.search(r'KfcGen\.(?:' + "|".join(_LICM_PURE_SEL) + r')\(', blob):
+        return [], mod_conds, body            # 끌어올릴 순수 셀렉터 자체가 없음
+
+    # (3-a) 효과 화이트리스트 — 브릿지/미허용 헬퍼가 하나라도 있으면 포기.
+    #   함수 호출은 pass-1.5 인터프로시저 요약(assemble._call_effect/_call_score)이
+    #   '전이적으로 무엇을 바꿀 수 있는지'를 알려줄 때만 관통시킨다. 요약이 미지(None)를
+    #   내면 그대로 포기 — 요약 자체가 fail-closed 로 계산된다.
+    if "runCommand" in blob:
+        return [], mod_conds, body
+    callee_writes = set()
+    if ".execute(" in blob or ".executeReturn(" in blob:
+        try:
+            import assemble as _asm_licm
+        except Exception:
+            return [], mod_conds, body
+        ce = _asm_licm._call_effect(blob)
+        if ce is None or ce[1]:
+            return [], mod_conds, body        # 미지 callee / 위치 변경(tp·ride 등)
+        callee_writes |= set(ce[0])           # callee 가 건드릴 수 있는 태그
+        sc = _asm_licm._call_score(blob)
+        if sc is None:
+            return [], mod_conds, body        # 점수 쓰기 미지
+        for d in sc:                          # 지시 튜플의 리터럴 토큰을 전부 보수적으로 수집
+            for tok in (d if isinstance(d, tuple) else (d,)):
+                callee_writes.add(str(tok).strip('"'))
+    for m in _LICM_CALL.finditer(blob):
+        nm = m.group(1)
+        # _LICM_CALL 은 `KfcGen.` 접두를 매치에 포함하므로 group(0) 으로 판정해야 한다
+        # (m.start() 는 접두 앞을 가리켜, 앞 8글자 검사로는 절대 잡히지 않는다).
+        if m.group(0).startswith("KfcGen."):
+            if nm not in _LICM_ALLOWED_KFC:
+                return [], mod_conds, body
+        elif nm in ("execute", "executeReturn"):
+            continue                          # 위에서 요약으로 검증된 생성 함수 호출
+        elif nm not in _LICM_ALLOWED_JAVA and nm not in ("if", "while", "for", "switch", "return"):
+            return [], mod_conds, body
+
+    # (3-b) 본문이 쓰는 태그/objective 리터럴 수집. 비리터럴 쓰기면 포기.
+    if re.search(r'KfcGen\.(?:addTag|removeTag)\(', blob):
+        if len(_LICM_TAGW.findall(blob)) != len(re.findall(r'KfcGen\.(?:addTag|removeTag)\(', blob)):
+            return [], mod_conds, body
+    if re.search(r'KfcGen\.resetScore\(', blob):
+        return [], mod_conds, body            # 홀더 전체/와일드카드 reset — 영향 범위 불명
+    # 점수 쓰기도 objective 리터럴을 전부 뽑아내지 못하면(동적 objective 등) 포기한다.
+    _nsw = len(re.findall(r'KfcGen\.(?:setScore|addScore|opScoreN?)\(', blob))
+    if _nsw and len(_LICM_SCOREW.findall(blob)) != _nsw:
+        return [], mod_conds, body
+    written = set(_LICM_TAGW.findall(blob)) | set(_LICM_SCOREW.findall(blob)) | callee_writes
+
+    # (1) 위치 정규화 — es 가 withEntityOnly 산물일 때만(리바인딩 없는 순수 `as`).
+    #     at/positioned 가 붙으면 es 의 위치가 부모와 달라지므로 정규화하지 않는다.
+    #     그 경우에도 es 를 전혀 참조하지 않는 식(예: _pos 기준)은 아래 자유 식별자
+    #     검사를 통과해 정상적으로 끌어올려진다.
+    if normalize_es:
+        norm = lambda s: s.replace("es.getPosition()", f"{pre_src}.getPosition()")
+        mod_conds = [norm(c) for c in mod_conds]
+        body = [norm(b) for b in body]
+        blob = "\n".join(mod_conds + body)
+
+    # (2)(3-c) 후보 식 수집
+    cand = {}
+    for m in re.finditer(r'KfcGen\.(' + "|".join(_LICM_PURE_SEL) + r')\(', blob):
+        end = _licm_balanced(blob, m.end() - 1)
+        if end < 0:
+            continue
+        expr = blob[m.start():end]
+        # 난수/predicate 소비 식 제외
+        if "testPredicate" in expr or "predicateMatches" in expr or "random" in expr.lower():
+            continue
+        # 루프 변수/루프 지역 참조가 남아 있으면 불변이 아니다.
+        # (이 자유 식별자 검사가 '루프 불변'의 유일한 보증이다 — 허용 목록에 있는 이름은
+        #  전부 함수 진입부에서 한 번 정해지는 값이라 반복마다 달라질 수 없다.)
+        idents = _licm_free_idents(expr)
+        if any(i in ("e", "en", "es") for i in idents):
+            continue
+        if any(not (_LICM_FREE_OK.match(i) or i == pre_src) for i in idents):
+            continue
+        # 본문이 쓰는 태그/objective 를 이 식이 참조하면 간섭 가능 → 포기
+        if any(lit in written for lit in _LICM_STR.findall(expr)):
+            continue
+        cand[expr] = cand.get(expr, 0) + 1
+    if not cand:
+        return [], mod_conds, body
+
+    hoists = []
+    for expr in sorted(cand, key=len, reverse=True):   # 긴 식 먼저 치환(부분 겹침 방지)
+        var = _fresh_var("_liv")
+        hoists.append(f"var {var} = {expr};")
+        mod_conds = [c.replace(expr, var) for c in mod_conds]
+        body = [b.replace(expr, var) for b in body]
+    return hoists, mod_conds, body
+
+
 def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> bool:
     """
     execute as <selector> [at @s] [if ...] run <target>  ->  네이티브 엔티티/플레이어 루프.
@@ -7126,6 +7350,14 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
         mod_conds = [re.sub(r'\b' + _fuse_at + r'\b', 'es', c) for c in mod_conds]
         body = [re.sub(r'\b' + _fuse_at + r'\b', 'es', b) for b in body]
 
+    # [LICM] 루프 불변 순수 셀렉터 끌어올리기.
+    # 리바인딩이 없는 순수 바닐라 `as` 에서만 `es.getPosition()` → 부모 위치 정규화를
+    # 허용한다(at/positioned/_fuse_at 이 붙으면 es 위치가 부모와 달라지므로 금지).
+    # 그 외 경우에도 es 를 참조하지 않는 불변식은 그대로 끌어올린다.
+    _licm_hoists, mod_conds, body = _hoist_invariant_selectors(
+        mod_conds, body, pre_src,
+        normalize_es=(not mod_rebinds and _fuse_at is None))
+
     # 엔티티 타입 결정
     if sel.base in ("a", "p", "r"):
         # 플레이어 루프
@@ -7181,7 +7413,9 @@ def emit_as_loop(line: str, head: list[dict], tail: list[dict], em: Emitted) -> 
     conds += _selector_extra_conds(sel, "en")
     filt = " && ".join(conds) if conds else "true"
 
-    out = []
+    # [LICM] 끌어올린 불변 셀렉터 선언은 루프(또는 단일 가드) '앞'에 놓는다. pre 수정자
+    # 래퍼(_wrap_pre) 안쪽이라 as 앞 조건/리바인딩이 그대로 적용된다.
+    out = list(_licm_hoists)
     # as 앞 수정자(pre)를 루프 밖에 배치하는 공통 래퍼
     def _wrap_pre(w):
         if pre_rebinds and (_rebinds_nullable(pre_rebinds)

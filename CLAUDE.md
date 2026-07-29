@@ -19,10 +19,14 @@ Full conversion (datapack → Java source), run from [gradle_project/](gradle_pr
 ```bash
 cd gradle_project
 ./gradlew convert -Pdatapack=../mypack.zip -Pout=../mysrc      # see parsebuild.sh
-#   -Pjobs=8    generate-stage worker processes (default: CPU count)
-#   -Pheap=6G   parse-stage JVM heap (default 4G)
+#   -Pjobs=8         generate-stage worker processes (default: CPU count)
+#   -Pheap=6G        parse-stage JVM heap (default 4G)
 #   -Ppython=python3
+#   -Ponserverstart  run tick-tag functions at START_SERVER_TICK instead of the
+#                    vanilla function-tick point (→ --onserverstart)
 ```
+
+[SETUP.md](SETUP.md) is the Korean end-user setup guide (JDK 21 pinning per-OS, a troubleshooting table); [usage.md](usage.md) is the short "how to run it + remove the original datapack" note.
 
 Build the produced mod: `cd ../mysrc && ./gradlew build` → `build/libs/*.jar`.
 
@@ -33,8 +37,12 @@ python convert.py generate gradle_project/build/kfc/trees.json mypack.zip mysrc
 #   --group <pkg>   override package root (default: sanitized datapack filename)
 #   --bridge <fid-prefix>   force those functions to bridge (bisecting a miscompile)
 #   --trace  <fid-prefix>   log execution context on entry (server console)
+#   --onserverstart         tick functions at START_SERVER_TICK
+#   --profile <name> / --profile-file <json>   BuildProfile selection (build_config.py)
 #   --no-merge / --no-clean
 ```
+
+`convert.py` hand-rolls its argv parsing (no argparse) — `main()` at the bottom is the authoritative flag list. The checked-in [build.sh](build.sh) / [parsebuild.sh](parsebuild.sh) / [gradle_project/convert.sh](gradle_project/convert.sh) are the maintainer's shortcuts, hardcoded to `kartall.zip` → `testkartall`; edit the paths or type the command out.
 
 Individual stages: `python convert.py extract <datapack> <lines.json>`. (`convert.py build` wants a `HeadlessParser.java` that is **not** in this repo — the Gradle `convert` task is the working path.)
 
@@ -56,6 +64,17 @@ Commit via [gitpush.sh](gitpush.sh) (timestamp commit messages, `git add .` + pu
 1. **extract** — [convert.py](convert.py) reads the datapack (zip or dir, transparently via [datapack_io.py](datapack_io.py) — zips are read in memory, never unpacked) and emits `lines.json`: every function id → its command lines, plus tick/load tags.
 2. **parse** — [ParseDumper.java](ParseDumper.java) runs as a Fabric mod under Loom's `runServer` and dumps brigadier parse trees to `trees.json` (JSONL, streamed). A real server boot is required: the MC command parser only works correctly under Fabric Loader's class transformation. The server boots a flat world, parses at `SERVER_STARTED`, and stops itself — no game loop. `build.gradle` stages the datapack into `run/world/datapacks/` **with `function/` and `tags/function/` stripped**, so registry tags/predicates resolve while avoiding double-parsing hundreds of thousands of functions. A free loopback port ≥20000 is picked to avoid 25565 conflicts.
 3. **generate** — [emit.py](emit.py) turns each parse tree into Java statements; [assemble.py](assemble.py) wraps a function's statements into a class; then the post-passes below rewrite the generated *text* before it is written out.
+
+### Navigating emit.py / assemble.py
+
+`emit.py` is ~450KB in one flat module — grep for the entry points rather than reading it:
+
+- `emit_line(obj)` — one parse-tree object → one `Emitted`. Top of the funnel.
+- brigadier's `chain` is a flat mix of nodes and arguments; emit re-splits it into *modifiers* + *target command*. `emit_execute()` / `emit_execute_with_src()` handle `execute` modifiers (`as/at/if/on/positioned/store/...`); `emit_target()` handles the actual command (`scoreboard/data/tag/tp/...`). Everything else is a helper for one of those three.
+- Selector handling is its own layer: `parse_selector()` → `Selector`, then `selector_cond()` / `entity_loop_open()` build the guard/loop Java. `try_simple_rule()` + `SimpleRule` is the table-driven fast path for commands with no special semantics.
+- emit.py is pure Python — it needs no Minecraft, so iterate on it directly against a cached `trees.json`.
+
+`assemble.py` builds the class skeleton (its module docstring shows the exact shape) and scans the body text for which symbols (`executor`/`sb`/`ctx`/…) it actually uses, emitting only the needed declarations and imports (`PRELUDE`). It also runs the intra-function optimizations — CSE of repeated score/tag reads (`_find_reused_*`), tail-call elimination (`_tco_*`), and method segmentation for the 64KB limit (`_seg_*`).
 
 ### Generate passes (search `pass-` in convert.py to find each call site)
 
@@ -89,7 +108,7 @@ These are templates, not compiled here — `convert.py` copies them into the out
 
 **KfcGen and the mixins must stay in sync.** Reusing an old `generated_src` while updating only `KfcGen.java` silently disables optimizations (a past incident: tag-bucket cost went 0.08 → 1.59 mspt). Regenerating fixes it; if you hand-patch, sync `<group>/mixin/` *and* the mixins.json list together.
 
-Runtime `-D` toggles (revert individual optimizations in-game without rebuilding): `kfc.sectionidx`, `kfc.taghook`, `kfc.entcells`, `kfc.reconphase`, `kfc.extsel`, `kfc.displaymerge`, `kfc.queryidx`, `kfc.snbttemplate`, `kfc.tagfp`, `kfc.itpid`, plus `kfc.debug.tagbucket` / `kfc.debug.coherence`.
+Runtime `-D` toggles (revert individual optimizations in-game without rebuilding): `kfc.sectionidx`, `kfc.taghook`, `kfc.entcells`, `kfc.reconphase`, `kfc.extsel`, `kfc.displaymerge`, `kfc.queryidx`, `kfc.snbttemplate`, `kfc.tagfp`, `kfc.itpid`, plus tuning knobs `kfc.sectionidx.min`, `kfc.recon` / `kfc.reconticks` / `kfc.recdepth`, `kfc.reset.quiet`, and `kfc.debug.tagbucket` / `kfc.debug.coherence`. (`grep -o '"kfc\.[a-z.]*"' KfcGen.java Kfc*Mixin.java` for the live list.)
 
 Python env vars: `KFC_JOBS` (worker count), `KFC_SLOW_STRIP=1` (use the reference state-machine comment stripper instead of the regex fast path — for bisecting regressions), `KFC_SAFE_CMDS`, `KFC_NONVANILLA_SAFE`, `KFC_RES_MANIFEST`.
 
@@ -98,4 +117,5 @@ Python env vars: `KFC_JOBS` (worker count), `KFC_SLOW_STRIP=1` (use the referenc
 - Edit **[ParseDumper.java](ParseDumper.java) at the repo root**; `gradle_project`'s `setupParserSource` task copies it into `src/main/java/datapackconvert/parsedumper/` on every build. The copy under `gradle_project/` is tracked but generated.
 - MC/Fabric versions live in two places that must agree: the 4 lines in [gradle_project/gradle.properties](gradle_project/gradle.properties) and the `BuildProfile` in [build_config.py](build_config.py). Core logic (emit/assemble/convert) is meant to stay version-agnostic; a minor MC bump should require nothing else.
 - Generated output layout: `<group>/ModEntry.java` (tick tag → server tick event, registers the `kfc-converted` detection command, `KfcGen.resetAll` on server stop), `<group>/generated/` (KfcGen + flattened trees), `<group>/mixin/`, `<group>/buckets/`, `<group>/<namespace>/...` per-function classes.
-- `.gitignore` excludes `*.json`, `test*`, `kart*`, `datapack-all-in-one/` — sample packs and generated source trees in this working dir are deliberately untracked.
+- `.gitignore` excludes `*.json`, `test*`, `kart*`, `datapack-all-in-one/` — sample packs and generated source trees in this working dir are deliberately untracked. Only 41 files are tracked; anything else you see at the root (`kartall.zip`, `testkartall/`, `openjdk-21-x86/`, `datapack-all-in-one/`) is local working material, so don't treat it as part of the project when making repo-wide changes.
+- The generated `ModEntry` registers a side-effect-free `kfc-converted` command that just returns 1, so a datapack can detect "am I running natively?" (`execute store … run kfc-converted`, then guard lines on that score). The datapack side depends on that exact literal — changing it breaks packs written against it.

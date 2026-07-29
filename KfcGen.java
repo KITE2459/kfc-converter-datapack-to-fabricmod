@@ -7730,7 +7730,31 @@ public static net.minecraft.entity.Entity firstEntity(
     private static void entityNbtRoundtrip(net.minecraft.entity.Entity e, String path,
                                            net.minecraft.nbt.NbtElement v) {
         if (e == null || v == null) return;
-        String top = topSeg(path.replace(" ", ""));
+        String pt0 = path.replace(" ", "");
+        // [28차] data.* 쓰기 — 위 entityNbtFast 의 data 분기와 동일 근거(customData = writeNbt 의
+        //   data 서브트리 원본). 바닐라 경로(전체 writeNbt → put → 전체 readNbt)에서 data 외 필드는
+        //   전부 동일값 왕복(no-op)이고 관측 효과는 customData 교체 하나뿐이므로, 컴포넌트만
+        //   직접 교체해도 관측 동등하다. 조건은 'data.' 로 시작하는 무필터 루트 세그먼트만:
+        //   · `data` 통짜 set 은 제외 — readNbt 코덱이 문자열 SNBT 대안 파싱을 하므로 원경로 유지.
+        //   · `data{...}` 필터 루트도 startsWith 불일치로 자동 제외(빈 컴파운드 존재/부재 편차 차단).
+        //   무변경 게이트(putAtPathCount>0)·부재 경로 실패는 기존과 동일 함수로 판정 — 시맨틱 불변.
+        if (pt0.startsWith("data.")) {
+            if (!entityNbtWritable(e)) return;   // 바닐라 EntityDataObject.setNbt: 플레이어 무변경(기존 관문과 동일)
+            net.minecraft.component.type.NbtComponent _cd =
+                    e.get(net.minecraft.component.DataComponentTypes.CUSTOM_DATA);
+            net.minecraft.nbt.NbtCompound _root = new net.minecraft.nbt.NbtCompound();
+            if (_cd != null && !_cd.isEmpty()) _root.put("data", _cd.copyNbt());   // 비면 키 생략 = writeNbt 동일
+            if (putAtPathCount(_root, path, v) > 0) {
+                net.minecraft.nbt.NbtElement _nd = _root.get("data");
+                if (_nd instanceof net.minecraft.nbt.NbtCompound _ndc) {           // data. 하위 put 은 항상 컴파운드 유지
+                    e.setComponent(net.minecraft.component.DataComponentTypes.CUSTOM_DATA,
+                            net.minecraft.component.type.NbtComponent.of(_ndc));
+                    invalidateSnapshot(e);                                          // 스냅샷의 data 서브트리 진부화
+                }
+            }
+            return;
+        }
+        String top = topSeg(pt0);
         Boolean known = dropState(e, top);
         if (known != null) {
             if (known) return;                       // 구조적 no-op — writeNbt 생략(엔티티 불변)
@@ -7772,6 +7796,23 @@ public static net.minecraft.entity.Entity firstEntity(
     private static net.minecraft.nbt.NbtElement entityNbtFast(net.minecraft.entity.Entity e, String pt) {
         net.minecraft.nbt.NbtElement lf = liveFieldNbt(e, pt);        // Pos/Rotation/Motion 라이브 게터
         if (lf != null) return lf;
+        // [28차] data.* — 1.21.5 부터 최상위 `data` 는 모든 엔티티의 base customData 컴포넌트다
+        //   (Entity.writeNbt: 비면 키 생략 / readNbt: 컴파운드를 NbtComponent 로 '그대로' 보관).
+        //   즉 customData 가 곧 writeNbt 산출의 data 서브트리 — 전체 스냅샷(writeNbt) 없이
+        //   컴포넌트에서 직접 읽어도 값이 정확히 같다. 미스(경로 부재)는 null 반환으로 기존
+        //   스냅샷 경로에 위임(느리지만 결과 동일 — fail-closed). 반환 요소는 라이브 컴파운드
+        //   내부 참조이므로 copy 로 격리(스냅샷 경로의 '호출부로 새지 않게 copy' 계약과 동일).
+        if (pt.equals("data") || (pt.startsWith("data.") )) {
+            net.minecraft.component.type.NbtComponent _cd =
+                    e.get(net.minecraft.component.DataComponentTypes.CUSTOM_DATA);
+            if (_cd != null && !_cd.isEmpty()) {
+                net.minecraft.nbt.NbtCompound _root = new net.minecraft.nbt.NbtCompound();
+                _root.put("data", _cd.getNbt());                      // writeNbt 와 동일 표면(참조 공유, 아래서 copy)
+                net.minecraft.nbt.NbtElement _r = getAtPath(_root, pt);
+                if (_r != null) return _r.copy();
+            }
+            // 비었으면 writeNbt 도 키 생략 → 경로 부재. 스냅샷 경로도 같은 결론이므로 그대로 위임.
+        }
         net.minecraft.nbt.NbtElement f = displayGetFast(e, pt);       // display transformation 등
         if (f != null) return f;
         return slotAccessorNbt(e, pt);                                // weapon/equipment/armor/container 슬롯
@@ -7976,16 +8017,16 @@ public static net.minecraft.entity.Entity firstEntity(
                 d.setStartInterpolation(d.getStartInterpolation());
                 return true;
             }
-            case "interpolation_duration": d.setInterpolationDuration((int) nbtNum(v)); return true;
-            case "start_interpolation":    d.setStartInterpolation((int) nbtNum(v)); return true;
-            case "teleport_duration":      d.setTeleportDuration((int) nbtNum(v)); return true;
+            case "interpolation_duration": d.setInterpolationDuration(net.minecraft.util.math.MathHelper.floor(nbtNum(v))); return true;
+            case "start_interpolation":    d.setStartInterpolation(net.minecraft.util.math.MathHelper.floor(nbtNum(v))); return true;
+            case "teleport_duration":      d.setTeleportDuration(net.minecraft.util.math.MathHelper.floor(nbtNum(v))); return true;
             case "brightness": {
                 // {sky:N,block:M} → setBrightness 직접 호출(DataTracker 갱신+클라 동기화).
                 // 일반 writeNbt/readNbt 폴백은 DisplayEntity brightness 트래커를 갱신하지 못해
                 // 시각적으로 반영되지 않는다(라이트가 안 켜지거나 안 꺼지는 원인).
                 if (v instanceof net.minecraft.nbt.NbtCompound bc) {
-                    int sky = bc.contains("sky") ? (int) nbtNum(bc.get("sky")) : 0;
-                    int block = bc.contains("block") ? (int) nbtNum(bc.get("block")) : 0;
+                    int sky = bc.contains("sky") ? net.minecraft.util.math.MathHelper.floor(nbtNum(bc.get("sky"))) : 0;
+                    int block = bc.contains("block") ? net.minecraft.util.math.MathHelper.floor(nbtNum(bc.get("block"))) : 0;
                     d.setBrightness(new net.minecraft.entity.decoration.Brightness(block, sky));
                     return true;
                 }
@@ -8223,7 +8264,8 @@ public static net.minecraft.entity.Entity firstEntity(
     }
 
     public static int storageGetNumber(net.minecraft.server.MinecraftServer server, String id, String path) {
-        return (int) nbtNum(getAtPath(storageRoot(server, id), path));  // NbtPath: 인덱스/필터 경로 정확
+        // 바닐라 data get(스케일 없음) = MathHelper.floor — (int) 절단은 음수 소수에서 1 어긋난다.
+        return net.minecraft.util.math.MathHelper.floor(nbtNum(getAtPath(storageRoot(server, id), path)));
     }
 
     /** NbtElement → double(숫자형 아니면 0). */
@@ -8525,9 +8567,9 @@ public static net.minecraft.entity.Entity firstEntity(
         if (e == null) return 0;
         String pt = path.replace(" ", "");
         net.minecraft.nbt.NbtElement fast = entityNbtFast(e, pt);   // 라이브/디스플레이/슬롯 fast-path(writeNbt 회피)
-        if (fast != null) return (int) nbtNum(fast);
+        if (fast != null) return net.minecraft.util.math.MathHelper.floor(nbtNum(fast));   // 바닐라 data get = floor
         if (nbtPathDroppable(e, pt)) return 0;                      // 구조적 부재 no-op → 스냅샷 회피
-        return (int) nbtNum(getAtPath(entitySnapshot(e), path));    // NbtPath: 인덱스/필터 경로 정확
+        return net.minecraft.util.math.MathHelper.floor(nbtNum(getAtPath(entitySnapshot(e), path)));
     }
 
     /** null-safe 버전 — 셀렉터 대상이 없으면 0. */
@@ -8678,7 +8720,7 @@ public static net.minecraft.entity.Entity firstEntity(
             d.setTransformation(at);
         }
         if (patch.contains("interpolation_duration"))
-            d.setInterpolationDuration((int) nbtNum(patch.get("interpolation_duration")));
+            d.setInterpolationDuration(net.minecraft.util.math.MathHelper.floor(nbtNum(patch.get("interpolation_duration"))));
         // start_interpolation: 바닐라 readNbt 는 getInt("start_interpolation", 0) 을 '무조건'
         // setStartInterpolation 에 넘긴다(바이트코드 확인). 그리고 writeCustomDataToNbt 는
         // start_interpolation 을 '쓰지 않으므로', /data merge 병합본에는 패치가 준 경우에만
@@ -8687,10 +8729,10 @@ public static net.minecraft.entity.Entity firstEntity(
         // 매 data merge 마다 일어나는 바닐라 동작이다. (setTransformation/Interpolation/Teleport
         //  Duration 은 equality-check set 이라 패치에 없으면 현재값=무변경이므로 생략해도 동일.)
         d.setStartInterpolation(patch.contains("start_interpolation")
-                ? (int) nbtNum(patch.get("start_interpolation")) : 0);
+                ? net.minecraft.util.math.MathHelper.floor(nbtNum(patch.get("start_interpolation"))) : 0);
         if (patch.contains("teleport_duration"))
             d.setTeleportDuration(net.minecraft.util.math.MathHelper.clamp(
-                    (int) nbtNum(patch.get("teleport_duration")), 0, 59));   // 바닐라 clamp[0,59]
+                    net.minecraft.util.math.MathHelper.floor(nbtNum(patch.get("teleport_duration"))), 0, 59));   // 바닐라 clamp[0,59]
         if (patch.contains("item")) {
             net.minecraft.nbt.NbtElement _iv = patch.get("item");
             if (!(_iv instanceof net.minecraft.nbt.NbtCompound _ic)) return false;

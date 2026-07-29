@@ -153,6 +153,8 @@ _CSE_SAFE_HELPERS = frozenset({
     "teamAdd", "setGameMode", "effectClear", "attrModifierRemove", "attrModifierAdd", "advancement",
     # execute 컨텍스트 내비게이션(스스로 변형 안 함; 본문 변형은 같은 줄의 헬퍼로 따로 잡힘)
     "onVehicle", "onPassengers",
+    # [29차] on-패밀리/withEntityOnly — 전부 순수 읽기 + SCS 생성(엔티티 상태 불변).
+    "withEntityOnly", "onController", "onOwner", "onAttacker", "onTarget", "onOrigin", "onLeasher",
 })
 # 인라인(엔티티 메서드 직접 호출) 변형 — 존재만으로 배리어
 _CSE_INLINE_BARRIER = (
@@ -609,6 +611,46 @@ def _find_reused_tag_exprs(emitted) -> set:
                     if el and ((el[0] & mtags) or (el[1] & mtags)
                                or (mmove and not el[2])):
                         seen.pop(k, None); key_variants.pop(k, None)
+    return reused
+
+
+# ── [29차] execute 접두(SCS 리바인드) CSE ──────────────────────────────────
+# `KfcGen.onVehicle(source)` 처럼 '메서드 스코프 인자만 받는' 소스 리바인드 식이 배리어 없는
+# 구간에서 2회+ 반복되면 1회 평가로 병합한다(줄마다 vehicle 체인/이름 렌더 재수행 제거).
+# 결과 SCS 는 (엔티티 신원, 위치/회전, 이름/표시명) 을 바인드 시점에 내장하므로, 배리어는
+# 기존 _cse_is_barrier 에 더해 다음을 추가로 잡는다(fail-closed):
+#   · 모든 함수 호출(.execute*/instantExecute) — 인터프로시저 요약이 이름/팀 축을 다루지 않음
+#   · team*/advancement — 점수/태그 CSE 화이트리스트엔 있으나 표시명을 바꿀 수 있음
+#   · source 재대입(TCO/디스패치 별칭)
+# 인자가 블록 로컬(_onN/루프 e)인 식은 패턴 자체가 안 잡혀 자동 제외(스코프 안전).
+PFX_CSE = True   # 회귀 시 즉시 차단용 토글
+_PFX_RE = re.compile(
+    r'KfcGen\.(?:onVehicle|onController|onOwner|onAttacker|onTarget|onOrigin|onLeasher)\(source\)'
+    r'|KfcGen\.(?:withEntityOnly|atEntity)\(source, executor\)')
+_PFX_MUT_RE = re.compile(r'KfcGen\.(?:team\w+|advancement)\(')
+
+def _pfx_barrier(em) -> bool:
+    if _cse_is_barrier(em):
+        return True
+    code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+    if ".execute(" in code or ".executeReturn(" in code:
+        return True
+    if _reassigns_source(code):
+        return True
+    return bool(_PFX_MUT_RE.search(code))
+
+def _find_reused_pfx(emitted) -> set:
+    """배리어 없는 구간에서 동일 접두 식이 2회+ 등장하면 hoist 대상(단일 사용은 제외)."""
+    reused: set = set(); seen: dict = {}
+    for em in emitted:
+        if _pfx_barrier(em):
+            seen.clear(); continue
+        code = "\n".join(l for l in em.java if not l.lstrip().startswith("//"))
+        for m in _PFX_RE.finditer(code):
+            e = m.group(0)
+            seen[e] = seen.get(e, 0) + 1
+            if seen[e] >= 2:
+                reused.add(e)
     return reused
 
 
@@ -1154,6 +1196,9 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     scr_lit: dict[tuple, int] = {}      # (holder,obj) -> 마지막 무조건부 리터럴 set 값 (store→load 포워딩)
     cse_tag_tags: dict[str, tuple] = {}  # _tselN 이 의존하는 (pos, neg) 태그집합
     reused_sets = _find_reused_set_exprs(emitted)  # 배리어 없는 구간 2회+ 만 hoist
+    reused_pfx = _find_reused_pfx(emitted) if PFX_CSE else set()   # [29차] 접두 리바인드
+    pfx_cache: dict[str, str] = {}   # 접두 식 -> _pfxN (배리어까지 유효)
+    pfx_seq = [0]
     reused_tags = _find_reused_tag_exprs(emitted) if ENTITY_TAG_CSE else set()
     reused_scores = _find_reused_score_reads(emitted) if SCORE_READ_CSE else set()
     # [수정] 세그먼트 분할이 CSE 주입 선언(_svN/_selN/_esetN/_tselN)을 예산에 넣지 않던 결함 교정.
@@ -1180,6 +1225,7 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             cse_tag_cache.clear(); cse_tag_tags.clear()  # _tsel 은 세그먼트 지역변수 → 경계 못 넘음
             scr_cache.clear()                            # _sv 도 세그먼트 지역변수
             scr_lit.clear()                              # 포워딩 값도 무효화 규칙 단일화
+            pfx_cache.clear()                            # _pfx 도 세그먼트 지역변수
             seg_acc = 0
         # 무조건 top-level return 이후의 줄은 바닐라에서도 실행되지 않는다(함수 즉시 종료).
         # → 도달불가 코드를 생성하면 javac "unreachable statement" 컴파일 에러. 주석으로만 보존.
@@ -1260,6 +1306,27 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
                     _nj2.append(line); continue
                 _nj2.append(_CSE_TAG_RE.sub(_repl_tag, line))
             new_java = _nj2
+
+        # [29차] 접두 리바인드 CSE — 배리어 줄은 치환하지 않고(줄 내 평가 위치 보존) 캐시만 비운다.
+        _pfx_bar = _pfx_barrier(em) if PFX_CSE else True
+        if PFX_CSE and reused_pfx and not _pfx_bar:
+            def _repl_pfx(m):
+                e = m.group(0)
+                if e not in reused_pfx:
+                    return e
+                v = pfx_cache.get(e)
+                if v is None:
+                    v = f"_pfx{pfx_seq[0]}"
+                    pfx_seq[0] += 1
+                    pfx_cache[e] = v
+                    decls.append(f"net.minecraft.server.command.ServerCommandSource {v} = {e};")
+                return v
+            _njp = []
+            for line in new_java:
+                if line.lstrip().startswith("//"):
+                    _njp.append(line); continue
+                _njp.append(_PFX_RE.sub(_repl_pfx, line))
+            new_java = _njp
 
         # 이 명령의 점수 캐시 영향(read-CSE·store-forward 공용).
         scr_eff = _score_effects(em) if (SCORE_READ_CSE or SCORE_STORE_FORWARD) else None
@@ -1374,6 +1441,8 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
         if barrier:
             cse_cache.clear()         # 변형 후 base-source nearest 캐시 무효화
             cse_set_cache.clear()
+        if PFX_CSE and _pfx_bar:
+            pfx_cache.clear()         # 접두 결과(이름/위치/탑승 내장)의 잠재 진부화
         # 태그 캐시 정밀 무효화: 이 명령이 변형한 태그/위치(tag_mut)에 의존하는 바인딩만 제거.
         # None = 미지 callee/미지헬퍼/멤버변동 → 전량 무효화.
         # (tags, move): 변형 태그 의존 + (move 시) origin-의존 스캔 제거.

@@ -1846,6 +1846,20 @@ public final class KfcGen {
         return out;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static java.util.List<net.minecraft.entity.Entity> allEntitiesAny(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
+            if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+            if (!posInRange(origin, e.getPos(), minDist, maxDist)) continue;
+            out.add(e);
+        }
+        return out;
+    }
+
+
     /** forceload add <pos> — 청크 강제 로드. */
     public static void forceloadAdd(net.minecraft.server.world.ServerWorld world,
                                     net.minecraft.util.math.Vec3d pos, boolean forced) {
@@ -2010,6 +2024,41 @@ public final class KfcGen {
         }
         return best;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static net.minecraft.entity.Entity nearestEntityAnyType(
+            GameContext ctx, net.minecraft.entity.Entity origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        net.minecraft.entity.Entity best = null;
+        double bestD = Double.MAX_VALUE;
+        net.minecraft.util.math.Vec3d o = origin != null ? origin.getPos() : null;
+        if (o != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(o);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
+            for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(o, maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                double d = e.getPos().squaredDistanceTo(o);
+                if (d < bestD) { bestD = d; best = e; }
+            }
+            return best;
+        }
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
+            if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+            if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
+            double d = (o == null) ? 0 : e.getPos().squaredDistanceTo(o);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
 
     /** kill <selector> — 셀렉터 대상 제거. (entities 는 호출부가 순회해 전달) */
     // ── team / name / level 셀렉터 필터 (검증된 yarn 1.21.5 API) ──
@@ -6308,6 +6357,40 @@ public final class KfcGen {
         return _unb ? anyMemoPut(type, tagsPos, tagsNeg, false) : false;
     }
 
+    // ── [29차] Tags 셀 오버로드(잔여분) ──
+
+    public static boolean anyEntity(GameContext ctx, net.minecraft.util.math.Vec3d origin,
+                                    net.minecraft.entity.EntityType<?> type,
+                                    Tags tagsPos, String[] tagsNeg,
+                                    double minDist, double maxDist) {
+        // predicate 를 조회 안으로 밀고, distance 상한이 있으면 Box 한정 섹션 스캔.
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (e.getType() == type && matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
+            return anyInBoxTyped(ctx, type, rangeBox(origin, maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
+        boolean _unb = (minDist < 0 && maxDist < 0);   // 거리 무제한 = 위치 무관 → 메모 가능
+        if (_unb) {
+            Boolean _m = anyMemoGet(ctx, type, tagsPos.pos, tagsNeg);
+            if (_m != null) return _m;
+        }
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, type))) {
+            if (_tb != null && e.getType() != type) continue;   // 태그버킷 경로: 타입 필터
+            if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist))
+                return _unb ? anyMemoPut(type, tagsPos.pos, tagsNeg, true) : true;
+        }
+        return _unb ? anyMemoPut(type, tagsPos.pos, tagsNeg, false) : false;
+    }
+
+
     public static boolean anyEntityAnyType(GameContext ctx, net.minecraft.util.math.Vec3d origin,
                                            String[] tagsPos, String[] tagsNeg,
                                            double minDist, double maxDist) {
@@ -6474,6 +6557,41 @@ public static net.minecraft.entity.Entity nearestEntity(
         return best;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static net.minecraft.entity.Entity nearestEntityAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        net.minecraft.entity.Entity best = null;
+        double bestD = Double.MAX_VALUE;
+        if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+                    if (!inRange(origin, e, minDist, maxDist)) continue;
+                    double d = e.getPos().squaredDistanceTo(origin);
+                    if (d < bestD) { bestD = d; best = e; }
+                }
+                return best;
+            }
+            for (net.minecraft.entity.Entity e : ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist))) {
+                double d = e.getPos().squaredDistanceTo(origin);
+                if (d < bestD) { bestD = d; best = e; }
+            }
+            return best;
+        }
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
+            if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+            if (!inRange(origin, e, minDist, maxDist)) continue;
+            double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
+
     /** @a[...,limit=1] (sort 미지정=arbitrary) — 위치 무관, 매치하는 첫 플레이어.
      *  @p 와 달리 nearest 가 아니다. 정렬 기준점 고정이 필요한 알고리즘(순위 판정 등)에서 중요. */
     /** as @a[...,sort=nearest|furthest] — origin(보통 at 으로 rebind 된 위치) 기준 정렬된 플레이어 순회용.
@@ -6521,6 +6639,23 @@ public static net.minecraft.entity.Entity nearestEntity(
         }
         return best;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static net.minecraft.server.network.ServerPlayerEntity nearestPlayer(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        net.minecraft.server.network.ServerPlayerEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (!matchTags(p, tagsPos.pos, tagsNeg)) continue;
+            if (!inRange(origin, p, minDist, maxDist)) continue;
+            double d = origin == null ? 0 : p.getPos().squaredDistanceTo(origin);
+            if (d < bestD) { bestD = d; best = p; }
+        }
+        return best;
+    }
+
 
     /** @r - 매칭 플레이어 중 균등 랜덤 1명(바닐라 EntitySelectorReader RANDOM 정렬 = 셔플 후 첫). */
     public static net.minecraft.server.network.ServerPlayerEntity randomPlayer(
@@ -6617,6 +6752,50 @@ public static net.minecraft.entity.Entity nearestEntity(
         return out;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static java.util.List<net.minecraft.entity.Entity> allEntities(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        // 무제한 + 양성 태그: 태그 버킷 경로(결과 집합·타입-우선 순서 동일, 후보만 소수).
+        java.util.List<net.minecraft.entity.Entity> _tb =
+                (origin != null && maxDist >= 0) ? tagCandidatesBounded(ctx, tagsPos) : tagCandidates(ctx, tagsPos);
+        if (_tb != null) {
+            java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : _tb) {
+                    if (e.getType() != t) continue;
+                    if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) out.add(e);
+                }
+            }
+            return out;
+        }
+        // 단일 타입(생성물의 226개 중 209개)은 조회 결과를 그대로 반환 — new ArrayList+addAll 로
+        // 한 번 더 복사하던 중간 리스트 할당을 제거한다(내용·순서 동일, 복사만 생략).
+        if (types.length == 1) {
+            net.minecraft.entity.EntityType<?> t = types[0];
+            if (origin != null && maxDist >= 0) {
+                return entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+            }
+            return entitiesByType(ctx, t,
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            if (origin != null && maxDist >= 0) {
+                out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin, maxDist),
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+            } else {
+                out.addAll(entitiesByType(ctx, t,
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+            }
+        }
+        return out;
+    }
+
+
     /** 소스 위치 기준 최근접 N개 (limit=N + sort=nearest / @n 다중). */
     public static java.util.List<net.minecraft.entity.Entity> nearestN(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
@@ -6641,6 +6820,24 @@ public static net.minecraft.entity.Entity nearestEntity(
         return all.size() <= n ? all : all.subList(0, n);
     }
 
+    // ── [29차] Tags 셀 오버로드(잔여분) ──
+
+    public static java.util.List<net.minecraft.entity.Entity> nearestN(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist, int n,
+            boolean wantNearest) {
+        java.util.List<net.minecraft.entity.Entity> all =
+                allEntities(ctx, origin, types, tagsPos, tagsNeg, minDist, maxDist);
+        // sort=nearest(wantNearest) 이거나 토글이 켜진 경우에만 거리순 정렬. 그 외(@e arbitrary)는
+        // 반복 순서 그대로 첫 N개 — 바닐라 arbitrary 와 일치하고 정렬 비용을 없앤다.
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
+            all.sort(java.util.Comparator.comparingDouble(e -> e.getPos().squaredDistanceTo(origin)));
+        }
+        return all.size() <= n ? all : all.subList(0, n);
+    }
+
+
     /** limit 셀렉터에 scores/predicate 등 추가 술어가 붙은 경우. 바닐라는 모든 술어 매치를
      *  limit(과 sort) 보다 먼저 적용한다(@e[scores={..},limit=N]). extra 를 후보 수집 직후
      *  (정렬·자르기 전)에 적용해 그 순서를 정확히 재현한다. */
@@ -6657,6 +6854,22 @@ public static net.minecraft.entity.Entity nearestEntity(
         }
         return all.size() <= n ? all : all.subList(0, n);
     }
+
+    // ── [29차] Tags 셀 오버로드(잔여분) ──
+    public static java.util.List<net.minecraft.entity.Entity> nearestN(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist, int n,
+            boolean wantNearest, java.util.function.Predicate<net.minecraft.entity.Entity> extra) {
+        java.util.List<net.minecraft.entity.Entity> all =
+                allEntities(ctx, origin, types, tagsPos, tagsNeg, minDist, maxDist);
+        if (extra != null) all.removeIf(e -> !extra.test(e));
+        if ((wantNearest || LIMIT_SORT_NEAREST) && origin != null && all.size() > 1) {
+            all.sort(java.util.Comparator.comparingDouble(e -> e.getPos().squaredDistanceTo(origin)));
+        }
+        return all.size() <= n ? all : all.subList(0, n);
+    }
+
 
     /** [바닐라 술어 평가 시점 재현] 셀렉터 술어를 <b>본문 실행 전</b>에 전부 적용해 후보를 확정한다.
      *
@@ -6701,6 +6914,15 @@ public static net.minecraft.entity.Entity nearestEntity(
             String[] tagsPos, String[] tagsNeg, double minDist, double maxDist) {
         return allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist, -1);
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        return allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist, -1);
+    }
+
 
     /**
      * {@code cap >= 0} 이면 <b>매치 cap 개를 채우는 즉시 순회를 중단</b>한다.
@@ -6750,6 +6972,38 @@ public static net.minecraft.entity.Entity nearestEntity(
         }
         return out;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist, int cap) {
+        if (cap == 0) return java.util.List.of();
+        if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                java.util.List<net.minecraft.entity.Entity> _out = new java.util.ArrayList<>();
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) {
+                        _out.add(e);
+                        if (cap >= 0 && _out.size() >= cap) break;
+                    }
+                }
+                return _out;
+            }
+            return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        java.util.List<net.minecraft.entity.Entity> out =
+                new java.util.ArrayList<>(cap >= 0 ? cap : 10);
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
+            if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+            if (!inRange(origin, e, minDist, maxDist)) continue;
+            out.add(e);
+            if (cap >= 0 && out.size() >= cap) break;
+        }
+        return out;
+    }
+
 
     /** 타입 미지정 @e[limit=N] (sort 미지정=nearest 기본) — origin 에서 가까운 순 N개. */
     public static java.util.List<net.minecraft.entity.Entity> nearestNAnyType(
@@ -6822,6 +7076,32 @@ public static net.minecraft.entity.Entity nearestEntity(
         return false;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static boolean anyEntity(GameContext ctx, net.minecraft.entity.Entity origin,
+                                    net.minecraft.entity.EntityType<?> type,
+                                    Tags tagsPos, String[] tagsNeg,
+                                    double minDist, double maxDist) {
+        if (QUERY_BOX && origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (e.getType() == type && matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+                }
+                return false;
+            }
+            return anyInBoxTyped(ctx, type, rangeBox(origin.getPos(), maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        // 거리 무제한: 전체 수집+isEmpty 대신 typeBucket 순회 + 첫 매치 early-return(존재 의미 동일).
+        java.util.List<net.minecraft.entity.Entity> _tb = tagCandidates(ctx, tagsPos);
+        for (net.minecraft.entity.Entity e : (_tb != null ? _tb : typeBucket(ctx, type))) {
+            if (_tb != null && e.getType() != type) continue;   // 태그버킷 경로: 타입 필터
+            if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) return true;
+        }
+        return false;
+    }
+
+
     /** if entity @a/@p/@r[tag,distance] — 조건에 맞는 플레이어가 하나라도 있으면 true. */
     public static boolean anyPlayer(GameContext ctx, net.minecraft.entity.Entity origin,
                                     String[] tagsPos, String[] tagsNeg,
@@ -6831,6 +7111,17 @@ public static net.minecraft.entity.Entity nearestEntity(
         }
         return false;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static boolean anyPlayer(GameContext ctx, net.minecraft.entity.Entity origin,
+                                    Tags tagsPos, String[] tagsNeg,
+                                    double minDist, double maxDist) {
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (matchTags(p, tagsPos.pos, tagsNeg) && inRange(origin, p, minDist, maxDist)) return true;
+        }
+        return false;
+    }
+
 
     /** 술어 동반 최근접 플레이어 (gamemode/scores 등 복합 필터용). */
     public static net.minecraft.server.network.ServerPlayerEntity nearestPlayerWhere(
@@ -6954,6 +7245,30 @@ public static net.minecraft.entity.Entity firstEntity(
         return null;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static net.minecraft.entity.Entity firstEntityAnyTypeWhere(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        if (origin != null && maxDist >= 0) {   // 범위 한정: 박스 조기종료(리스트 미생성)
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) { if (pred.test(e)) return e; }
+                }
+                return null;
+            }
+            return firstInBox(ctx, origin, maxDist,
+                    e -> matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e));
+        }
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {   // 무한범위: 스냅샷 조기종료
+            if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist) && pred.test(e)) return e;
+        }
+        return null;
+    }
+
+
     /** @a[limit=1](sort 미지정 = arbitrary)용 — 접속 순서(allPlayers) 첫 매치. */
     public static net.minecraft.entity.Entity firstPlayer(
             GameContext ctx, net.minecraft.util.math.Vec3d origin,
@@ -6977,6 +7292,23 @@ public static net.minecraft.entity.Entity firstEntity(
         }
         return best;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+
+    public static net.minecraft.entity.Entity nearestEntityAnyTypeWhere(
+            GameContext ctx, net.minecraft.util.math.Vec3d origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist,
+            java.util.function.Predicate<net.minecraft.entity.Entity> pred) {
+        net.minecraft.entity.Entity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (net.minecraft.entity.Entity e : allEntitiesAnyType(ctx, origin, tagsPos, tagsNeg, minDist, maxDist)) {
+            if (!pred.test(e)) continue;
+            double d = origin == null ? 0 : e.getPos().squaredDistanceTo(origin);
+            if (d < bestD) { bestD = d; best = e; }
+        }
+        return best;
+    }
+
 
     /** gamemode= 셀렉터 필터 — 바닐라 GameMode 이름(survival/creative/adventure/spectator) 비교. */
     public static boolean gamemodeIs(net.minecraft.entity.Entity e, String name) {
@@ -7018,6 +7350,17 @@ public static net.minecraft.entity.Entity firstEntity(
         }
         return false;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static boolean anyPlayer(GameContext ctx, net.minecraft.util.math.Vec3d origin,
+                                    Tags tagsPos, String[] tagsNeg,
+                                    double minDist, double maxDist) {
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (matchTags(p, tagsPos.pos, tagsNeg) && inRange(origin, p, minDist, maxDist)) return true;
+        }
+        return false;
+    }
+
 
     /** scoreboard players operation <dst> OP <src> (홀더 이름 기반). floor div/mod = MC 시맨틱. */
     public static void opScore(ServerScoreboard sb, String dh, String dobj, String op,
@@ -7110,6 +7453,22 @@ public static net.minecraft.entity.Entity firstEntity(
         }
         return best;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static net.minecraft.server.network.ServerPlayerEntity nearestPlayer(
+            GameContext ctx, net.minecraft.entity.Entity origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        net.minecraft.server.network.ServerPlayerEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (net.minecraft.server.network.ServerPlayerEntity p : ctx.allPlayers) {
+            if (!matchTags(p, tagsPos.pos, tagsNeg)) continue;
+            if (origin != null && !inRange(origin, p, minDist, maxDist)) continue;
+            double d = origin == null ? 0 : origin.squaredDistanceTo(p);
+            if (d < bestD) { bestD = d; best = p; }
+        }
+        return best;
+    }
+
 
     /** 엔티티의 스코어가 [min,max] 범위인지. 엔티티 null 이면 false(=대상 없음). */
     // ──────────────── if items (아이템 술어) ────────────────
@@ -7457,6 +7816,40 @@ public static net.minecraft.entity.Entity firstEntity(
         return out;
     }
 
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static java.util.List<net.minecraft.entity.Entity> allEntities(
+            GameContext ctx, net.minecraft.entity.Entity origin,
+            net.minecraft.entity.EntityType<?>[] types,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        // 무제한 + 양성 태그: 태그 버킷 경로(결과 집합·타입-우선 순서 동일, 후보만 소수).
+        java.util.List<net.minecraft.entity.Entity> _tb =
+                (origin != null && maxDist >= 0) ? tagCandidatesBounded(ctx, tagsPos) : tagCandidates(ctx, tagsPos);
+        if (_tb != null) {
+            java.util.List<net.minecraft.entity.Entity> out2 = new java.util.ArrayList<>();
+            for (net.minecraft.entity.EntityType<?> t : types) {
+                for (net.minecraft.entity.Entity e : _tb) {
+                    if (e.getType() != t) continue;
+                    if (matchTagsAlive(e, tagsPos.pos, tagsNeg)
+                            && (origin == null || inRange(origin, e, minDist, maxDist))) out2.add(e);
+                }
+            }
+            return out2;
+        }
+        java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (net.minecraft.entity.EntityType<?> t : types) {
+            if (origin != null && maxDist >= 0) {
+                out.addAll(entitiesByTypeBox(ctx, t, rangeBox(origin.getPos(), maxDist),
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist)));
+            } else {
+                out.addAll(entitiesByType(ctx, t,
+                        en -> matchTagsAlive(en, tagsPos.pos, tagsNeg)
+                              && (origin == null || inRange(origin, en, minDist, maxDist))));
+            }
+        }
+        return out;
+    }
+
+
     /** 타입 무관 전 엔티티 순회 버전 (as @e[무타입]). */
     public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
             GameContext ctx, net.minecraft.entity.Entity origin,
@@ -7481,6 +7874,32 @@ public static net.minecraft.entity.Entity firstEntity(
         }
         return out;
     }
+
+    // ── [29차] Tags 셀 오버로드(merge_pass 승격 꼬리 확장) — String[] 판과 본문 동일, 후보 해소만 셀 경유 ──
+    public static java.util.List<net.minecraft.entity.Entity> allEntitiesAnyType(
+            GameContext ctx, net.minecraft.entity.Entity origin,
+            Tags tagsPos, String[] tagsNeg, double minDist, double maxDist) {
+        if (origin != null && maxDist >= 0) {
+            java.util.List<net.minecraft.entity.Entity> _tbb = tagCandidatesBounded(ctx, tagsPos);
+            if (_tbb != null) {
+                java.util.List<net.minecraft.entity.Entity> _out = new java.util.ArrayList<>();
+                for (net.minecraft.entity.Entity e : _tbb) {
+                    if (matchTagsAlive(e, tagsPos.pos, tagsNeg) && inRange(origin, e, minDist, maxDist)) _out.add(e);
+                }
+                return _out;
+            }
+            return ctx.world.getOtherEntities(null, rangeBox(origin.getPos(), maxDist),
+                    en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        java.util.List<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
+            if (!matchTagsAlive(e, tagsPos.pos, tagsNeg)) continue;
+            if (origin != null && !inRange(origin, e, minDist, maxDist)) continue;
+            out.add(e);
+        }
+        return out;
+    }
+
 
     // ──────────────── storage NBT (data ... storage <id> <path>) ────────────────
     // 경로는 점 표기('a.b.c')만 1차 지원. 배열 인덱스/필터는 호출부에서 거르며, 여기 도달하면

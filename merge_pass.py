@@ -1189,7 +1189,20 @@ _TAGS_ARR_FIELD = re.compile(r'\s*KFC_SA_\d+\s*\Z')
 
 def _promote_tags(body: str, decls: list, fields: dict, start_seq: int) -> tuple[str, int, int]:
     seq = start_seq; n = 0
-    specs = [("KfcGen.firstEntity(", 7, 3), ("KfcGen.nearestEntity(", 7, 3)]
+    specs = [("KfcGen.firstEntity(", 7, 3), ("KfcGen.nearestEntity(", 7, 3),
+             # [29차] 꼬리 확장 — KfcGen 에 동일 본문의 Tags 오버로드가 존재하는 형태만.
+             #   (needle 은 '(' 포함 완전 접두라 nearestEntity↔nearestEntityAnyTypeWhere 등 오인 없음.
+             #    argc 불일치/tagsPos 자리가 KFC_SA_ 가 아니면 기존 로직이 건너뛴다 — 원판 유지.)
+             ("KfcGen.nearestEntityAnyTypeWhere(", 7, 2),
+             ("KfcGen.allEntities(", 7, 3),
+             ("KfcGen.allEntitiesAnyType(", 6, 2),
+             ("KfcGen.nearestPlayer(", 6, 2),
+             ("KfcGen.anyEntity(", 7, 3),
+             ("KfcGen.firstEntityAnyTypeWhere(", 7, 2),
+             ("KfcGen.nearestN(", 9, 3),
+             ("KfcGen.anyPlayer(", 6, 2),
+             ("KfcGen.nearestEntityAnyType(", 6, 2),
+             ("KfcGen.allEntitiesAny(", 6, 2)]
     repls = []   # (arg_start, arg_end, field_name)
     for needle, argc, ti in specs:
         for (nstart, close_idx, args) in _scan_call_args(body, needle):

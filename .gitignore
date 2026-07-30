@@ -12,6 +12,9 @@ test*
 kart*
 datapack-all-in-one/
 __pycache__/
+*.md
+!SETUP.md
+!usage.md
 
 # eclipse
 

@@ -27,13 +27,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Entity.class)
 public abstract class KfcRideMixin {
 
+    // [36차] 클라이언트 월드 가드 — 통합서버(P2P 호스트) JVM 에선 클라 월드의 승객 패킷 처리도
+    // 이 훅을 발화시킨다. RIDE_TOPO_GEN 은 서버 스레드 전용 비원자 long 이라 교차 스레드 ++ 가
+    // 끼면 lost-update 로 세대가 '서버 관점에서 역행'해, 스테일 승객 캐시가 우연히 재검증될 수
+    // 있다(27차 회귀와 같은 부류의 간헐 결함). 클라 승객 변화는 서버 캐시와 무관 — 차단이 정답.
     @Inject(method = "addPassenger(Lnet/minecraft/entity/Entity;)V", at = @At("RETURN"), require = 0)
     private void kfc$onPassengerAdded(Entity passenger, CallbackInfo ci) {
+        Entity self = (Entity) (Object) this;
+        if (self.getWorld() != null && self.getWorld().isClient) return;   // 36차
         __KFC_GROUP__.generated.KfcGen.onRideTopologyChanged();
     }
 
     @Inject(method = "removePassenger(Lnet/minecraft/entity/Entity;)V", at = @At("RETURN"), require = 0)
     private void kfc$onPassengerRemoved(Entity passenger, CallbackInfo ci) {
+        Entity self = (Entity) (Object) this;
+        if (self.getWorld() != null && self.getWorld().isClient) return;   // 36차
         __KFC_GROUP__.generated.KfcGen.onRideTopologyChanged();
     }
 }

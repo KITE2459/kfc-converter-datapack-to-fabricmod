@@ -44,17 +44,27 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(Entity.class)
 public abstract class KfcEntityTagMixin {
 
+    // [36차] 클라이언트 월드 가드 — 이 믹스인은 단일 JVM(통합서버/P2P 호스트)에서 '클라이언트
+    // 월드' 엔티티에도 발화한다. KfcGen 정적 상태(TAG_BUCKETS: plain HashMap)는 서버 메인 스레드
+    // 전용 계약이므로, 클라 스레드 발화가 유입되면 두 스레드가 같은 HashMap 을 변이/순회해
+    // 손상(무한루프/CME → 서버 프리즈 → 전원 접속 끊김)이 가능하다. 전용서버에는 클라 월드가
+    // 없어 무해했던 구멍 — 통합 환경에서만 존재. 클라측 이벤트는 버킷과 무관하므로(서버 버킷은
+    // 서버 엔티티만 담는다) 차단이 관측 동일하다.
     @Inject(method = "addCommandTag(Ljava/lang/String;)Z", at = @At("RETURN"), require = 0)
     private void kfc$onCommandTagAdded(String tag, CallbackInfoReturnable<Boolean> cir) {
         if (cir.getReturnValueZ()) {
-            __KFC_GROUP__.generated.KfcGen.onCommandTagAdded((Entity) (Object) this, tag);
+            Entity self = (Entity) (Object) this;
+            if (self.getWorld() != null && self.getWorld().isClient) return;   // 36차
+            __KFC_GROUP__.generated.KfcGen.onCommandTagAdded(self, tag);
         }
     }
 
     @Inject(method = "removeCommandTag(Ljava/lang/String;)Z", at = @At("RETURN"), require = 0)
     private void kfc$onCommandTagRemoved(String tag, CallbackInfoReturnable<Boolean> cir) {
         if (cir.getReturnValueZ()) {
-            __KFC_GROUP__.generated.KfcGen.onCommandTagRemoved((Entity) (Object) this, tag);
+            Entity self = (Entity) (Object) this;
+            if (self.getWorld() != null && self.getWorld().isClient) return;   // 36차
+            __KFC_GROUP__.generated.KfcGen.onCommandTagRemoved(self, tag);
         }
     }
 }

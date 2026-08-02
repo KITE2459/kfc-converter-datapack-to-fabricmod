@@ -2729,10 +2729,11 @@ public final class KfcGen {
         net.minecraft.util.Identifier id;
         try { id = idOf(soundId.contains(":") ? soundId : "minecraft:" + soundId); }
         catch (Exception ex) { return null; }   // 잘못된 사운드 id → null(재생 스킵). 상수/틱 크래시 방지, vanilla 명령실패 동등.
-        net.minecraft.sound.SoundEvent e = net.minecraft.registry.Registries.SOUND_EVENT.get(id);
-        // 미등록 id 도 그대로 재생(바닐라 허용) — RegistryEntry 래핑까지 1회.
-        return net.minecraft.registry.entry.RegistryEntry.of(
-                e != null ? e : net.minecraft.sound.SoundEvent.of(id));
+        // [33차·고증] 바닐라 PlaySoundCommand.execute 는 레지스트리 조회 없이 항상
+        //   RegistryEntry.of(SoundEvent.of(id)) — '고정 사거리 없는' 인라인 엔트리를 보낸다.
+        // 종전의 레지스트리 우선 해소는 고정 사거리 보유 사운드에서 클라이언트 감쇠·가청
+        // 반경을 바닐라 /playsound 와 다르게 만들었다(와이어 payload 자체가 다름). 원문 재현.
+        return net.minecraft.registry.entry.RegistryEntry.of(net.minecraft.sound.SoundEvent.of(id));
     }
 
     public static net.minecraft.sound.SoundCategory soundCat(String category) {
@@ -2794,7 +2795,7 @@ public final class KfcGen {
                                  net.minecraft.sound.SoundCategory cat,
                                  double x, double y, double z, float vol, float pitch, float minVol, long seed) {
         if (p == null || ev == null) return;   // ev==null: 잘못된 사운드 id 해소 실패 → 무재생(패킷 없음)
-        double lim = vol > 1.0f ? (double) (vol * 16.0f) : 16.0;
+        double lim = ev.value().getDistanceToTravel(vol);   // 바닐라 PlaySoundCommand 동일(고정 사거리 사운드 포함)
         double dx = x - p.getX(), dy = y - p.getY(), dz = z - p.getZ();
         double d2 = dx * dx + dy * dy + dz * dz;
         double sx = x, sy = y, sz = z;
@@ -4039,11 +4040,22 @@ public final class KfcGen {
     }
     public static final MacroParseFail MACRO_FAIL = new MacroParseFail();
 
+    /** 바닐라 StringReader.readDouble 문자집합([-.0-9]) 재현 — NaN/Infinity/지수/'+'/16진은
+     *  바닐라에서 매크로 인스턴스화 실패이므로 동일하게 MACRO_FAIL 로 중단한다. */
+    private static void macroNumCharset(String t) {
+        if (t.isEmpty()) throw MACRO_FAIL;
+        for (int i = 0; i < t.length(); i++) {
+            char ch = t.charAt(i);
+            if ((ch < '0' || ch > '9') && ch != '.' && ch != '-') throw MACRO_FAIL;
+        }
+    }
+
     public static double coord(String tok, boolean center) {
         // 매크로 좌표 전용($(x) 등) — 비수치/누락이면 바닐라 매크로 인스턴스화 실패와 동일하게
         // 함수 전체 중단 신호를 던진다(줄 스킵이 아님).
         if (tok == null) throw MACRO_FAIL;
         String t = tok.trim();
+        macroNumCharset(t);   // 35차: NaN/Infinity/지수/'+' — 바닐라 매크로 실패 재현
         double v;
         try { v = Double.parseDouble(t); } catch (NumberFormatException e) { throw MACRO_FAIL; }
         if (center && t.indexOf('.') < 0) v += 0.5;   // 정수 리터럴만 센터링(소수점 있으면 정확값)
@@ -4058,12 +4070,14 @@ public final class KfcGen {
     /** macroD 의 int 판(scores/limit/level 정수 바운드). 비수치/null → MACRO_FAIL. */
     public static int macroI(String tok) {
         if (tok == null) throw MACRO_FAIL;
+        macroNumCharset(tok.trim());   // 35차: '+' 등 brigadier 비허용 문자 차단
         try { return Integer.parseInt(tok.trim()); } catch (NumberFormatException e) { throw MACRO_FAIL; }
     }
 
     /** macroD 의 float 판(playsound 볼륨/피치 등). 비수치/null → MACRO_FAIL. */
     public static float macroF(String tok) {
         if (tok == null) throw MACRO_FAIL;
+        macroNumCharset(tok.trim());   // 35차
         try { return Float.parseFloat(tok.trim()); } catch (NumberFormatException e) { throw MACRO_FAIL; }
     }
 
@@ -4151,8 +4165,9 @@ public final class KfcGen {
             double b = (i == 0 ? base.x : i == 1 ? base.y : base.z);
             try {
                 if (s.equals("~")) c[i] = b;
-                else if (s.startsWith("~")) c[i] = b + Double.parseDouble(s.substring(1));
+                else if (s.startsWith("~")) { macroNumCharset(s.substring(1)); c[i] = b + Double.parseDouble(s.substring(1)); }
                 else {
+                    macroNumCharset(s);   // 35차: NaN/Infinity 좌표 원천 차단(바닐라 파싱실패 동등)
                     double v = Double.parseDouble(s);
                     if (i != 1 && s.indexOf('.') < 0) v += 0.5;   // 정수 x/z 센터링
                     c[i] = v;
@@ -4164,11 +4179,11 @@ public final class KfcGen {
             net.minecraft.util.math.Vec2f rot = source.getRotation();   // ~회전은 source 기준(바닐라)
             try {
                 yaw   = p[3].equals("~") ? rot.y
-                        : p[3].startsWith("~") ? rot.y + Float.parseFloat(p[3].substring(1))
-                        : Float.parseFloat(p[3]);
+                        : p[3].startsWith("~") ? rot.y + macroF(p[3].substring(1))
+                        : macroF(p[3]);
                 pitch = p[4].equals("~") ? rot.x
-                        : p[4].startsWith("~") ? rot.x + Float.parseFloat(p[4].substring(1))
-                        : Float.parseFloat(p[4]);
+                        : p[4].startsWith("~") ? rot.x + macroF(p[4].substring(1))
+                        : macroF(p[4]);
             } catch (NumberFormatException ex) { throw MACRO_FAIL; }
         }
         teleportToWithRot(t, c[0], c[1], c[2], yaw, pitch);

@@ -968,6 +968,47 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         print("[!]  no Kfc*Mixin.java next to convert.py - mixins skipped")
 
     write_report(out_root, fn_meta, stats, group)
+
+    # ── [34차] 미해소 외부 함수 참조 경고 ──
+    # 팩 안의 `function <fid>` 콜리가 팩에 없으면(분할 병합 시 공용 데이터팩 누락 등) emit 은
+    # fail-closed 로 브릿지하지만, 원본 데이터팩까지 제거된 운영 환경에선 런타임 레지스트리에도
+    # 없어 조용한 no-op 이 된다(실사고: updatedetector:on-user-dismount-kart — 하차 상태머신 소실).
+    # 빌드 시점에 목록을 콘솔 + 리포트 최상단에 노출해 패키징 누락을 배포 전에 잡는다.
+    try:
+        import re as _re34, collections as _c34
+        _fnre = _re34.compile(r'(?:^|run )function\s+(?:if_loaded\s+)?([a-z0-9_.-]+:[a-z0-9_./-]+)')
+        _missing = _c34.defaultdict(set)
+        from datapack_io import open_datapack as _odp34
+        _dp34 = open_datapack(datapack_root)
+        _ffs = _dp34.glob("data/*/function/**/*.mcfunction") or _dp34.glob("data/*/functions/**/*.mcfunction")
+        for _fp in _ffs:
+            _parts = _fp.split("/")
+            _ns = _parts[1]; _fi = _parts.index("function") if "function" in _parts else _parts.index("functions")
+            _fid = _ns + ":" + "/".join(_parts[_fi + 1:]).removesuffix(".mcfunction")
+            for _l in _dp34.read_text(_fp, errors="ignore").splitlines():
+                _l = _l.strip()
+                if not _l or _l.startswith("#"): continue
+                for _m in _fnre.finditer(_l):
+                    _c = _m.group(1)
+                    if _c not in all_fids and not _c.startswith("#"):
+                        _missing[_c].add(_fid)
+        if _missing:
+            print(f"[generate][WARN] ⚠️ 미해소 외부 함수 참조 {len(_missing)}건 — 팩에 콜리 없음."
+                  f" 원본 데이터팩 미설치 환경에선 런타임 no-op([KFC-BRIDGE-ERROR])이 됩니다:")
+            for _c, _cs in sorted(_missing.items()):
+                print(f"    {_c}  ← {sorted(_cs)[0]}" + (f" 외 {len(_cs)-1}곳" if len(_cs) > 1 else ""))
+            _rp = out_root / "CONVERSION_REPORT.md"
+            if _rp.exists():
+                _txt = _rp.read_text(encoding="utf-8")
+                _sec = ["\n## ⚠️ 미해소 외부 함수 참조 (분할/병합 패키징 점검 필요)\n",
+                        "이 콜리들은 팩에 존재하지 않아 브릿지되며, 원본 데이터팩이 없으면 **런타임 no-op** 입니다.\n"]
+                for _c, _cs in sorted(_missing.items()):
+                    _sec.append(f"- `{_c}`  ← `{sorted(_cs)[0]}`" + (f" 외 {len(_cs)-1}곳" if len(_cs) > 1 else "") + "\n")
+                _i = _txt.find("\n## ")
+                _txt = (_txt[:_i] + "".join(_sec) + _txt[_i:]) if _i >= 0 else _txt + "".join(_sec)
+                _rp.write_text(_txt, encoding="utf-8")
+    except Exception as _e34:
+        print(f"[generate][WARN] 미해소 콜리 스캔 실패(치명 아님): {_e34}")
     _tlog("stubs+KfcGen+report")
 
     # ── 사전 흐름분석 감사(개선사항 E): unreachable/missing-return 0건 확인 ──

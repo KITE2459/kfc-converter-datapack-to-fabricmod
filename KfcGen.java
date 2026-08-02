@@ -439,22 +439,7 @@ public final class KfcGen {
         }
         return on;
     }
-    // [selfrec-native/B-1] 비꼬리 자기재귀: 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.
-    public static int REC_DEPTH;
-    /** 네이티브 재귀로 처리할 최대 깊이. 초과분은 브릿지(바닐라 큐 엔진)로 위임된다.
-     *  목적은 오직 Java 스택 보호 — 값이 커도 동작은 같고(위임 시점만 늦어짐) 스택만 위험해진다. */
-    private static final int REC_DEPTH_MAX = Integer.getInteger("kfc.recdepth", 512);
-    /** [selfrec/B-1] 자기재귀 진입 가드. true=네이티브 재귀 계속, false=호출측이 브릿지로 위임.
-     *  바닐라는 명령 재귀를 Java 스택이 아니라 명시적 큐(CommandExecutionContext: Deque
-     *  commandQueue + run() 루프 — 바이트코드 확인)로 돌려 깊이 제한이 없다. 네이티브 재귀는
-     *  스택을 쓰므로 깊이가 인원수에 비례하는 재귀(마커 배치)에서 터졌다. 얕은 재귀(카트 전진
-     *  등 대다수)는 네이티브로 최고 성능을 유지하고, 깊어지면 그 지점부터 바닐라 엔진에 넘겨
-     *  깊이 무제한을 얻는다 — 컷오프가 아니라 위임이라 관측 동등(8/16인 배치 정상 완주). */
-    public static boolean recEnter() {
-        if (++REC_DEPTH > REC_DEPTH_MAX) { --REC_DEPTH; return false; }
-        return true;
-    }
-    public static void recExit() { --REC_DEPTH; }
+    // [43차] 재귀 깊이 위임(recEnter/브릿지) 제거 — 체인 예산 int-max = 바닐라 설정 최대치.
     private static GameContext CTX_CACHE;
     public static GameContext getOrCreateContext(net.minecraft.server.command.ServerCommandSource src) {
         // 25차: 외부 명령(커맨드블럭·채팅·/function·타 데이터팩) 실행이 감지되면, 다음 네이티브
@@ -1479,10 +1464,15 @@ public final class KfcGen {
 
     // ── team ── (바닐라 TeamCommand 흐름: Scoreboard 팀 API 직접 호출)
     public static void teamAdd(GameContext ctx, String name, String displayJson) {
-        NAME_GEN++;   // 팀 생성/표시명 변화 — 표시명 틱-캐시 무효화(10차)
-        net.minecraft.scoreboard.Team t = ctx.scoreboard.getTeam(name);
-        if (t == null) t = ctx.scoreboard.addTeam(name);   // 멱등: 이미 있으면 재사용
-        if (displayJson != null) t.setDisplayName(parseText(ctx.server, displayJson));
+        // [38차] 바닐라 team add: 동명 팀 존재 시 duplicate 에러 — 기존 팀 불변, 패킷 0(감사 F15).
+        //   종전의 '재사용+표시명 재설정'은 바닐라에 없는 UPDATE 패킷을 만들었다.
+        if (ctx.scoreboard.getTeam(name) != null) return;
+        NAME_GEN++;   // 팀 생성 — 표시명 틱-캐시 무효화(10차)
+        net.minecraft.scoreboard.Team t = ctx.scoreboard.addTeam(name);
+        if (displayJson != null) {
+            net.minecraft.text.Text d = parseText(ctx.server, displayJson);
+            if (d != null) t.setDisplayName(d);
+        }
     }
 
     private static net.minecraft.scoreboard.AbstractTeam.VisibilityRule visRule(String v) {
@@ -1512,6 +1502,7 @@ public final class KfcGen {
             case "friendlyFire": t.setFriendlyFireAllowed(Boolean.parseBoolean(value)); break;
             case "seeFriendlyInvisibles": t.setShowFriendlyInvisibles(Boolean.parseBoolean(value)); break;
             case "nametagVisibility": { var r = visRule(value); if (r != null) t.setNameTagVisibilityRule(r); break; }
+            case "deathMessageVisibility": { var r = visRule(value); if (r != null) t.setDeathMessageVisibilityRule(r); break; }   // [38차] 감사 F13
             case "collisionRule": { var r = collRule(value); if (r != null) t.setCollisionRule(r); break; }
             case "color": { net.minecraft.util.Formatting f = net.minecraft.util.Formatting.byName(value); if (f != null) t.setColor(f); break; }
             case "displayName": t.setDisplayName(parseText(ctx.server, value)); break;
@@ -4131,20 +4122,39 @@ public final class KfcGen {
                                          double x, double y, double z, float yaw, float pitch) {
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity) return false;
         if (e.hasPassengers()) return false;
+        if (e.hasVehicle()) return false;   // [38차] 바닐라 /tp 는 하차 후 이동 — 풀 teleport 폴백(감사 F4)
         e.refreshPositionAndAngles(x, y, z, yaw, pitch);   // setPos+setYaw+setPitch+resetPosition+refreshPosition
         e.setHeadYaw(yaw);                                  // 풀 teleport 의 setHeadYaw 동등
         e.setVelocity(net.minecraft.util.math.Vec3d.ZERO);  // 풀 teleport 의 속도 0 동등(바닐라 /tp 정지)
         return true;
     }
 
+    /** [38차] 바닐라 TeleportCommand 사후 블록(감사 F8): 비활공 living 은 수직 속도 0 + 착지 마킹
+     *  (낙하거리 취소 — 원본 시절 '착지 데미지 없음' 재현), PathAware 는 길찾기 중단. */
+    private static void _tpTail(net.minecraft.entity.Entity e) {
+        if (!(e instanceof net.minecraft.entity.LivingEntity le && le.isGliding())) {
+            e.setVelocity(e.getVelocity().multiply(1.0, 0.0, 1.0));
+            e.setOnGround(true);
+        }
+        if (e instanceof net.minecraft.entity.mob.PathAwareEntity pae) pae.getNavigation().stop();
+    }
+
     public static void teleportTo(net.minecraft.entity.Entity e, double x, double y, double z) {
         if (e == null) return;
+        // [37차·고증] 바닐라 TeleportCommand 는 World.isValid(±3천만/높이한계) 위반 시 명령 실패
+        //   (INVALID_POSITION — 엔티티 불이동). 이 게이트가 없으면 팩 산술 폭주(충돌 swapspeed 등)가
+        //   만든 극단 좌표가 그대로 적용돼 트래커/청크/클라이언트 연쇄 붕괴('연결 끊김')로 이어진다.
+        //   원본 데이터팩 시절엔 이 실패가 자연 클램프였다 — 동일 재현.
+        if (!net.minecraft.world.World.isValid(net.minecraft.util.math.BlockPos.ofFloored(x, y, z))) return;
         // 플레이어도 비-플레이어와 동일하게 바닐라 /tp 의 풀 teleport() 를 쓴다.
         // requestTeleport 는 dismount 직후 같은 틱 tp 시 하차 위치 보정에 덮어써져
         // (retire: stopRiding -> tp -17.5 가 카트 위치로 끌려감) 위치 복귀가 실패한다.
-        if (lightTeleport(e, x, y, z, e.getYaw(), e.getPitch())) return;
-        e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
-                java.util.Set.of(), e.getYaw(), e.getPitch(), true);
+        if (lightTeleport(e, x, y, z, e.getYaw(), e.getPitch())) { _tpTail(e); return; }
+        // [38차] 회전 미지정 = 바닐라 getFlags 의 Y_ROT|X_ROT(회전 델타 0 — 플레이어 카메라 보존, 감사 F7)
+        if (e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
+                java.util.Set.of(net.minecraft.network.packet.s2c.play.PositionFlag.Y_ROT, net.minecraft.network.packet.s2c.play.PositionFlag.X_ROT), 0.0f, 0.0f, true)) {
+            _tpTail(e);
+        }
     }
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정. */
@@ -4216,14 +4226,19 @@ public final class KfcGen {
     public static void teleportToWithRot(net.minecraft.entity.Entity e, double x, double y, double z,
                                          float yaw, float pitch) {
         if (e == null) return;
+        // [37차·고증] 바닐라 TeleportCommand 는 World.isValid(±3천만/높이한계) 위반 시 명령 실패
+        //   (INVALID_POSITION — 엔티티 불이동). 이 게이트가 없으면 팩 산술 폭주(충돌 swapspeed 등)가
+        //   만든 극단 좌표가 그대로 적용돼 트래커/청크/클라이언트 연쇄 붕괴('연결 끊김')로 이어진다.
+        //   원본 데이터팩 시절엔 이 실패가 자연 클램프였다 — 동일 재현.
+        if (!net.minecraft.world.World.isValid(net.minecraft.util.math.BlockPos.ofFloored(x, y, z))) return;
         // 바닐라 TeleportCommand 와 동일: yaw/pitch 를 wrapDegrees 로 정규화 후 전체 teleport.
         // teleport 은 내부적으로 resetPosition→updateLastAngles 를 호출하므로 디스플레이 엔티티
         // 회전도 정상 동기화된다(소환 후 tp @s ~ ~ ~ ~rot 패턴).
         float _wy = net.minecraft.util.math.MathHelper.wrapDegrees(yaw);
         float _wp = net.minecraft.util.math.MathHelper.wrapDegrees(pitch);
-        if (lightTeleport(e, x, y, z, _wy, _wp)) return;
-        e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
-                java.util.Set.of(), _wy, _wp, true);
+        if (lightTeleport(e, x, y, z, _wy, _wp)) { _tpTail(e); return; }
+        if (e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), x, y, z,
+                java.util.Set.of(), _wy, _wp, true)) _tpTail(e);
     }
 
     /** tp <대상> <좌표> <회전> — 위치+회전 설정.
@@ -4245,9 +4260,9 @@ public final class KfcGen {
                         net.minecraft.util.math.MathHelper.wrapDegrees(pitch))) return;
         java.util.EnumSet<net.minecraft.network.packet.s2c.play.PositionFlag> flags =
                 java.util.EnumSet.noneOf(net.minecraft.network.packet.s2c.play.PositionFlag.class);
-        if ((relMask & 1)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.X);
-        if ((relMask & 2)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Y);
-        if ((relMask & 4)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Z);
+        if ((relMask & 1)  != 0) { flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.X); flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.DELTA_X); }
+        if ((relMask & 2)  != 0) { flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Y); flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.DELTA_Y); }
+        if ((relMask & 4)  != 0) { flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Z); flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.DELTA_Z); }
         if ((relMask & 8)  != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.Y_ROT);
         if ((relMask & 16) != 0) flags.add(net.minecraft.network.packet.s2c.play.PositionFlag.X_ROT);
         double dx = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.X) ? x - e.getX() : x;
@@ -4255,9 +4270,9 @@ public final class KfcGen {
         double dz = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.Z) ? z - e.getZ() : z;
         float gy = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.Y_ROT) ? yaw - e.getYaw() : yaw;
         float hp = flags.contains(net.minecraft.network.packet.s2c.play.PositionFlag.X_ROT) ? pitch - e.getPitch() : pitch;
-        e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), dx, dy, dz, flags,
+        if (e.teleport((net.minecraft.server.world.ServerWorld) e.getWorld(), dx, dy, dz, flags,
                 net.minecraft.util.math.MathHelper.wrapDegrees(gy),
-                net.minecraft.util.math.MathHelper.wrapDegrees(hp), true);
+                net.minecraft.util.math.MathHelper.wrapDegrees(hp), true)) _tpTail(e);
     }
 
     /** tp <대상> <좌표> facing <좌표> — 위치 이동 후 좌표를 바라보게(바닐라 Entity.lookAt). */
@@ -4732,12 +4747,16 @@ public final class KfcGen {
         if (who == vehicle) return;                                  // 자기 자신엔 못 탐
         for (net.minecraft.entity.Entity v = vehicle; v != null; v = v.getVehicle())
             if (v == who) return;                                    // who 가 vehicle 체인에 있음 → 순환, 거부
-        if (who.getVehicle() == vehicle) return;                     // 이미 그 탈것에 타고 있음
-        who.stopRiding();
+        // [38차] 바닐라 RideCommand.executeMount: 이미 '어떤' 탈것에든 타고 있으면 명령 실패
+        //   (ALREADY_RIDING — 하차·재탑승 없음, 패킷 0). 종전의 하차-후-갈아타기는 바닐라에 없는 동작.
+        if (who.getVehicle() != null) return;
+        RIDE_MUT++;   // 탑승 위상 변화 — passengerFirstSnap 캐시 무효화(감사 F19)
         who.startRiding(vehicle, true);   // force=true (커맨드 강제 탑승)
     }
     public static void rideDismount(net.minecraft.entity.Entity who) {
-        if (who != null) who.stopRiding();
+        if (who == null) return;
+        RIDE_MUT++;   // KfcGen.dismount 와 동일 — PF_CACHE 무효화(감사 F19)
+        who.stopRiding();
     }
 
     /** advancement grant|revoke <player> only <id> — 해당 어드밴스먼트의 모든 criteria 부여/회수. */
@@ -4823,12 +4842,19 @@ public final class KfcGen {
      *  기존 teleportTo(풀 텔레포트)를 그대로 사용할 것. */
     public static void movePosition(net.minecraft.entity.Entity e, double x, double y, double z) {
         if (e == null) return;
+        // [37차·고증] 바닐라 TeleportCommand 는 World.isValid(±3천만/높이한계) 위반 시 명령 실패
+        //   (INVALID_POSITION — 엔티티 불이동). 이 게이트가 없으면 팩 산술 폭주(충돌 swapspeed 등)가
+        //   만든 극단 좌표가 그대로 적용돼 트래커/청크/클라이언트 연쇄 붕괴('연결 끊김')로 이어진다.
+        //   원본 데이터팩 시절엔 이 실패가 자연 클램프였다 — 동일 재현.
+        if (!net.minecraft.world.World.isValid(net.minecraft.util.math.BlockPos.ofFloored(x, y, z))) return;
         // 이동 변위(delta)를 먼저 계산 — 승객 동반 이동에 사용.
         double _dx = x - e.getX();
         double _dy = y - e.getY();
         double _dz = z - e.getZ();
         if (e instanceof net.minecraft.server.network.ServerPlayerEntity p) {
-            p.networkHandler.requestTeleport(x, y, z, p.getYaw(), p.getPitch());
+            // [38차] ServerPlayerEntity.requestTeleport(x,y,z) = DELTA∪ROT 플래그 — 위치 절대,
+            // 클라 속도/카메라 보존(감사 F5: 종전 빈-플래그판은 매 이동 모멘텀 절멸 + 스테일 회전 스냅).
+            p.requestTeleport(x, y, z);
         } else {
             e.updatePosition(x, y, z);
         }
@@ -4852,14 +4878,21 @@ public final class KfcGen {
     // 27차 철회 주석(아래)의 처방 그대로: 축이 '변이 지점 그 자체'라 teleportTo 하차·kill·타 모드
     // 경로 전부가 구조적으로 잡힌다. 훅 첫 발동 전에는 캐시 미사용(자기 부트스트랩, fail-safe).
     private static long RIDE_TOPO_GEN = 1;         // 0 = 슬롯 무효 예약값
+    static boolean RIDE_HOOK_ACTIVE = false;       // [38차] 훅 실발동 확인 전 캐시 미사용(자기 부트스트랩)
     public static void onRideTopologyChanged() {
         RIDE_TOPO_GEN++;
+        RIDE_HOOK_ACTIVE = true;
     }
 
     /** vehicle 의 직접+중첩 승객 평탄 리스트. 훅 활성 + 슬롯 스탬프 일치 시 재사용, 아니면 1회
      *  평탄화 후 슬롯에 기록. 훅 비활성/믹스인 미적용이면 항상 신선 순회(종전과 동일). */
     private static java.util.List<net.minecraft.entity.Entity> passengersDeepCached(
             net.minecraft.entity.Entity vehicle) {
+        if (!RIDE_HOOK_ACTIVE) {           // [38차] 훅 미발동(미적용 포함) — 항상 신선 순회(회귀 원천 차단)
+            java.util.ArrayList<net.minecraft.entity.Entity> fresh = new java.util.ArrayList<>();
+            for (net.minecraft.entity.Entity ps : vehicle.getPassengersDeep()) fresh.add(ps);
+            return fresh;
+        }
         NdHolder h = (NdHolder) vehicle;   // 31차: 믹스인 정상적용 전제(미적용이면 즉시 CCE)
         if (h.kfc$deepStamp() == RIDE_TOPO_GEN) {
             java.util.List<net.minecraft.entity.Entity> hit = h.kfc$deep();
@@ -4896,8 +4929,7 @@ public final class KfcGen {
         for (int _i = 0, _n = _deep.size(); _i < _n; _i++) {
             net.minecraft.entity.Entity ps = _deep.get(_i);
             if (ps instanceof net.minecraft.server.network.ServerPlayerEntity sp) {
-                sp.networkHandler.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz,
-                        sp.getYaw(), sp.getPitch());
+                sp.requestTeleport(sp.getX() + dx, sp.getY() + dy, sp.getZ() + dz);   // [38차] DELTA∪ROT 보존판
             } else {
                 ps.updatePosition(ps.getX() + dx, ps.getY() + dy, ps.getZ() + dz);
             }
@@ -5321,6 +5353,9 @@ public final class KfcGen {
         }
         if (slot == null) return;
         net.minecraft.scoreboard.ScoreboardObjective ob = (objName == null) ? null : obj(sb, objName);
+        // [38차] 바닐라 executeSetDisplay: 이미 그 슬롯에 같은 objective 면 ALREADY_SET 에러(패킷 0).
+        //   리셋 흐름이 매번 재지정해 전 클라에 ScoreboardDisplayS2CPacket 을 반복 전송하던 것 차단(감사 F12).
+        if (sb.getObjectiveForSlot(slot) == ob) return;
         sb.setObjectiveSlot(slot, ob);
     }
 
@@ -8249,7 +8284,7 @@ public static net.minecraft.entity.Entity firstEntity(
                     e.get(net.minecraft.component.DataComponentTypes.CUSTOM_DATA);
             if (_cd != null && !_cd.isEmpty()) {
                 net.minecraft.nbt.NbtCompound _root = new net.minecraft.nbt.NbtCompound();
-                _root.put("data", _cd.getNbt());                      // writeNbt 와 동일 표면(참조 공유, 아래서 copy)
+                _root.put("data", kfc$nbtOf(_cd));                    // writeNbt 동일 표면 — 읽기 전용 참조(deprecation 격리 헬퍼 경유, 추출 요소만 copy)
                 net.minecraft.nbt.NbtElement _r = getAtPath(_root, pt);
                 if (_r != null) return _r.copy();
             }
@@ -10231,7 +10266,6 @@ public static net.minecraft.entity.Entity firstEntity(
         // ── 7) 세대/에폭/플래그 — 레지스트리 밖 셀까지 스탬프 불일치로 강제 재해소 ──
         ENTITY_GEN++; GEN_SRC = 6; OBJ_GEN++; NAME_GEN++; QUERY_MUT++; RIDE_MUT++; RIDE_TOPO_GEN++;
         OBJ_TICK = MIN;
-        REC_DEPTH = 0;                       // 월드가 중간에 내려가도 재귀 깊이가 새지 않게
         EXTERNAL_DIRTY = false; EXTERNAL_MASK = 0;
 
         RESET_COUNT++;

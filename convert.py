@@ -1509,11 +1509,18 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
        진입점에서는 다루지 않는다(SERVER_STARTED 핸들러 불필요)."""
     tick_calls = []
     for fid in tags.get("tick", []):
-        tick_calls.append(f"            {fid_to_fqcn(fid, group)}.executeReturn(src);")
+        # [38차] 함수별 예외 격리(감사 F29) — 바닐라는 함수 실행 예외가 서버를 죽이지 않는다.
+        tick_calls.append(
+            f"            try {{ {fid_to_fqcn(fid, group)}.executeReturn(src); }}\n"
+            f"            catch (Throwable _t) {{ System.err.println(\"[KFC] tick fn {fid}: \" + _t); }}")
     tick_body = "\n".join(tick_calls) if tick_calls else "            // (tick 함수 없음)"
 
     # tick 등록부는 '변환 시점에 확정된 한 경로'만 생성한다 — 런타임 분기 없음.
-    _body = (f"            ServerCommandSource src = server.getCommandSource().withSilent();\n"
+    # [38차] 권한 레벨 2(감사 F33 — 바닐라 tick/load 함수 소스 동일).
+    # [39차 판정 번복] F34(disableFlush 배칭)는 롤백 — 수제 포팅 시절에도 동일하게 창 밖
+    #   개별 플러시였고 무사고였다는 반례로 '끊김 원인' 지위 상실. 반박된 이론에 근거한
+    #   동작 변경을 배포하지 않는다(위험 관리 원칙). 바닐라 편차 자체는 감사 기록에 유지.
+    _body = (f"            ServerCommandSource src = server.getCommandSource().withLevel(2).withSilent();\n"
              f"{tick_body}\n"
              f"            {group}.generated.KfcGen.tickNativeSchedule(server);")
     if TICK_AT_SERVER_START:

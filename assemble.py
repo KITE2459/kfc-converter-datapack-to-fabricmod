@@ -1552,15 +1552,12 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
             #    → 인원수에 비례해 깊어지는 재귀(auto-mount 마커 배치)도 바닐라와 동일하게 완주한다.
             #  [철회 이력] 종전엔 한도 초과 시 return 0 으로 잘라, 8인 배치가 중간에 끊기는
             #  '바닐라에 없던' 오작동이 났다. 컷오프가 아니라 위임이어야 관측 동등이다.
-            _rn_ns, _rn_path = fid.split(":", 1)
-            _rn_mask = emit.bridge_mask(fid)
-            body = ("// [selfrec-native] 비꼬리 자기재귀 — 얕은 깊이는 네이티브, 한도 초과 시 브릿지 위임.\n"
-                    "        // 바닐라는 재귀를 큐(Deque)로 처리해 깊이 무제한 — 한도 도달 시 그 엔진에 넘긴다.\n"
-                    "        if (!KfcGen.recEnter()) {\n"
-                    f'            return KfcGen.instantExecuteFunctionReturn(source, '
-                    f'net.minecraft.util.Identifier.of("{_rn_ns}", "{_rn_path}"), {_rn_mask});\n'
-                    "        }\n"
-                    "        try {\n" + body + "\n        } finally { KfcGen.recExit(); }")
+            # [43차] 깊이 위임(브릿지) 완전 제거 — 체인 예산이 int-max(41차)로 바닐라 설정
+            # 최대치와 동일해진 시점에서, 이를 넘는 재귀는 바닐라에서도 정상 종료 불가한 동작이다.
+            # 병리적 무한 재귀는 SOE 로 실패하고 ModEntry 함수별 격리(F29)가 잡아 로그한다
+            # (42차 실사고에서 이 실패 모드가 미스컴파일을 노출시킨 실적 있음 — 시끄러운 실패가 정답).
+            body = ("// [selfrec-native] 비꼬리 자기재귀 — 전량 네이티브(깊이 위임 없음, 43차).\n"
+                    + body)
         fully_converted = True
 
     if _is_traced(fid):
@@ -1728,10 +1725,11 @@ def function_to_class(fid: str, parse_trees: list[dict], group: str = "kartrider
     public static int executeReturn(ServerCommandSource source) {{
         int _tcoSteps = 0;
         while (true) {{
-        // 바닐라 maxCommandChainLength(기본 65536) 컷오프 모방 — 종료 조건이 어긋난
-        // 비정상 재귀에서 서버가 무한루프로 멈추는 것을 막는다(정상 재귀는 본문에서
-        // 종료 점수가 감소해 그 전에 자연 종료하므로 이 가드에 도달하지 않는다).
-        if (++_tcoSteps > 65536) return 0;
+        // [41차] 체인 예산 = 2147483647 고정(바닐라 maxCommandChainLength 설정 가능 최대치).
+        // 운영 서버가 항상 int-max 룰이므로 게임룰 추종 대신 상수 고정 — 종전 65536 하드컷이
+        // 원본 완주 재귀(속도 비례 swapspeed 등)를 절단하던 문제 해소는 동일하게 유지.
+        // int 오버플로 랩 감지(< 0)로 '정확히 2^31-1 회'에서 정지(> MAX 비교는 영원히 거짓).
+        if (++_tcoSteps < 0) return 0;
         {prelude}
 {indented_body}{tail_return}
         }}

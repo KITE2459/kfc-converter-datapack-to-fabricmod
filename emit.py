@@ -2821,8 +2821,10 @@ def emit_tellraw_title(nn, args, em, cmd):
         return False
     ss_cond = at_s_selecteditem_cond(holder)   # @s[nbt={SelectedItemSlot:N}] 특수 처리(핫바 슬롯)
     sel = parse_selector(holder)
-    if ss_cond is None and (sel is None or sel.base not in ("a", "p", "r", "s")):
-        em.reason = f"{cmd} 셀렉터({holder[:20]}) 미지원(플레이어 한정)"
+    if ss_cond is None and (sel is None or sel.base not in ("a", "s")):
+        # [38차] @p/@r 포함 — 종전엔 p/r 을 전체-일치 루프로 컴파일해 '최근접/랜덤 1명'이
+        # 태그 일치 전원 브로드캐스트가 됐다(감사 F0). limit-1 정렬 시맨틱은 브릿지가 정확.
+        em.reason = f"{cmd} 셀렉터({holder[:20]}) 미지원(@a/@s 외 — @p/@r 은 limit-1 시맨틱)"
         return False
 
     def _player_guards(var):
@@ -3245,8 +3247,8 @@ def emit_stopsound(nn: list[str], args: dict, em: Emitted) -> bool:
         "master", "music", "record", "weather", "block", "hostile",
         "neutral", "player", "ambient", "voice")), None)
     sel = parse_selector(holder) if holder else None
-    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "p", "s"):
-        em.reason = f"stopsound 셀렉터({(holder or '?')[:25]}) 미지원(플레이어 한정)"
+    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "s"):
+        em.reason = f"stopsound 셀렉터({(holder or '?')[:25]}) 미지원(@a/@s 외 — @p 는 limit-1 시맨틱)"   # [38차] 감사 F1
         return False
     cj = "null" if cat is None else jstr(cat)
     sj = "null" if sound is None else jstr(sound)
@@ -3295,8 +3297,8 @@ def emit_playsound(nn: list[str], args: dict, em: Emitted) -> bool:
         em.reason = f"playsound 좌표({pos}) 미지원"
         return False
     sel = parse_selector(holder)
-    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "p", "r", "s"):
-        em.reason = f"playsound 셀렉터({holder[:25]}) 미지원(플레이어 한정)"
+    if sel is None or sel.predicates or sel.scores or _sel_has_extra(sel) or sel.base not in ("a", "s"):
+        em.reason = f"playsound 셀렉터({holder[:25]}) 미지원(@a/@s 외 — @p/@r 은 limit-1 시맨틱)"   # [38차] 감사 F1
         return False
     # minVolume 시맨틱(바닐라 PlaySoundCommand): 가청 반경(vol>1?vol*16:16) 밖 대상은
     # minVolume ≤ 0 이면 미재생, > 0 이면 '플레이어 위치+소리방향×2'에서 minVolume 으로 재생.
@@ -5794,6 +5796,16 @@ def _emit_store_cond(head, em) -> bool:
         if prebinds:
             guard_lines += ["{"] + ["    " + s for s in prebinds]
             guard_close = ["}"] + guard_close
+            # [42차] null-가능 리바인드(`at @s[셀렉터]` 등 — 매치 실패 = 명령 전체 미실행)는
+            # 실행 게이트다. 값식이 소스를 참조하지 않는 store(글로벌 점수 등)에서 이 게이트가
+            # 소실되던 미스컴파일 수정 — 실사고: auto-mount 방향토글(`at @s[tag=!X] store result
+            # score G O if score ...`)이 무조건 실행돼 마커가 ±1.75 왕복 진동 → 무한 재귀 → SOE.
+            # 바닐라: at 의 셀렉터 불일치 = store 미실행. 리바인드 변수 null 검사로 동일 재현.
+            for _pb in prebinds:
+                _m = re.match(r'\s*ServerCommandSource (\w+) = .*(?:: null\)|== null \? null.*)\s*;\s*$', _pb)
+                if _m:
+                    guard_lines.append(f"    if ({_m.group(1)} != null) {{")
+                    guard_close = ["}"] + guard_close
         for c in pconds:
             guard_lines.append(f"if ({c}) {{")
             guard_close = ["}"] + guard_close

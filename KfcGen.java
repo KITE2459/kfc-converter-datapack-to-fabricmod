@@ -965,8 +965,12 @@ public final class KfcGen {
     // 두 방식의 결과 리스트가 원소·순서까지 완전히 일치(0건 불일치), 중복을 허용하면 불일치
     // 발생 — 즉 동등성은 '중복 없음' 불변식에 정확히 의존한다.
     // 남는 원소의 상대 순서는 보존되므로 '버킷 = 스냅샷 순서의 부분수열' 계약도 그대로다.
-    private static final java.util.HashMap<String, java.util.Set<net.minecraft.entity.Entity>> TB_DROP =
-            new java.util.HashMap<>();
+    // [N2-e] 값 자리에 <b>단일 엔티티 또는 Set</b> 을 넣는다(단일 원소 특수화).
+    // 근거(실측): N2-d 이후 drainEntityHook 의 잔여 0.468 ms/tick 중 실제 제거 작업은 0.13 뿐이고
+    // <b>self 0.308 이 적재 부기(簿記)</b>였다 — 태그마다 ReferenceOpenHashSet 을 새로 만들고
+    // identityHashCode 로 해싱하는데, 이 팩은 태그당 대상이 대개 1개라 그 자료구조가 통째로 낭비다.
+    // 값이 Entity 면 단일, Set 이면 다건 — 두 번째 원소가 들어올 때만 Set 으로 승격한다.
+    private static final java.util.HashMap<String, Object> TB_DROP = new java.util.HashMap<>();
 
     private static void drainEntityHook() {
         if (!ENTITY_HOOK_LIVE) return;
@@ -977,9 +981,24 @@ public final class KfcGen {
             net.minecraft.entity.Entity e = PEND_UNLOAD.get(i);
             if (live) {
                 // 개별 remove 대신 (태그 → 대상) 으로 적재만 한다.
+                // 버킷 존재 여부는 여기서 확인하지 않는다 — 아래 드레인 루프가 null 버킷을 건너뛰므로
+                // (엔티티,태그)마다 HashMap 조회를 한 번 더 하는 것이 순손해다.
                 for (String tg : e.getCommandTags()) {
-                    if (TAG_BUCKETS.get(tg) != null)
-                        TB_DROP.computeIfAbsent(tg, k -> new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>()).add(e);
+                    Object cur = TB_DROP.get(tg);
+                    if (cur == null) {
+                        TB_DROP.put(tg, e);                       // 단일 — 할당·해싱 없음
+                    } else if (cur instanceof net.minecraft.entity.Entity ce) {
+                        if (ce != e) {                            // 두 번째 원소에서만 Set 승격
+                            it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<net.minecraft.entity.Entity> s =
+                                    new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>(4);
+                            s.add(ce); s.add(e);
+                            TB_DROP.put(tg, s);
+                        }
+                    } else {
+                        @SuppressWarnings("unchecked")
+                        java.util.Set<net.minecraft.entity.Entity> s = (java.util.Set<net.minecraft.entity.Entity>) cur;
+                        s.add(e);
+                    }
                 }
             }
             long f = _entFp(e);
@@ -987,15 +1006,17 @@ public final class KfcGen {
             if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) TB_TAG_FP -= f;
         }
         if (!TB_DROP.isEmpty()) {
-            for (java.util.Map.Entry<String, java.util.Set<net.minecraft.entity.Entity>> en4 : TB_DROP.entrySet()) {
+            for (java.util.Map.Entry<String, Object> en4 : TB_DROP.entrySet()) {
                 java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(en4.getKey());
                 if (b == null || b.isEmpty()) continue;
-                java.util.Set<net.minecraft.entity.Entity> drop = en4.getValue();
-                if (drop.size() == 1) {
+                Object cur = en4.getValue();
+                if (cur instanceof net.minecraft.entity.Entity one) {
                     // [N2-d] 대상이 1개면 remove(Object) 가 최적이다 — 찾는 즉시 멈춘다(평균 n/2).
                     // 배치 압축은 무조건 n 을 전부 훑으므로 이 경우 오히려 2배 손해다.
-                    b.remove(drop.iterator().next());
+                    b.remove(one);
                 } else {
+                    @SuppressWarnings("unchecked")
+                    java.util.Set<net.minecraft.entity.Entity> drop = (java.util.Set<net.minecraft.entity.Entity>) cur;
                     // 다건일 때만 단일 패스 압축. ArrayList.removeIf 는 BitSet 할당 + 2패스 +
                     // 원소마다 람다 호출이라, 손으로 쓴 read/write 커서 1패스가 더 싸다.
                     int w = 0, n2 = b.size();

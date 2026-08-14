@@ -944,10 +944,19 @@ public final class KfcGen {
     //   ① 평균 n/2 개를 equals 로 선형 탐색하고 ② 찾은 뒤 System.arraycopy 로 뒤를 당긴다.
     // 언로드 7.7개/틱 × 각자의 태그 수만큼 이 (탐색+시프트) 쌍이 반복됐다.
     //
-    // [수정] 드레인은 이미 틱 경계 배치다. (태그 → 제거 대상 집합)으로 뒤집어 모은 뒤
-    // <b>영향받은 태그당 removeIf 1회</b>로 처리한다. 같은 태그를 공유하는 엔티티가
-    // 함께 빠지고(카트 파츠 리그가 정확히 이 형태), 시프트도 버킷당 1회로 끝난다.
-    //   비용: Σ_{(엔티티,태그)} O(버킷)  →  Σ_{영향받은 태그} O(버킷)
+    // [수정] 드레인은 이미 틱 경계 배치다. (태그 → 제거 대상 집합)으로 뒤집어 모아
+    // 태그당 1회만 처리한다.  비용: Σ_{(엔티티,태그)} O(버킷) → Σ_{영향받은 태그} O(버킷)
+    //
+    // [N2-d 정정 — 실측이 가설을 반증했다] 최초 구현은 태그당 무조건 {@code removeIf} 였다.
+    // '카트 파츠는 태그를 공유하니 배치가 이득' 이라는 가설이었는데, 다음 프로파일에서
+    // {@code ArrayList.removeIf} 가 1.222 ms/tick 으로 <b>종전(0.401)보다 악화</b>됐다.
+    // 원인 두 가지:
+    //   ① 이 팩의 파츠는 태그가 대체로 <b>엔티티마다 고유</b>하다(파츠 ID). 태그당 대상이 1개면
+    //      removeIf 는 버킷 전체 n 을 훑지만 remove(Object) 는 찾는 즉시 멈춘다(평균 n/2) — 2배 손해.
+    //   ② JDK removeIf 는 BitSet 을 할당하고 2패스를 돌며 원소마다 술어를 호출한다.
+    //      실측 내역: 람다 호출 1.165 중 실제 집합 조회는 0.199뿐 — 나머지가 전부 부대비용.
+    // 그래서 <b>대상 1개면 remove(Object), 다건일 때만 손으로 쓴 1패스 압축</b>으로 이원화한다.
+    // 어느 경우에도 종전보다 나쁘지 않고, 태그를 공유할 때만 추가 이득을 얻는다.
     //
     // [동등성 — 전제와 근거] removeIf(집합) 은 개별 remove(Object) 를 순서대로 적용한 것과
     // 결과가 같다. 단 <b>버킷에 중복 원소가 없어야</b> 한다 — remove(Object) 는 첫 1건만 지우고
@@ -982,7 +991,20 @@ public final class KfcGen {
                 java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(en4.getKey());
                 if (b == null || b.isEmpty()) continue;
                 java.util.Set<net.minecraft.entity.Entity> drop = en4.getValue();
-                b.removeIf(drop::contains);      // 버킷당 단일 패스 + 단일 시프트
+                if (drop.size() == 1) {
+                    // [N2-d] 대상이 1개면 remove(Object) 가 최적이다 — 찾는 즉시 멈춘다(평균 n/2).
+                    // 배치 압축은 무조건 n 을 전부 훑으므로 이 경우 오히려 2배 손해다.
+                    b.remove(drop.iterator().next());
+                } else {
+                    // 다건일 때만 단일 패스 압축. ArrayList.removeIf 는 BitSet 할당 + 2패스 +
+                    // 원소마다 람다 호출이라, 손으로 쓴 read/write 커서 1패스가 더 싸다.
+                    int w = 0, n2 = b.size();
+                    for (int r = 0; r < n2; r++) {
+                        net.minecraft.entity.Entity x = b.get(r);
+                        if (!drop.contains(x)) { if (w != r) b.set(w, x); w++; }
+                    }
+                    if (w < n2) b.subList(w, n2).clear();
+                }
             }
             TB_DROP.clear();
         }

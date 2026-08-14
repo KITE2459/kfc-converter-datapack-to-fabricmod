@@ -545,7 +545,8 @@ public final class KfcGen {
         // 부활시키므로 그대로 무효 상태로 둔다(다음 접근 때 재수집).
         if (TB_GEN == _prevGen && e != null) {
             tagBucketsOnAdd(e);
-            for (net.minecraft.entity.Entity p : e.getPassengersDeep()) tagBucketsOnAdd(p);
+            tbFpAdd(e);                                             // [N2] 버킷 지문 증분 동기
+            for (net.minecraft.entity.Entity p : e.getPassengersDeep()) { tagBucketsOnAdd(p); tbFpAdd(p); }
             TB_GEN = ENTITY_GEN;
         }
         // 타입 인덱스도 동일 원칙의 증분 유지 — 종전엔 스폰/킬마다 gen 불일치로 다음 typeBucket
@@ -659,6 +660,7 @@ public final class KfcGen {
         if (e != null) ENT_CELLS.remove(e);      // [A4] 소멸 엔티티의 스코어 셀 해제(참조 보유 방지)
         if (TB_GEN == _prevGen && e != null) {   // 태그 버킷 증분 제거(snapAdd 와 동일 정합 가드)
             tagBucketsOnRemove(e);
+            tbFpRemove(e);                       // [N2] 버킷 지문 증분 동기
             TB_GEN = ENTITY_GEN;
         }
         if (TYPEIDX_GEN == _prevGen && e != null) {   // 타입 인덱스 증분 제거(동일 가드)
@@ -829,6 +831,172 @@ public final class KfcGen {
     // 재구축을 건너뛴다. 재구축 방식(전체 스냅샷 순서)은 불변 → 버킷 내용/순서/셀렉터 고증 불변.
     // 태그 엔티티 변화·태그 경계 교차(tagless↔tagged)는 지문이 바뀌어 정상 재구축(≤1틱, 현행 동등).
     private static final boolean TAG_FP_OPT = "on".equalsIgnoreCase(System.getProperty("kfc.tagfp","off"));
+
+    // ════════════════ [N2] 버킷 지문 증분 동기 — popDrift 오탐 제거 ════════════════
+    //
+    // [진단] TB_FP 는 종전에 '틱 경계에서 SNAP_FP 로 덮어쓰기'만 했고, 틱 <b>안에서</b> 일어난
+    // 개체군 변화를 전혀 추적하지 않았다. 그런데 snapAdd/snapRemove 는 SNAP_FP 를 증분 갱신한다.
+    // 그래서 우리 명령이 엔티티를 하나라도 소환/제거한 틱은 <b>반드시</b> 다음 틱 경계에서
+    //     SNAP_FP(전체 재계산 = 이전 + Δ)  ≠  TB_FP(이전, Δ 미반영)
+    // 이 되어 popDrift 가 참이 된다 → TAG_BUCKETS 전체 폐기 → 스냅샷 전 엔티티 × 태그 재구축.
+    //
+    // 즉 '외부 유입 감지'용으로 만든 지문이 <b>우리 자신의 스폰</b>에 매 틱 오탐을 냈다. 카트 팩은
+    // 파티클·이펙트·투사체를 매 틱 소환하므로 사실상 <b>매 틱 전체 재구축</b>이 돌았고, 그 위에
+    // 얹은 증분 훅(tagBucketsOnAdd/Remove)은 다음 경계에서 통째로 버려져 아무 효과가 없었다.
+    // 2차 프로파일의 tagBucket 4.79 mspt(모드 틱의 37%)가 이 오탐의 비용이다.
+    //
+    // [수정] TB_FP 의 의미를 '버킷이 반영하고 있는 개체군의 지문' 으로 정확히 정의하고, 버킷을
+    // 증분 갱신하는 <b>바로 그 자리에서</b> 같은 양만큼 움직인다. 그러면 우리 변화는 지문이
+    // 동기 유지되어 오탐이 사라지고, 훅을 거치지 않은 외부 변화(청크 로드/바닐라 스폰)만
+    // 정확히 popDrift 로 남는다 — <b>감지 능력은 종전과 완전히 동일</b>하고 오탐만 제거된다.
+    //
+    // [fail-safe] 지문이 어긋나는 방향은 항상 '재구축'(보수적)이다. 이 동기화가 틀리면 최악이
+    // 종전 동작(매번 재구축)이고, 결과 집합은 어느 쪽이든 동일하다(버킷은 1차 후보일 뿐,
+    // 호출측이 태그·생존·타입·거리를 라이브 재검사한다).
+    //   -Dkfc.tbfp=off 로 종전(오탐 포함) 동작 원복 — A/B 측정용.
+    private static final boolean TB_FP_SYNC =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.tbfp", "on"));
+
+    /** 버킷이 방금 e 를 포함하게 됐다 — 버킷 지문을 그만큼 전진. */
+    private static void tbFpAdd(net.minecraft.entity.Entity e) {
+        if (!TB_FP_SYNC || e == null || ENTITY_HOOK_LIVE) return;   // 훅 활성 시 계상 주체는 훅 1곳
+        long f = _entFp(e);
+        TB_FP += f;
+        if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) TB_TAG_FP += f;
+    }
+
+    /** 버킷이 방금 e 를 제외하게 됐다 — 버킷 지문을 그만큼 후퇴. */
+    private static void tbFpRemove(net.minecraft.entity.Entity e) {
+        if (!TB_FP_SYNC || e == null || ENTITY_HOOK_LIVE) return;
+        long f = _entFp(e);
+        TB_FP -= f;
+        if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) TB_TAG_FP -= f;
+    }
+
+    // ════════════════ [N2] 외부 엔티티 유입/이탈 훅 ════════════════
+    //
+    // TB_FP 오탐을 없애고 나면 popDrift 의 잔여 유발원은 '우리 훅을 거치지 않는 개체군 변화'
+    // 뿐이다 — 청크 로드/언로드, 바닐라 스폰/사망, 타 모드의 spawnEntity. 카트 팩에서는
+    // 주행 중 청크 스트리밍과 바닐라 아이템/경험치 엔티티가 이 축을 계속 흔든다.
+    //
+    // Fabric 의 ServerEntityEvents.ENTITY_LOAD/UNLOAD 는 <b>그 경로를 전부</b> 통과한다
+    // (ServerWorld 의 엔티티 핸들러 startTracking/stopTracking — 청크 로드·스폰·차원이동·사망·
+    // 청크 언로드). 이벤트를 받아 큐에 적재하고, 틱 경계에서 popDrift 판정 <b>직전에</b> 비워
+    // 버킷을 증분 갱신 + 지문 동기하면 popDrift 는 0 에 수렴한다.
+    //
+    // [지연 처리 이유] 이벤트는 월드 엔티티 순회 중에 발화할 수 있다. 그 자리에서 버킷·스냅샷을
+    // 만지면 순회 중 구조 변경(CME) 위험이 있고, 우리 명령의 소환도 같은 이벤트를 발생시켜
+    // snapAdd 와 이중 계상된다. 틱 경계 1회 배치 드레인은 두 문제를 동시에 없앤다:
+    //   · 순회 밖(틱 경계)이라 CME 없음.
+    //   · tagBucketsOnAdd/Remove 는 멱등(contains 검사 / 없으면 no-op)이라 snapAdd 와 중복 무해.
+    //   · 훅이 살아 있으면 지문 계상 주체를 훅 한 곳으로 단일화(tbFpAdd/Remove 는 즉시 반환)해
+    //     이중 계상 자체를 없앤다.
+    //
+    // [가시성 계약] 외부 유입은 '다음 틱 경계부터 버킷에 보인다' — 종전 popDrift 재구축과 정확히
+    // 같은 ≤1틱 계약이다(바닐라 동등). 우리 자신의 소환은 종전대로 snapAdd 가 즉시 반영한다.
+    //
+    // [fail-safe] 훅이 안 붙거나(구버전 fabric-api) 커버리지에 구멍이 있으면 지문이 어긋나
+    // popDrift 가 그대로 잡아낸다 — 종전 동작으로 자동 강등. 관측 결과는 어느 쪽이든 동일.
+    //   -Dkfc.entityhook=off 로 비활성(종전 popDrift 전량 재구축 경로).
+    public static final boolean ENTITY_HOOK_ON =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.entityhook", "on"));
+    private static boolean ENTITY_HOOK_LIVE = false;
+    private static java.util.ArrayList<net.minecraft.entity.Entity> PEND_LOAD;
+    private static java.util.ArrayList<net.minecraft.entity.Entity> PEND_UNLOAD;
+    private static long TBD_HOOK_LOAD, TBD_HOOK_UNLOAD;   // 진단 카운터
+
+    /** ModEntry 가 ServerEntityEvents 등록에 성공하면 부팅 시 1회 호출. */
+    public static void markEntityHookApplied() {
+        if (!ENTITY_HOOK_ON) return;
+        ENTITY_HOOK_LIVE = true;
+        PEND_LOAD = new java.util.ArrayList<>();
+        PEND_UNLOAD = new java.util.ArrayList<>();
+        System.out.println("[KFC] 엔티티 유입/이탈 훅 = LIVE (popDrift 전량 재구축 경로 비활성)");
+    }
+
+    /** ServerEntityEvents.ENTITY_LOAD — 청크 로드/스폰/차원이동 유입. */
+    public static void onEntityLoaded(net.minecraft.entity.Entity e,
+                                      net.minecraft.server.world.ServerWorld w) {
+        if (!ENTITY_HOOK_LIVE || e == null) return;
+        // 추적 중인 월드 밖(다른 차원)은 우리 스냅샷/버킷의 모집단이 아니다 — 무시.
+        // (SNAP_WORLD 미확정 시에도 무시: 첫 스냅샷이 전량 수집하므로 누락 없음.)
+        if (SNAP_WORLD != null && w != SNAP_WORLD) return;
+        PEND_LOAD.add(e);
+    }
+
+    /** ServerEntityEvents.ENTITY_UNLOAD — 청크 언로드/사망/제거/차원이동 이탈. */
+    public static void onEntityUnloaded(net.minecraft.entity.Entity e,
+                                        net.minecraft.server.world.ServerWorld w) {
+        if (!ENTITY_HOOK_LIVE || e == null) return;
+        if (SNAP_WORLD != null && w != SNAP_WORLD) return;
+        PEND_UNLOAD.add(e);
+    }
+
+    /** 틱 경계 배치 드레인 — 버킷 증분 + 지문 동기. popDrift 판정 직전에 호출한다.
+     *
+     *  <p>제거를 먼저 적용한다: 같은 틱에 (언로드 → 재로드)된 엔티티가 있으면 최종 상태가
+     *  '포함' 이어야 하고, 지문도 (-f)+(+f)=0 으로 상쇄되어 정확하다. 반대 순서면 제거가
+     *  뒤에 남아 실제 개체군과 어긋난다. */
+    // ── [N2-c] 배치 제거 — 태그당 1패스 ──────────────────────────────────────
+    // [실측 동기] spark: drainEntityHook 2.49%(0.379 ms/tick) 중 2.44%p 가
+    // tagBucketsOnRemove → ArrayList.remove(Object) → Entity.equals 였다.
+    // 원인은 제거를 <b>엔티티마다 따로</b> 한 것이다. ArrayList.remove(Object) 는
+    //   ① 평균 n/2 개를 equals 로 선형 탐색하고 ② 찾은 뒤 System.arraycopy 로 뒤를 당긴다.
+    // 언로드 7.7개/틱 × 각자의 태그 수만큼 이 (탐색+시프트) 쌍이 반복됐다.
+    //
+    // [수정] 드레인은 이미 틱 경계 배치다. (태그 → 제거 대상 집합)으로 뒤집어 모은 뒤
+    // <b>영향받은 태그당 removeIf 1회</b>로 처리한다. 같은 태그를 공유하는 엔티티가
+    // 함께 빠지고(카트 파츠 리그가 정확히 이 형태), 시프트도 버킷당 1회로 끝난다.
+    //   비용: Σ_{(엔티티,태그)} O(버킷)  →  Σ_{영향받은 태그} O(버킷)
+    //
+    // [동등성 — 전제와 근거] removeIf(집합) 은 개별 remove(Object) 를 순서대로 적용한 것과
+    // 결과가 같다. 단 <b>버킷에 중복 원소가 없어야</b> 한다 — remove(Object) 는 첫 1건만 지우고
+    // removeIf 는 전부 지우기 때문이다. 이 전제는 tagBucketsOnAdd 의 {@code if (!b.contains(e))}
+    // 가 보장한다(엔티티 identity 기준 유일). 퍼징 20,000케이스로 확인: 고유 원소 조건에서
+    // 두 방식의 결과 리스트가 원소·순서까지 완전히 일치(0건 불일치), 중복을 허용하면 불일치
+    // 발생 — 즉 동등성은 '중복 없음' 불변식에 정확히 의존한다.
+    // 남는 원소의 상대 순서는 보존되므로 '버킷 = 스냅샷 순서의 부분수열' 계약도 그대로다.
+    private static final java.util.HashMap<String, java.util.Set<net.minecraft.entity.Entity>> TB_DROP =
+            new java.util.HashMap<>();
+
+    private static void drainEntityHook() {
+        if (!ENTITY_HOOK_LIVE) return;
+        int nu = PEND_UNLOAD.size(), nl = PEND_LOAD.size();
+        if (nu == 0 && nl == 0) return;
+        boolean live = !TAG_BUCKETS.isEmpty();   // 버킷이 비어 있으면 어차피 전체 구축 — 지문만 동기
+        for (int i = 0; i < nu; i++) {
+            net.minecraft.entity.Entity e = PEND_UNLOAD.get(i);
+            if (live) {
+                // 개별 remove 대신 (태그 → 대상) 으로 적재만 한다.
+                for (String tg : e.getCommandTags()) {
+                    if (TAG_BUCKETS.get(tg) != null)
+                        TB_DROP.computeIfAbsent(tg, k -> new it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet<>()).add(e);
+                }
+            }
+            long f = _entFp(e);
+            TB_FP -= f;
+            if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) TB_TAG_FP -= f;
+        }
+        if (!TB_DROP.isEmpty()) {
+            for (java.util.Map.Entry<String, java.util.Set<net.minecraft.entity.Entity>> en4 : TB_DROP.entrySet()) {
+                java.util.ArrayList<net.minecraft.entity.Entity> b = TAG_BUCKETS.get(en4.getKey());
+                if (b == null || b.isEmpty()) continue;
+                java.util.Set<net.minecraft.entity.Entity> drop = en4.getValue();
+                b.removeIf(drop::contains);      // 버킷당 단일 패스 + 단일 시프트
+            }
+            TB_DROP.clear();
+        }
+        for (int i = 0; i < nl; i++) {
+            net.minecraft.entity.Entity e = PEND_LOAD.get(i);
+            if (live) tagBucketsOnAdd(e);
+            long f = _entFp(e);
+            TB_FP += f;
+            if (TAG_FP_OPT && !e.getCommandTags().isEmpty()) TB_TAG_FP += f;
+        }
+        if (DEBUG_TAGBUCKET) { TBD_HOOK_UNLOAD += nu; TBD_HOOK_LOAD += nl; }
+        PEND_UNLOAD.clear(); PEND_LOAD.clear();
+    }
+
     // TAG_BUCKETS 가 clear 될 때마다(=틱/gen/서버 변화 rebuild, NBT 리로드 태그변경) 증가.
     // 정적 승격된 Tags 핸들(pass-4)이 (서버,틱,gen,epoch) 4-스탬프가 모두 일치할 때만
     // 캐시된 후보 리스트를 반환하고, 하나라도 어긋나면 String[] 경로로 위임(재해소)한다.
@@ -859,6 +1027,11 @@ public final class KfcGen {
     private static final java.util.HashMap<String, Long> TBD_TAGNOTE = new java.util.HashMap<>();
     private static final java.util.HashMap<String, Long> TBD_NOTE = new java.util.HashMap<>();
     private static long TBD_DRIFT, TBD_POP, TBD_RECON, TBD_GEN, TBD_NBT, TBD_BUILD, TBD_ENT;
+    private static long TBD_BRDRAIN;                                     // [N2-b] 폐기 대신 증분 반영한 횟수
+    // [진단] BR_ALL(127, fail-closed)로 분류된 외부 명령 원문 집계. 미상 명령 하나가 매 틱
+    // 전면 무효화를 유발하는 상황을 '어느 명령인지' 까지 즉시 특정하기 위한 것 —
+    // -Dkfc.debug.coherence 의 전량 로깅과 달리 상위 5건만 100틱마다 요약한다.
+    private static final java.util.HashMap<String, Long> TBD_ALLCMD = new java.util.HashMap<>();
     private static int  TBD_TICK = Integer.MIN_VALUE;
     private static void tbdReport(int tk) {
         if (TBD_TICK == Integer.MIN_VALUE) { TBD_TICK = tk; return; }
@@ -868,7 +1041,22 @@ public final class KfcGen {
                 + " (틱당 " + String.format("%.2f", (double) TBD_BUILD / span) + ")"
                 + "  사유 drift=" + TBD_DRIFT + " pop=" + TBD_POP + " recon=" + TBD_RECON
                 + " gen=" + TBD_GEN + " nbt=" + TBD_NBT
-                + "  스캔엔티티누계=" + TBD_ENT);
+                + "  스캔엔티티누계=" + TBD_ENT
+                + "  훅(load/unload)=" + TBD_HOOK_LOAD + "/" + TBD_HOOK_UNLOAD
+                + (ENTITY_HOOK_LIVE ? " [hook LIVE]" : " [hook off]")
+                + (TB_FP_SYNC ? " [tbfp on]" : " [tbfp off]")
+                + "  증분반영(폐기회피)=" + TBD_BRDRAIN
+                + "  추적거리캐시(hit/miss)=" + TBD_TD_HIT + "/" + TBD_TD_MISS + parStats());
+        TBD_TD_HIT = TBD_TD_MISS = 0;
+        if (!TBD_ALLCMD.isEmpty()) {
+            StringBuilder sb3 = new StringBuilder("[KFC-TAGBUCKET]   BR_ALL(미상) 외부명령 상위: ");
+            TBD_ALLCMD.entrySet().stream()
+                    .sorted((x, y) -> Long.compare(y.getValue(), x.getValue()))
+                    .limit(5).forEach(en3 -> sb3.append("\n[KFC-TAGBUCKET]     x")
+                            .append(en3.getValue()).append("  /").append(en3.getKey()));
+            System.out.println(sb3);
+            TBD_ALLCMD.clear();
+        }
         StringBuilder sb2 = new StringBuilder("[KFC-TAGBUCKET]   brTag=" + TBD_BRTAG + "  gen 유발자: ");
         for (int i = 0; i < TBD_SRC.length; i++)
             if (TBD_SRC[i] > 0) sb2.append(GEN_SRC_NAME[i]).append('=').append(TBD_SRC[i]).append(' ');
@@ -888,6 +1076,7 @@ public final class KfcGen {
         java.util.Arrays.fill(TBD_SRC, 0L); TBD_NOTE.clear(); TBD_TAGNOTE.clear();
         TBD_BRTAG = 0; GEN_SRC_NOTE = "";
         TBD_DRIFT = TBD_POP = TBD_RECON = TBD_GEN = TBD_NBT = TBD_BUILD = TBD_ENT = 0;
+        TBD_HOOK_LOAD = TBD_HOOK_UNLOAD = 0; TBD_BRDRAIN = 0;
     }
 
     static java.util.List<net.minecraft.entity.Entity> tagBucket(GameContext ctx, String tag) {
@@ -909,6 +1098,9 @@ public final class KfcGen {
             // 누락 → 트랙 선택룸 UI 가 다음 ENTITY_GEN 범프까지(1~2초) 무반응이었다.
             // 훅 경유 변화(경주 중 스폰/킬)는 지문이 동기 유지되어 재구축을 유발하지 않는다.
             entitiesSnapshot(ctx);                    // 이 틱 스냅샷/지문 확정(첫 접근 시 재구축)
+            // [N2] 훅이 모은 외부 유입/이탈을 판정 <b>직전에</b> 버킷·지문에 반영한다.
+            // 훅이 완전하면 이 시점에 지문이 정확히 일치해 아래 popDrift 가 거짓이 된다.
+            drainEntityHook();
             boolean popDrift = TAG_FP_OPT ? (SNAP_TAG_FP != TB_TAG_FP) : (SNAP_FP != TB_FP);
             TB_FP = SNAP_FP; TB_TAG_FP = SNAP_TAG_FP;
             // 25차[무결성·성능 양립]: 외부 태그 변이의 즉시 화해는 KfcFuncCoherenceMixin 이
@@ -4884,6 +5076,53 @@ public final class KfcGen {
         RIDE_HOOK_ACTIVE = true;
     }
 
+    // ════════════ [N4] 트래커 추적거리 캐시 지원 (KfcTrackDistMixin) ════════════
+    //
+    // [실측] spark 125초: EntityTracker.getMaxTrackDistance 가 실작업의 8.57%(1.304 ms/tick)로
+    // 단일 최대 항목. 1.21.5 바이트코드 확인 — 바닐라 구현은
+    //     int i = this.maxDistance;
+    //     for (Entity e : this.entity.getPassengersDeep())        // ← 승객 트리 전체 순회
+    //         i = Math.max(i, e.getType().getMaxTrackDistance() * 16);
+    //     return adjustTrackingDistance(i);
+    // 이고, 호출부가 updateTrackedStatus(ServerPlayerEntity) 라 <b>엔티티 × 플레이어 × 매 틱</b>
+    // 트리를 다시 걷는다. 카트 1대에 디스플레이 파츠 수백 개가 승객으로 달리면 비용이
+    // (파츠 수 × 플레이어 수 × 카트 수) 곱셈으로 늘어난다.
+    //
+    // [관측 동등] 루프가 구하는 것은 '승객 타입 추적거리의 최댓값' 하나뿐이다. *16 은 단조
+    // 증가라 argmax 가 같으므로, <b>최댓값을 내는 승객 1개만 담은 리스트</b>를 순회시켜도
+    // i 는 동일하다. 승객이 없거나 최댓값이 maxDistance 이하면 빈 리스트로 충분하다.
+    // adjustTrackingDistance 는 <b>캐시하지 않는다</b> — 전용서버는 매 호출
+    // entity-broadcast-range-percentage 를, 통합서버는 클라 엔티티 거리 배율을 라이브로 읽으므로
+    // (바이트코드 확인) 그 값은 런타임에 바뀔 수 있다. 바닐라 메서드를 취소하지 않고 내부
+    // getPassengersDeep() 호출만 @Redirect 하므로 이 클램프는 그대로 살아 있다.
+    //
+    // [무효화] 30차 KfcRideMixin 이 addPassenger/removePassenger RETURN 에서 올리는
+    // RIDE_TOPO_GEN 을 그대로 쓴다 — 승객 리스트의 유일한 변이 지점이라 누락이 구조적으로
+    // 불가능하고, 이미 승객 평탄화 캐시가 같은 축으로 검증돼 있다. 엔티티 타입은 런타임 불변
+    // 이므로 트리 구성이 그대로면 최댓값도 그대로다.
+    //
+    // [fail-safe] 훅 미발동(RIDE_HOOK_ACTIVE=false)이면 캐시를 쓰지 않고 원본 순회로 위임한다.
+    // 믹스인 자체가 안 붙어도 바닐라 경로 그대로(최적화만 소실).
+    //   -Dkfc.trackdist=off 로 비활성.
+    public static final boolean TRACKDIST_ON =
+            !"off".equalsIgnoreCase(System.getProperty("kfc.trackdist", "on"));
+    private static boolean TRACKDIST_LOGGED = false;
+    static long TBD_TD_HIT, TBD_TD_MISS;
+
+    /** 캐시를 써도 되는가 — 훅이 실제로 발동해 RIDE_TOPO_GEN 이 살아 있을 때만. */
+    public static boolean trackDistCacheUsable() { return TRACKDIST_ON && RIDE_HOOK_ACTIVE; }
+
+    /** 현재 탑승 위상 세대 — 믹스인의 캐시 스탬프. */
+    public static long rideTopoGen() { return RIDE_TOPO_GEN; }
+
+    public static void markTrackDistApplied(boolean hit) {
+        if (hit) TBD_TD_HIT++; else TBD_TD_MISS++;
+        if (!TRACKDIST_LOGGED) {
+            TRACKDIST_LOGGED = true;
+            System.out.println("[KFC] 추적거리 캐시(KfcTrackDistMixin) = ACTIVE");
+        }
+    }
+
     /** vehicle 의 직접+중첩 승객 평탄 리스트. 훅 활성 + 슬롯 스탬프 일치 시 재사용, 아니면 1회
      *  평탄화 후 슬롯에 기록. 훅 비활성/믹스인 미적용이면 항상 신선 순회(종전과 동일). */
     private static java.util.List<net.minecraft.entity.Entity> passengersDeepCached(
@@ -5134,6 +5373,29 @@ public final class KfcGen {
     private static void bridgeReconcile(int mask) {
         if ((mask & BR_ENTITY) != 0) {          // POP: 전면(스냅샷·버킷·NBT 전부 GEN 연쇄) + interp
             ENTITY_GEN++; GEN_SRC = 4; INTERP_ID_MAPS.clear();
+            // ── [N2-b] 태그 버킷은 폐기하지 않고 '증분 반영' 한다 ──
+            //
+            // [실측 동기] N2 이후 popDrift 는 0 이 됐지만 재구축은 여전히 틱당 1.00 이었고,
+            // 사유가 전부 gen(=여기, bridgeReconcile) 이었다. 외부 `execute` 한 줄이 미상 명령으로
+            // 분류되어 BR_ALL(127) 을 내고, 그 BR_ENTITY 비트가 매 틱 버킷을 통째로 버렸다
+            // (실측 스캔 1,813 엔티티/틱).
+            //
+            // [왜 폐기가 불필요한가] BR_ENTITY 가 뜻하는 '개체군이 바뀌었을 수 있다' 는 사건은
+            // 전부 ENTITY_LOAD/UNLOAD 를 지난다 — 방금 그 외부 명령이 만든 유입/이탈이 이미
+            // 대기열에 들어 있다. 지금 그것을 비워 반영하면 버킷 내용은 <b>전체 재구축했을 때와
+            // 정확히 동일</b>하고, 비용은 전체 스캔이 아니라 '변화분' 에 비례한다.
+            // 태그 변이는 KfcEntityTagMixin(TAG_HOOK_ACTIVE) 이 같은 방식으로 이미 담당한다 —
+            // 이 최적화는 그 판정을 BR_TAG 에서 BR_ENTITY 로 확장한 것뿐이다.
+            //
+            // [fail-safe] 훅에 커버리지 구멍이 있으면 다음 틱 경계에서 지문이 어긋나 popDrift 가
+            // 전체 재구축을 수행한다 — 종전 동작으로 자동 강등되고 결과 집합은 동일하다.
+            // 두 훅 중 하나라도 죽어 있으면 아예 종전 경로(폐기)를 그대로 쓴다.
+            //   -Dkfc.brdrain=off 로 종전(전량 폐기) 동작 원복.
+            if (BR_DRAIN && ENTITY_HOOK_LIVE && TAG_HOOK_ACTIVE && TB_GEN == ENTITY_GEN - 1) {
+                drainEntityHook();
+                TB_GEN = ENTITY_GEN;             // 버킷은 최신 — 유효 표시 유지
+                if (DEBUG_TAGBUCKET) TBD_BRDRAIN++;
+            }
         } else {                                 // 세분: 필요한 축만
             if ((mask & BR_TAG) != 0) {
                 TAG_BUCKETS.clear(); TB_EPOCH++;
@@ -5539,6 +5801,8 @@ public final class KfcGen {
     // 분류 자체는 P3 bridge_mask 와 동일 표(파이썬 20+13케이스 검증)의 자바 포팅. 미상/함수 → BR_ALL.
     // -Dkfc.extsel=off 로 즉시 blanket 원복(escape hatch).
     private static final boolean EXT_SEL = !"off".equalsIgnoreCase(System.getProperty("kfc.extsel", "on"));
+    // [N2-b] BR_ENTITY 화해 시 태그 버킷을 폐기하는 대신 훅 대기열을 증분 반영한다. 위 bridgeReconcile 참조.
+    private static final boolean BR_DRAIN = !"off".equalsIgnoreCase(System.getProperty("kfc.brdrain", "on"));
     private static final java.util.Map<String, Integer> EXT_MASK_CACHE = boundedMap(4096);
     private static int EXTERNAL_MASK = 0;
 
@@ -5702,6 +5966,12 @@ public final class KfcGen {
         if (m != 0) {
             EXTERNAL_MASK |= m; EXTERNAL_DIRTY = true;
             if (DEBUG_TAGBUCKET && (m & (BR_ENTITY | BR_TAG)) != 0) GEN_SRC_NOTE = "cmd:" + firstToken(command) + ":mask" + m;
+            // [진단] 미상 분류(BR_ALL)만 원문 앞부분을 집계 — 어느 명령을 switch 에 추가하면
+            // 전면 무효화가 사라지는지 한 판 실행으로 특정된다.
+            if (DEBUG_TAGBUCKET && m == BR_ALL && command != null) {
+                String k = command.length() > 90 ? command.substring(0, 90) + "…" : command;
+                TBD_ALLCMD.merge(k, 1L, Long::sum);
+            }
         }
     }
     // /schedule 지연 함수는 CommandManager.execute 를 안 탄다(바닐라 타이머 → CommandFunctionManager.execute
@@ -7020,6 +7290,12 @@ public static net.minecraft.entity.Entity nearestEntity(
             return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos, tagsNeg) && inRange(origin, en, minDist, maxDist));
         }
+        // [N3-a] 조기종료 없는 전수 스캔만 순서보존 병렬 필터로 — 술어가 순수 읽기라
+        // 필터 구간에 쓰기 주체가 없다. 결과 원소·순서는 아래 순차 경로와 완전히 동일.
+        if (cap < 0) {
+            return parallelFilter(tagOrSnap(ctx, tagsPos),
+                    e -> matchTagsAlive(e, tagsPos, tagsNeg) && inRange(origin, e, minDist, maxDist));
+        }
         java.util.List<net.minecraft.entity.Entity> out =
                 new java.util.ArrayList<>(cap >= 0 ? cap : 10);
         for (net.minecraft.entity.Entity e : tagOrSnap(ctx, tagsPos)) {
@@ -7050,6 +7326,12 @@ public static net.minecraft.entity.Entity nearestEntity(
             }
             return ctx.world.getOtherEntities(null, rangeBox(origin, maxDist),
                     en -> matchTagsAlive(en, tagsPos.pos, tagsNeg) && inRange(origin, en, minDist, maxDist));
+        }
+        // [N3-a] String[] 판과 동일 — 조기종료 없는 전수 스캔만 순서보존 병렬 필터.
+        if (cap < 0) {
+            final String[] _tp = tagsPos.pos;
+            return parallelFilter(tagOrSnap(ctx, tagsPos),
+                    e -> matchTagsAlive(e, _tp, tagsNeg) && inRange(origin, e, minDist, maxDist));
         }
         java.util.List<net.minecraft.entity.Entity> out =
                 new java.util.ArrayList<>(cap >= 0 ? cap : 10);
@@ -8030,6 +8312,189 @@ public static net.minecraft.entity.Entity firstEntity(
     //  명령 함수는 엔티티 틱 페이즈와 분리되어 동기 실행되므로, 한 실행 내 다중 읽기는 동일 age 로 안전하다.
     private static final boolean ENTITY_READ_CACHE = true;
 
+    // ════════════════ [N3] 순서무관 루프 병렬 실행 ════════════════
+    //
+    // 데이터팩 시맨틱은 순차 실행이지만, `execute as @e[...] run <본문>` 중에는 반복 사이에
+    // <b>어떤 데이터 의존도 없는</b> 것이 있다. 그런 루프는 순서를 바꾸거나 동시에 돌려도
+    // 관측 결과가 같다 — 데이터팩으로는 불가능하고 네이티브 변환에서만 얻을 수 있는 이득이다.
+    //
+    // <p><b>[적용 조건 — emit 이 컴파일 타임에 증명, fail-closed]</b> 아래를 모두 만족하는
+    // 루프에만 이 경로가 생성된다({@code emit._loop_body_parallel_safe}):
+    // <ol>
+    //   <li>본문의 <b>읽기·쓰기가 전부 순회 엔티티 자신</b>에 한정 — 다른 엔티티/전역 상태를
+    //       읽지도 쓰지도 않는다. 따라서 반복 i 가 반복 j 의 결과를 관측할 경로가 없다.</li>
+    //   <li>쓰기 대상이 <b>DataTracker(엔티티별 독립 객체)</b> 뿐이다. 스코어보드(공유 HashMap),
+    //       스토리지, 블록, 팀, 보스바, 태그 버킷은 공유 자료구조라 전부 금지.</li>
+    //   <li><b>위치·탑승·차원 변경 금지.</b> {@code Entity.setPosition} 은 EntityTrackingSection
+    //       (섹션 공유 리스트)을 갱신하므로 스레드 안전하지 않다 — 승객·섹션 재배치 계열 전부 제외.</li>
+    //   <li>엔티티 집합 불변(스폰·킬·브릿지·임의 함수호출 없음) — 기존 {@code _loop_body_entity_safe}.</li>
+    //   <li>순서 관측 가능한 부수효과 금지: 채팅/사운드/파티클 패킷, RNG 소비, 로그.</li>
+    // </ol>
+    //
+    // <p><b>[왜 이 조건이면 충분한가]</b> 조건 1·2 에 의해 각 반복의 쓰기 대상 집합이 서로소이고
+    // (엔티티별 DataTracker 인스턴스), 읽기 집합도 자기 자신뿐이라 read-write 충돌이 없다.
+    // 공유 자료구조 접근이 0 이므로 데이터 경쟁이 원천적으로 성립하지 않는다. 남는 것은 순회
+    // 순서인데, 조건 1 에 의해 순서를 관측할 주체가 없다 — 바닐라 순차 실행과 <b>결과 동등</b>이다.
+    //
+    // <p><b>[임계값]</b> 작은 리스트는 분할·합류 비용이 이득을 넘는다. 기본 64 미만은 순차
+    // 실행(오버헤드 0). 카트 파츠 리그(수백 개)가 주 대상이다.
+    //
+    // <p><b>[예외 격리]</b> 바닐라는 함수 실행 예외가 서버를 죽이지 않는다. 워커에서 던진
+    // 예외는 수집해 합류 후 메인 스레드에서 1회 보고하고, 나머지 반복은 정상 완료시킨다.
+    //
+    // <p><b>[기본 OFF]</b> 이 변경만이 유일하게 '동시성' 을 도입한다 — 다른 최적화와 위험
+    // 등급이 다르므로 명시적으로 켜야 한다. A/B 실측 후 승격 판단.
+    //   {@code -Dkfc.par=on} 활성 / {@code -Dkfc.par.min=N} 임계값(기본 64) /
+    //   {@code -Dkfc.par.threads=N} 워커 수(기본 = 코어수-1, 최대 8)
+    private static final boolean PAR_ON = "on".equalsIgnoreCase(System.getProperty("kfc.par", "off"));
+    private static final int PAR_MIN = Integer.getInteger("kfc.par.min", 64);
+    private static java.util.concurrent.ForkJoinPool PAR_POOL;
+    private static long PAR_CALLS, PAR_SEQ, PAR_ITEMS;   // 진단
+
+    private static java.util.concurrent.ForkJoinPool parPool() {
+        java.util.concurrent.ForkJoinPool p = PAR_POOL;
+        if (p == null) {
+            int n = Integer.getInteger("kfc.par.threads",
+                    Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() - 1)));
+            // asyncMode=false(LIFO) — 우리 작업은 재귀 분할이라 워크스틸링 기본 모드가 맞다.
+            p = new java.util.concurrent.ForkJoinPool(n, pool -> {
+                java.util.concurrent.ForkJoinWorkerThread t =
+                        java.util.concurrent.ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+                t.setName("kfc-par-" + t.getPoolIndex());
+                t.setDaemon(true);   // 서버 종료를 막지 않는다
+                return t;
+            }, null, false);
+            PAR_POOL = p;
+            System.out.println("[KFC] 병렬 루프 = ON (워커 " + n + ", 임계값 " + PAR_MIN + ")");
+        }
+        return p;
+    }
+
+    /**
+     * 순서무관이 증명된 {@code execute as} 루프의 병렬 실행. 증명 조건은 위 주석 참조 —
+     * <b>emit 이 검증한 본문만</b> 이 경로로 생성된다. 손으로 호출하지 말 것.
+     *
+     * <p>임계값 미만이거나 병렬이 꺼져 있으면 <b>같은 순서로 순차 실행</b>한다(관측 동일, 오버헤드 0).
+     */
+    public static void parallelAs(java.util.List<net.minecraft.entity.Entity> src,
+                                  java.util.function.Consumer<net.minecraft.entity.Entity> body) {
+        final int n = (src == null) ? 0 : src.size();
+        if (n == 0) return;
+        if (!PAR_ON || n < PAR_MIN) {                 // 순차 폴백 — 종전 경로와 완전 동일
+            PAR_SEQ++;
+            for (int i = 0; i < n; i++) {
+                net.minecraft.entity.Entity e = src.get(i);
+                if (e != null) body.accept(e);
+            }
+            return;
+        }
+        PAR_CALLS++; PAR_ITEMS += n;
+        // 워커 예외는 첫 1건만 보관해 합류 후 보고(바닐라: 함수 예외가 서버를 죽이지 않는다).
+        final java.util.concurrent.atomic.AtomicReference<Throwable> err =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        PAR_ACTIVE = true;
+        try {
+            parPool().submit(() ->
+                java.util.stream.IntStream.range(0, n).parallel().forEach(i -> {
+                    net.minecraft.entity.Entity e = src.get(i);   // 순회 중 구조 변경 없음(조건 4)
+                    if (e == null) return;
+                    try { body.accept(e); }
+                    catch (Throwable t) { err.compareAndSet(null, t); }
+                })
+            ).join();
+        } catch (Throwable t) {
+            // 풀 자체의 실패(거부/인터럽트) — 안전하게 순차로 마저 처리하지 않고 보고만 한다.
+            // (부분 실행 후 재실행은 멱등하지 않을 수 있으므로 중복 적용을 만들지 않는다.)
+            System.err.println("[KFC] 병렬 루프 실패: " + t);
+            return;
+        } finally {
+            PAR_ACTIVE = false;
+            // 병렬 구간이 미룬 NBT 스냅샷 무효화를 여기서 일괄 처리(과잉 무효화 = 보수적 안전).
+            if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.clear();
+        }
+        Throwable t0 = err.get();
+        if (t0 != null) System.err.println("[KFC] 병렬 루프 본문 예외(나머지 반복은 정상 완료): " + t0);
+    }
+
+    // ──────────── [N3-a] 순서보존 병렬 필터 (읽기 전용 — 가장 안전한 등급) ────────────
+    //
+    // <p>{@code @e[tag=..,distance=..]} 무제한 스캔의 필터 단계는 <b>순수 읽기</b>다:
+    // {@code matchTagsAlive} 는 엔티티별 {@code getCommandTags()} Set 과 {@code isAlive()} 를,
+    // {@code inRange} 는 위치를 읽을 뿐 어떤 공유 자료구조도 쓰지 않는다. 필터가 끝날 때까지
+    // 본문은 시작조차 하지 않으므로 <b>필터 구간 전체에 쓰기 주체가 하나도 없다</b> —
+    // 데이터 경쟁이 성립할 수 없는, 병렬화 등급 중 가장 안전한 부류다.
+    //
+    // <p><b>[순서 보존]</b> 청크 분할 → 청크별 지역 리스트 → <b>청크 순서대로</b> 연결.
+    // 결과 리스트는 순차 필터와 <b>원소·순서가 완전히 동일</b>하다. 이게 중요한 이유는
+    // {@code @e[limit=N]} 의 arbitrary 픽이 '수집 순서 앞 N 개' 이기 때문이다(위 항등 근거).
+    //
+    // <p><b>[적용 범위]</b> 조기종료(cap>=0)가 없는 전수 스캔만. cap 경로는 순차 조기종료가
+    // 이미 더 싸고, 병렬로는 '앞 N 개' 를 그대로 재현하려면 결국 전수 필터가 필요하다.
+    //
+    // <p><b>[임계값]</b> 원소당 작업이 매우 작으므로(태그 Set 조회 + 거리 제곱) 분할 비용을
+    // 넘으려면 리스트가 커야 한다. 기본 512. {@code -Dkfc.par.fmin=N}
+    //
+    // <p><b>[fail-safe]</b> 술어가 던지거나 풀이 실패하면 <b>순차로 전량 재계산</b>한다.
+    // 필터는 부수효과가 없으므로 재계산이 완전히 멱등하다(부분 결과 폐기 = 무해).
+    private static final int PAR_FILTER_MIN = Integer.getInteger("kfc.par.fmin", 512);
+
+    private static java.util.ArrayList<net.minecraft.entity.Entity> seqFilter(
+            java.util.List<net.minecraft.entity.Entity> src, int n,
+            java.util.function.Predicate<net.minecraft.entity.Entity> p) {
+        java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            net.minecraft.entity.Entity e = src.get(i);
+            if (e != null && p.test(e)) out.add(e);
+        }
+        return out;
+    }
+
+    /** 순서보존 병렬 필터. 순차 결과와 원소·순서가 동일하다(임계값 미만/비활성 시 그대로 순차). */
+    public static java.util.List<net.minecraft.entity.Entity> parallelFilter(
+            java.util.List<net.minecraft.entity.Entity> src,
+            java.util.function.Predicate<net.minecraft.entity.Entity> p) {
+        final int n = (src == null) ? 0 : src.size();
+        if (n == 0) return new java.util.ArrayList<>();
+        if (!PAR_ON || n < PAR_FILTER_MIN) { PAR_SEQ++; return seqFilter(src, n, p); }
+
+        final int workers = Math.max(2, parPool().getParallelism());
+        final int chunk = (n + workers - 1) / workers;
+        final int nc = (n + chunk - 1) / chunk;
+        @SuppressWarnings("unchecked")
+        final java.util.ArrayList<net.minecraft.entity.Entity>[] parts = new java.util.ArrayList[nc];
+        try {
+            parPool().submit(() ->
+                java.util.stream.IntStream.range(0, nc).parallel().forEach(c -> {
+                    final int lo = c * chunk, hi = Math.min(n, lo + chunk);
+                    java.util.ArrayList<net.minecraft.entity.Entity> local =
+                            new java.util.ArrayList<>(hi - lo);
+                    for (int i = lo; i < hi; i++) {
+                        net.minecraft.entity.Entity e = src.get(i);
+                        if (e != null && p.test(e)) local.add(e);
+                    }
+                    parts[c] = local;      // 서로 다른 인덱스만 쓴다(경쟁 없음), join 이 가시성 보장
+                })
+            ).join();
+        } catch (Throwable t) {
+            // 술어 예외/풀 실패 — 부수효과가 없으므로 순차 전량 재계산이 완전히 안전하다.
+            System.err.println("[KFC] 병렬 필터 폴백(순차 재계산): " + t);
+            PAR_SEQ++;
+            return seqFilter(src, n, p);
+        }
+        PAR_CALLS++; PAR_ITEMS += n;
+        int total = 0;
+        for (int c = 0; c < nc; c++) total += (parts[c] == null ? 0 : parts[c].size());
+        java.util.ArrayList<net.minecraft.entity.Entity> out = new java.util.ArrayList<>(total);
+        for (int c = 0; c < nc; c++) if (parts[c] != null) out.addAll(parts[c]);   // 청크 순서 = 원 순서
+        return out;
+    }
+
+    /** 진단 요약 — {@code -Dkfc.debug.tagbucket=true} 리포트에 함께 출력. */
+    private static String parStats() {
+        if (!PAR_ON) return "";
+        return "  병렬(호출/순차폴백/원소)=" + PAR_CALLS + "/" + PAR_SEQ + "/" + PAR_ITEMS;
+    }
+
     // 측정 결론(8주행+8관전, 동일 트랙/주행): typeBucket(false)이 box(true)보다 빠름.
     //   onStartTick 18.10% vs 19.17%, kartmain_loop 14.68% vs 15.53%,
     //   getEntitiesByType 0.52% vs 0.88%, nearestEntity+anyEntity 0.22% vs 0.87%.
@@ -8155,8 +8620,18 @@ public static net.minecraft.entity.Entity firstEntity(
 
     /** 엔티티 NBT 를 바꾸는 쓰기 직후 스냅샷 무효화(write-through). */
     private static void invalidateSnapshot(net.minecraft.entity.Entity e) {
-        if (ENTITY_READ_CACHE) ENTITY_NBT_SNAP.remove(e);
+        if (!ENTITY_READ_CACHE) return;
+        // [N3] 병렬 구간에서는 per-엔티티 remove 를 하지 않는다. ENTITY_NBT_SNAP 은
+        // synchronizedMap(WeakHashMap) 이라 워커마다 같은 모니터를 잡아 루프가 사실상 직렬화되고
+        // (실측 불가능할 정도의 경합), WeakHashMap 은 그 자체로 재해시 중 구조 변경에 취약하다.
+        // 대신 parallelAs 가 합류 직후 맵 전체를 1회 비운다 — '과잉 무효화' 방향이라 관측은
+        // 항상 보수적으로 안전하다(캐시 미스 = 엔티티에서 fresh 재직렬화 = 진실).
+        if (PAR_ACTIVE) return;
+        ENTITY_NBT_SNAP.remove(e);
     }
+
+    /** [N3] 병렬 구간 진행 중 표식 — 워커/메인 모두에서 읽히므로 volatile. */
+    private static volatile boolean PAR_ACTIVE = false;
 
     // ── 구조적 no-op NBT 경로 자가검증/생략 (write/read 양쪽) ───────────────────────────────
     //  배경: display/marker 엔티티에 `data.X`(예: data.interpolation_duration, data.loop-data.*)를
@@ -10223,6 +10698,12 @@ public static net.minecraft.entity.Entity firstEntity(
         TBC_CACHE.clear(); TBC_SERVER = null; TBC_TICK = MIN; TBC_GEN = -1;
         TB_SERVER = null; TB_WORLD = null; TB_TICK = MIN; TB_GEN = -1; TB_PLN = -1; TB_PLH = 0;
         TB_RECON_TICK = MIN; TB_FP = Long.MIN_VALUE; TB_TAG_FP = Long.MIN_VALUE; TB_EPOCH++;
+        // [N2] 훅 대기열 — 월드 경계에서 이전 월드의 엔티티 참조를 놓는다(누수 방지).
+        // 지문이 Long.MIN_VALUE 로 초기화되므로 다음 틱 경계는 무조건 popDrift → 전체 재구축이고,
+        // 대기열을 버려도 누락이 생기지 않는다(새 월드 첫 스냅샷이 전량 수집).
+        TB_DROP.clear();
+        if (PEND_LOAD != null) PEND_LOAD.clear();
+        if (PEND_UNLOAD != null) PEND_UNLOAD.clear();
         ANY_MEMO.clear(); AM_SERVER = null; AM_TICK = MIN; AM_GEN = -1; AM_MUT = -1;
         ONP_MAP.clear(); ONP_VEH.clear();
         ONP_MAP_SERVER = null; ONP_MAP_TICK = MIN; ONP_MAP_GEN = -1;

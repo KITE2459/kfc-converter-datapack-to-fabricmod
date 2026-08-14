@@ -935,17 +935,35 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
     # [31차] 믹스인 멤버 네임스페이스 — 다중 변환 모드 동시 탑재 시 같은 바닐라 클래스에 병합되는
     # public 멤버(kfc$nd/kfc$create 등)의 이름 충돌을 그룹별 접두(kfc$<id>$)로 원천 차단한다.
     _mix_id = re.sub(r'[^A-Za-z0-9_]', '', group.split(".")[-1]) or "kfc"
+    # [멱등화] 종전 str.replace 는 두 번 적용되면 kfc$<id>$<id>$… 로 망가졌다. 이미 네임스페이스가
+    # 붙은 토큰은 건너뛰는 정규식으로 바꿔, 같은 텍스트에 몇 번 적용해도 결과가 같게 한다.
+    _MIX_NS_RE = re.compile(r'kfc\$(?!' + re.escape(_mix_id) + r'\$)')
     def _mix_ns(txt: str) -> str:
-        return txt.replace("kfc$", f"kfc${_mix_id}$")
+        return _MIX_NS_RE.sub(f"kfc${_mix_id}$", txt)
+
+    # [가드] 생성 산출물의 kfc$ 네임스페이스 정합 검증.
+    #   KfcGen 과 믹스인은 같은 접두(kfc$<modid>$)를 공유해야 서로의 멤버를 찾는다. 한쪽만
+    #   치환된 트리는 컴파일 단계에서 "cannot find symbol: kfc$output" / "does not override"
+    #   로 터지는데, 그 시점엔 원인이 드러나지 않아 추적이 오래 걸린다(실사고). 생성 직후
+    #   여기서 검사해 원인을 문장으로 알린다.
+    #   대표적 발생 경로: convert.py 를 다시 돌리지 않고 KfcGen.java 를 생성 트리에 손으로 복사.
+    def _verify_mix_ns(name: str, txt: str) -> None:
+        bad = re.findall(r'kfc\$(?!' + re.escape(_mix_id) + r'\$)[A-Za-z0-9_]+', txt)
+        if bad:
+            raise SystemExit(
+                f"[generate][FATAL] {name}: kfc$ 네임스페이스 미적용 심볼 {len(bad)}건 — {sorted(set(bad))[:6]}\n"
+                f"    KfcGen 과 Kfc*Mixin 은 kfc${_mix_id}$ 접두를 공유해야 합니다.\n"
+                f"    생성 트리의 KfcGen.java 를 손으로 복사하지 말고 convert.py 를 다시 실행하세요.")
     if kfcgen_src.exists():
         kg = kfcgen_src.read_text(encoding="utf-8")
         kg = re.sub(r'^package\s+[\w.]+;', f'package {group}.generated;', kg, count=1, flags=re.M)
         # D-10: KfcGen 이 KfcScsMixin(그룹.mixin) 을 참조하므로 그룹 토큰도 치환.
         kg = _mix_ns(kg.replace("__KFC_GROUP__", group))
+        _verify_mix_ns("KfcGen.java", kg)
         gen_dir = src_root / Path(*f"{group}.generated".split("."))
         gen_dir.mkdir(parents=True, exist_ok=True)
         write_if_changed(gen_dir / "KfcGen.java", kg)
-        print(f"[generate] KfcGen.java -> {group}.generated")
+        print(f"[generate] KfcGen.java -> {group}.generated (mixin ns = kfc${_mix_id}$)")
     else:
         print("[!]  KfcGen.java is not next to convert.py - manual placement needed")
 
@@ -961,6 +979,7 @@ def generate(trees_path: str, datapack_root: str, out_dir: str, group: str = "ka
         for _mx_path in _mixin_templates:
             mx = _mx_path.read_text(encoding="utf-8")
             mx = _mix_ns(mx.replace("__KFC_GROUP__", group))
+            _verify_mix_ns(_mx_path.name, mx)
             mx = re.sub(r'^package\s+[\w.]+;', f'package {group}.mixin;', mx, count=1, flags=re.M)
             write_if_changed(mixin_dir / _mx_path.name, mx)
             print(f"[generate] {_mx_path.name} -> {group}.mixin")
@@ -1556,6 +1575,7 @@ def write_entrypoint(src_root: Path, group: str, tags: dict, generated_fids: set
 
 import net.fabricmc.api.ModInitializer;
 {tick_import}import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.command.CommandManager;
@@ -1619,6 +1639,24 @@ public final class ModEntry implements ModInitializer {{
         //   레지스트리 산출물이라 /reload 후 진부해진다 — 누수 방지 겸 정합성 요건.
         ServerLifecycleEvents.END_DATA_PACK_RELOAD.register(
                 (server, resourceManager, success) -> {group}.generated.KfcGen.resetAll("datapack-reload"));
+
+        // [N2] 외부 엔티티 유입/이탈 훅 — 청크 로드/언로드·바닐라 스폰/사망처럼 우리 명령 훅
+        //   (snapAdd/snapRemove)을 거치지 않는 개체군 변화를 태그 버킷에 증분 반영한다.
+        //   이 훅이 없으면 그런 변화가 '개체군 지문 드리프트' 로만 드러나고, 그때마다
+        //   TAG_BUCKETS 전체가 폐기되어 스냅샷 전 엔티티 × 태그로 재구축된다(실측 최대 항목).
+        //   등록 실패(구버전 fabric-api 등)는 무시 — 지문 드리프트 경로가 그대로 남아 정합은
+        //   보장되고 최적화만 소실된다(fail-safe).
+        if ({group}.generated.KfcGen.ENTITY_HOOK_ON) {{
+            try {{
+                ServerEntityEvents.ENTITY_LOAD.register(
+                        (entity, world) -> {group}.generated.KfcGen.onEntityLoaded(entity, world));
+                ServerEntityEvents.ENTITY_UNLOAD.register(
+                        (entity, world) -> {group}.generated.KfcGen.onEntityUnloaded(entity, world));
+                {group}.generated.KfcGen.markEntityHookApplied();
+            }} catch (Throwable _t) {{
+                System.out.println("[KFC] 엔티티 훅 등록 실패(종전 경로 유지): " + _t);
+            }}
+        }}
 
 {tick_registration}
         CommandRegistrationCallback.EVENT.register(

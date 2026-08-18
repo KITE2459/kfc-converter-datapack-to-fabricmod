@@ -1089,8 +1089,10 @@ public final class KfcGen {
                 + (ENTITY_HOOK_LIVE ? " [hook LIVE]" : " [hook off]")
                 + (TB_FP_SYNC ? " [tbfp on]" : " [tbfp off]")
                 + "  증분반영(폐기회피)=" + TBD_BRDRAIN
-                + "  추적거리캐시(hit/miss)=" + TBD_TD_HIT + "/" + TBD_TD_MISS + parStats());
-        TBD_TD_HIT = TBD_TD_MISS = 0;
+                + "  추적거리캐시(hit/miss)=" + TBD_TD_HIT + "/" + TBD_TD_MISS
+                + "  함수마스크 디스크읽기누계=" + FN_MASK_READS
+                + (MASK_SLOW_MS > 0 ? "  느린마스크=" + TBD_MASK_SLOW : "") + parStats());
+        TBD_TD_HIT = TBD_TD_MISS = 0; TBD_MASK_SLOW = 0;
         if (!TBD_ALLCMD.isEmpty()) {
             StringBuilder sb3 = new StringBuilder("[KFC-TAGBUCKET]   BR_ALL(미상) 외부명령 상위: ");
             TBD_ALLCMD.entrySet().stream()
@@ -5846,15 +5848,60 @@ public final class KfcGen {
     private static final boolean EXT_SEL = !"off".equalsIgnoreCase(System.getProperty("kfc.extsel", "on"));
     // [N2-b] BR_ENTITY 화해 시 태그 버킷을 폐기하는 대신 훅 대기열을 증분 반영한다. 위 bridgeReconcile 참조.
     private static final boolean BR_DRAIN = !"off".equalsIgnoreCase(System.getProperty("kfc.brdrain", "on"));
-    private static final java.util.Map<String, Integer> EXT_MASK_CACHE = boundedMap(4096);
+    // [N5②] 접근순(LRU) — 매 틱 도는 뜨거운 명령이 일회성 명령에 밀려 축출되면, 다시 들어올 때
+    // fnMask 전체 트리 재분석을 지불한다. 상한도 16384 로 올려 축출 자체를 희소하게 만든다.
+    private static final java.util.Map<String, Integer> EXT_MASK_CACHE = lruMap(16384);
+    /** [N5 진단] 이 ms 이상 걸린 extMask 미스를 1줄 로그. 0/미설정이면 계측 자체를 안 한다. */
+    private static final int MASK_SLOW_MS = Integer.getInteger("kfc.debug.maskslow", 0);
+    private static long TBD_MASK_SLOW;
     private static int EXTERNAL_MASK = 0;
 
     // ── [v2 확장] /function 타겟 마스크 — 로드된 데이터팩의 mcfunction 원문을 ResourceManager 로
     // 1회 읽어 같은 분류기로 전이 분석(P3 bridge_mask 의 런타임판). 자원 부재/예외/서버 미준비 →
     // BR_ALL(fail-closed). 사이클은 상위 순회가 집계(기여 0). memoize 로 fid 당 1회 비용.
-    private static final java.util.Map<String, Integer> FN_MASK_CACHE = boundedMap(4096);
+    // ════════ [N5] 주기적 50ms 스파이크의 원인 — 함수 마스크 재분석 ════════
+    //
+    // 이 런타임에서 <b>디스크를 읽는 경로는 여기 하나뿐</b>이다(getResourceManager().getResource
+    // → BufferedReader). 그래서 GC 와 무관한 수십 ms 스파이크가 생길 수 있는 자리도 여기뿐이다.
+    //
+    // [결함 1 — 중첩 결과 미캐시(핵심)] 종전 캐시 조건은 {@code if (FN_MASK_BUSY.isEmpty())} 였다.
+    // 그런데 fnMask 는 함수 본문의 {@code function X} 줄을 만나면 extMaskUncached 를 통해
+    // <b>자기 자신에 재귀</b>한다. 재귀 중에는 부모가 BUSY 에 남아 있으므로 isEmpty() 가 거짓 —
+    // 즉 <b>자식 함수의 결과가 단 한 번도 캐시되지 않았다</b>. 최상위 1건만 캐시된다.
+    // 결과: 최상위 미스 1회마다 <b>함수 트리 전체를 디스크에서 다시 읽고 다시 파싱</b>한다.
+    // 함수가 수천 개인 팩에서 이 한 번이 수십 ms 다. 공유 자식은 부모 수만큼 중복해서 읽는다.
+    //
+    // [결함 2 — FIFO 축출] FN/EXT 마스크 캐시가 insertion-order LinkedHashMap(cap 4096)이라
+    // <b>가장 오래된 것부터</b> 버린다. 일회성 명령이 계속 흘러들면 매 틱 쓰이는 뜨거운 항목이
+    // 밀려나고, 다시 들어올 때 결함 1의 전체 트리 재분석을 지불한다.
+    // 이것이 '<b>장시간 켜놓으면</b> 발생'의 정체다 — 캐시가 4096을 채우기 전에는 축출이 없어
+    // 증상이 안 나타나고, 채우고 나서야 주기적으로 터지기 시작한다.
+    //
+    // [수정]
+    //   ① 사이클을 만나지 않은 노드는 <b>중첩 여부와 무관하게 캐시</b>한다. 사이클 여부는
+    //      전역 카운터 스냅샷으로 판정 — 하위 어딘가에서 사이클을 밟았으면 그 값이 변하고,
+    //      그 노드와 모든 조상이 캐시를 건너뛴다(불완전한 값의 전파 차단). 사이클이 없는
+    //      절대다수는 함수당 정확히 1회만 디스크를 읽는다.
+    //   ② 두 캐시를 <b>접근순(LRU)</b>으로 바꿔 뜨거운 항목이 일회성 명령에 밀려나지 않게 한다.
+    //   ③ FN_MASK_CACHE 상한을 32768 로 — 함수 id 공간은 팩 크기로 유한하고($( 매크로는 위에서
+    //      조기 반환) 값이 Integer 라 전량 캐시해도 메모리가 무의미한 수준이다.
+    //
+    // [진단] -Dkfc.debug.maskslow=<ms> 로 임계값 이상 걸린 extMask 호출을 명령 원문·디스크
+    // 읽기 횟수와 함께 1줄 로그. 스파이크가 정말 여기인지 한 판으로 확정할 수 있다.
+    private static final java.util.Map<String, Integer> FN_MASK_CACHE = lruMap(32768);
     private static final java.util.HashSet<String> FN_MASK_BUSY = new java.util.HashSet<>();
     private static boolean EXT_NOCACHE;   // 서버 준비 전 임시 BR_ALL — 상위 memo 억제(재시도 허용)
+    private static int FN_MASK_CYCLE;     // 사이클을 밟은 횟수 — 캐시 가능 여부 판정용
+    private static int FN_MASK_READS;     // 진단: 이번 extMask 호출에서 디스크를 읽은 함수 수
+
+    /** 접근순(LRU) 상한 맵 — 뜨거운 항목이 일회성 항목에 밀려나지 않는다. 메인 스레드 전용. */
+    private static <K, V> java.util.LinkedHashMap<K, V> lruMap(final int cap) {
+        return new java.util.LinkedHashMap<K, V>(256, 0.75f, true) {
+            @Override protected boolean removeEldestEntry(java.util.Map.Entry<K, V> eldest) {
+                return size() > cap;
+            }
+        };
+    }
 
     private static int fnMask(String fid) {
         if (fid == null || fid.contains("$(") || fid.startsWith("#")) return BR_ALL;
@@ -5863,7 +5910,8 @@ public final class KfcGen {
         if (c != null) return c;
         GameContext gc = CTX_CACHE;
         if (gc == null) { EXT_NOCACHE = true; return BR_ALL; }   // 부팅 초기 — 미캐시 재시도
-        if (!FN_MASK_BUSY.add(fq)) return 0;                     // 사이클: 상위가 집계 중
+        if (!FN_MASK_BUSY.add(fq)) { FN_MASK_CYCLE++; return 0; } // 사이클: 상위가 집계 중
+        final int cyc0 = FN_MASK_CYCLE;                          // [N5①] 사이클 판정 스냅샷
         int v = BR_ALL;
         try {
             int ci2 = fq.indexOf(':');
@@ -5873,6 +5921,7 @@ public final class KfcGen {
                     gc.server.getResourceManager().getResource(rid);
             if (r.isPresent()) {
                 v = 0;
+                FN_MASK_READS++;
                 try (java.io.BufferedReader br2 = r.get().getReader()) {
                     String ln;
                     while ((ln = br2.readLine()) != null) {
@@ -5886,7 +5935,28 @@ public final class KfcGen {
         } finally {
             FN_MASK_BUSY.remove(fq);
         }
-        if (FN_MASK_BUSY.isEmpty()) FN_MASK_CACHE.put(fq, v);    // top-level 완결시에만 캐시
+        // [N5①] 캐시 가능 조건 — 둘 중 하나면 v 가 '완전한 전이 마스크' 임이 보장된다.
+        //
+        //  (a) 이 서브트리가 사이클을 한 번도 밟지 않았다  → 모든 자식이 완전한 값을 돌려줬다.
+        //      중첩 호출이어도 캐시 가능. 사이클 없는 절대다수가 여기 해당하고, 이 한 줄이
+        //      '함수당 디스크 1회'를 만든다(종전엔 최상위 1건만 캐시돼 매번 트리 전체 재독).
+        //
+        //  (b) 이 호출이 <b>진입점</b>이다(BUSY 가 비었다) → 사이클을 밟았더라도 진입점의 값은
+        //      완전하다. 사이클로 0 을 돌려준 노드는 '지금 계산 중인 조상' 이고, 그 노드의 줄
+        //      기여는 이미 그 조상의 v 에 누적되어 최종적으로 진입점까지 OR 된다.
+        //      예: A→B→C→B 에서 C 는 B 기여를 놓치지만(→ 캐시 금지), B 와 A 는 완전하다.
+        //      종전 코드의 {@code if (FN_MASK_BUSY.isEmpty())} 가 정확히 이 경우였다 —
+        //      그래서 이 조건을 그대로 남겨 <b>사이클 있는 팩에서도 종전보다 나빠지지 않게</b> 한다.
+        //
+        // 사이클을 밟은 '중간' 노드만 캐시에서 제외된다(불완전한 값의 전파 차단).
+        //
+        // [EXT_NOCACHE 가드] 하위 어딘가가 '서버 미준비(CTX_CACHE==null)'로 BR_ALL 을 냈다면
+        // 그건 진짜 마스크가 아니라 임시값이다. 그대로 캐시하면 부팅 초기에 한 번 분석된 함수가
+        // <b>영구히 BR_ALL</b> 로 굳어 매번 전면 무효화를 유발한다(정합은 유지되나 성능 손실).
+        // extMask 가 미스마다 EXT_NOCACHE=false 로 초기화하므로 이 플래그는 '이번 분석에서
+        // 임시값이 섞였는가'를 정확히 가리킨다.
+        if (!EXT_NOCACHE && (FN_MASK_CYCLE == cyc0 || FN_MASK_BUSY.isEmpty()))
+            FN_MASK_CACHE.put(fq, v);
         return v;
     }
 
@@ -5895,7 +5965,19 @@ public final class KfcGen {
         Integer c = EXT_MASK_CACHE.get(cmd);
         if (c != null) return c;
         EXT_NOCACHE = false;
+        // [N5 진단] 미스 경로만 계측 — 적중 경로(절대다수)에는 비용 0.
+        final long t0 = (MASK_SLOW_MS > 0) ? System.nanoTime() : 0L;
+        final int r0 = FN_MASK_READS;
         int v = extMaskUncached(cmd);
+        if (MASK_SLOW_MS > 0) {
+            long ms = (System.nanoTime() - t0) / 1_000_000L;
+            if (ms >= MASK_SLOW_MS) {
+                TBD_MASK_SLOW++;
+                System.out.println("[KFC-MASKSLOW] " + ms + "ms  디스크읽기 " + (FN_MASK_READS - r0)
+                        + "개 함수  mask=" + v + "  /"
+                        + (cmd.length() > 120 ? cmd.substring(0, 120) + "…" : cmd));
+            }
+        }
         if (!EXT_NOCACHE) EXT_MASK_CACHE.put(cmd, v);
         if (DEBUG_COHERENCE) System.out.println("[KFC] extMask=" + v + " : /" + cmd);
         return v;
